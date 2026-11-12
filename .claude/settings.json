@@ -21,6 +21,17 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.pkit/adapters/claude-code/permission-hook.py"
+          }
+        ]
+      }
     ]
   },
   "agent": "project-manager",
