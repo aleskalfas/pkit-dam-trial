@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "privilege-catalog.schema.json",
+  "title": "Privilege catalog",
+  "description": "Formal shape of privilege-catalog.yaml — the named privileges an agent may be permitted to do (per COR-028). Each entry declares a recognizer (structured matcher over Bash commands and/or harness tool names, with a regex escape hatch) and an optional scope dimension. Namespace owner: permission-grants references entries via the typed token `[privilege-catalog:<id>]` (COR-019). Companion per COR-018 / the .pkit/schemas/ area conventions. An installed capability MAY ship a fragment of this same shape at `.pkit/capabilities/<cap>/permissions/privilege-catalog.yaml`, which the loader merges into the central catalog (the merge rule — additive, collision-rejecting, capability-scoped — is ADR-021's). Authoring constraints on a fragment: write keys as bare kebab-case ids (the loader applies the `<cap>:` scope), and `guardrail` is forbidden in a fragment.",
+  "x-pkit-id-collection": "/privileges",
+  "type": "object",
+  "required": ["schema_version", "privileges"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "source": { "$ref": "refs.schema.json#/$defs/source" },
+    "privileges": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z][a-z0-9-]*$": { "$ref": "#/$defs/entry" }
+      },
+      "additionalProperties": false,
+      "description": "Privilege definitions. Keys are kebab-case ids; values match $defs.entry."
+    }
+  },
+  "$defs": {
+    "privilege_ref": {
+      "type": "string",
+      "pattern": "^\\[privilege-catalog:[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)?\\]$",
+      "description": "Narrowed cross-schema reference pattern for the privilege-catalog namespace (per COR-019). Consumers $ref this rather than redeclaring the pattern. The id half MAY carry a capability scope (`<cap>:<name>`, e.g. `[privilege-catalog:trip-planning:ad-hoc-scraping]`) for a capability-contributed privilege per ADR-021 — the COR-019 token-grammar clarification."
+    },
+    "bash_matcher": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One Bash-command recognizer. Either a structured matcher (cmd [+ subcommand] [+ flag_any] [+ word_prefix_any]) or a regex escape hatch (pattern). The runtime matcher segments compound commands and strips env-var prefixes before matching. For a deny, the decision core also reads a structured matcher's program, subcommand and flags in the forms programs read them (ADR-025 point 5), and a pattern's flags as written.",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Leading command token to match (e.g. `git`, `docker`, `gh`)."
+        },
+        "subcommand": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "If present, the first non-flag token after `cmd` must be one of these (e.g. `[run, exec]` to match `docker run` but not `docker ps`)."
+        },
+        "flag_any": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "If present, the command must carry at least one of these flags (e.g. `[-rf, -fr]` for a destructive-rm guardrail)."
+        },
+        "word_prefix_any": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "If present, a word after `cmd` must open with one of these (e.g. `[+]` for a git refspec that forces the update of its ref)."
+        },
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Regex escape hatch matched against a command segment when the structured fields can't express the case. The author owns its fragility (Q4c)."
+        }
+      },
+      "anyOf": [
+        { "required": ["cmd"] },
+        { "required": ["pattern"] }
+      ]
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "recognize"],
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One-line, domain-readable description of what this privilege permits."
+        },
+        "recognize": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "description": "How a request is identified as this privilege. At least one of `bash` / `tool` / `path`.",
+          "properties": {
+            "path": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["folders", "tools"],
+              "description": "A path-scoped allow: the privilege is recognized only for a file tool listed in `tools` whose target lies inside one of `folders` — never for the tool alone, and never for a shell command, which is judged like any other — so a grant of it neither reaches nor denies anything elsewhere. It reduces prompts; it confines nothing. Enforced by the hook, which sees the target; never realized as a session-wide rule. The agent workspace (#1043) is the shipped instance.",
+              "properties": {
+                "folders": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "^(?!/)(?!~)(?!.*(^|/)\\.\\.(/|$))\\S+$"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "description": "Folders relative to the root of a checkout of the project — the project root, or another working tree of its repository, each with its own copy of the folder. No leading `/` or `~`, no `..`; a folder reached through a symlink is never recognized."
+                },
+                "tools": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "description": "File tools recognized when the path they name lies inside a folder (e.g. `Read`, `Write`, `Edit`)."
+                }
+              }
+            },
+            "bash": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/bash_matcher" },
+              "minItems": 1,
+              "description": "Bash-command recognizers; a request matches if any item matches a command segment."
+            },
+            "tool": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1,
+              "uniqueItems": true,
+              "description": "Harness tool names this privilege covers (e.g. `Read`, `WebFetch`)."
+            }
+          }
+        },
+        "scope_type": {
+          "type": "string",
+          "enum": ["directory", "domain"],
+          "description": "The scope dimension a grant of this privilege may constrain. `directory` = path globs (enforced per-call by the hook); `domain` = host allowlist. Absent = unscoped (anywhere)."
+        },
+        "guardrail": {
+          "type": "boolean",
+          "description": "If true, the model synthesizes a baseline `{subject: all, effect: deny}` grant for this privilege — the catalog is the single source of truth for the guardrail deny set (per ADR-002's double-lock). The synthesized model deny is the fail-open hook half; the harness's native settings denies are the fail-closed half. Absent = false."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,162 @@
+---
+name: agent-author
+description: Author a new agent (persistent role at .pkit/agents/<namespace>/<name>.md, or in a capability's agents/ folder) with proper frontmatter shape, citation discipline, and body conventions per COR-013. Use when adding a role for an AI tooling integration to delegate against.
+metadata:
+  wraps_command: pkit new agent
+gates:
+  - COR-005
+  - COR-006
+  - COR-013
+  - COR-015
+  - COR-016
+reads:
+  records:
+    - COR-008
+    - COR-014
+    - COR-026
+  paths:
+    - .pkit/agents/README.md
+    - .pkit/agents/hooks.md
+    - .pkit/agents/storyboards.md
+    - .pkit/decisions/README.md
+    - .pkit/agents/project/overlay.yaml
+---
+
+# Authoring an agent
+
+This skill walks through adding a new **agent** under `.pkit/agents/{core,project}/` or a capability's `agents/` folder. Agents are the persistent-role artifact kind (per COR-006); each names a scope of authority and judgement, declares the references it consults and the paths it owns, and gives the AI tooling a stable identity to delegate against.
+
+## Acceptance gate (run first)
+
+Per `.pkit/decisions/README.md`'s acceptance gate: before procedural work, verify every record listed in this skill's frontmatter `gates:` is `accepted`. The current dependencies:
+
+- **COR-005** — skill / command pairing. Establishes the rule that this skill pairs with `pkit new agent`.
+- **COR-006** — artifact roles. The discriminator that places "agent" as one of five content shapes and rules out putting role-content in a skill or decision.
+- **COR-013** — agent architecture. The unified frontmatter shape, hook contract, overlay mechanism, and reference-graph discipline this skill enforces.
+- **COR-015** — artifact file layout. Atomic agents stamp flat as `<name>.md`; only promote to folder form when sibling helpers appear.
+
+If any is `proposed` or `superseded`, halt and report.
+
+## Procedure
+
+### 1. Confirm "agent" is the right artifact
+
+Per COR-006's discriminator, agents are *role-bearing* artifacts: a persistent identity an AI tooling integration can be delegated against, with its own scope of authority. Use a different artifact if:
+
+- The work is a *recipe* (how to do X), not a role → that's a **skill**.
+- The work is a *decision* (the rule among alternatives) → that's a COR / PRJ record.
+- The work is a *reference doc* (explanation, navigation) → that's an area README or `<artifact>/README.md`.
+- The work is *exploratory* (mapping a design space) → that's a **scratchpad note**.
+
+An agent has *judgement*, *write authority over paths*, and *staying power across sessions*. A one-off task or a procedure you walk through once doesn't need an agent — a skill carries it more cheaply.
+
+### 2. Pick a namespace (core, project, or a capability)
+
+Per COR-014's universal-applicability test and COR-026's placement rule:
+
+- **`core`** — the agent's role is useful to *any* adopting project. Methodology disciplines, code review against universal conventions, coordinator templates adopters specialise via overlay. Ships with the methodology; refreshes on every sync.
+- **`project`** — the agent is tied to this adopter's stack, language, or product. Implementer agents (`qa-engineer`), domain reviewers, customised coordinators. Authored per project; never propagated.
+- **a capability name** — the agent implies a discipline a capability ships (issues and pull requests, documentation, code authoring): it lives in that capability, at `.pkit/capabilities/<capability>/agents/`. The capability must already exist — author it first (`capability-author`) rather than parking the agent at core. The code-authoring `software-engineer` is the example: it ships in the `software-engineering` capability.
+
+If you're not sure, the questions to ask: *would an adopter who installed none of the methodology's capabilities find this agent useful?* No → the capability whose discipline it presupposes. Yes → *would any project that adopts the methodology benefit from it in identical form?* (COR-014's universal-applicability test) Yes → core, the methodology maintainers' case: outside the methodology's source repository, propose it upstream. Otherwise → project.
+
+### 3. Pick a name
+
+Kebab-case, 1–3 words, naming the *role* (not the verb). Examples: `methodology-reviewer`, `software-engineer`, `convention-compliance-reviewer`. Bad: `do-the-thing`, `review-stuff`.
+
+Test: the name should fit naturally in the sentence *"You are the **<name>** for this project."* If the name doesn't read as an identity, sharpen it.
+
+### 4. Decide if this agent drives a scripted scenario
+
+Per COR-016, ask: *will this agent drive a scripted interaction scenario* — a sequence of designed turns with specific prompts, gates, and mutations the methodology authors in advance? Or is the agent's value purely in *judgment applied to context* (improvising findings from a diff, exploring a topic, answering ad-hoc questions)?
+
+If **yes** to scripted scenarios, the storyboard-first path applies:
+
+- Stamp the agent in folder form with a sibling storyboard scaffold (`--with-storyboard`, step 5).
+- Draft the storyboard *first*, then write the agent body from it (call `storyboard-author` after this skill, before drafting the body in step 6).
+
+If **no**, stamp flat as the default — the agent's body is the source of truth, no storyboard needed.
+
+You can answer "no" today and revisit later: stamping a storyboard sibling onto an existing flat agent is supported (`pkit new storyboard agent <name>` auto-migrates flat to folder).
+
+### 5. Stamp the stub
+
+For a judgment-driven agent (flat layout):
+
+```
+pkit new agent core <name>            # for a universal role
+pkit new agent project <name>         # for an adopter-specific role
+pkit new agent <capability> <name>    # for a capability's discipline
+```
+
+For an agent that drives one or more scripted scenarios (folder layout + sibling storyboard):
+
+```
+pkit new agent core <name> --with-storyboard
+pkit new agent project <name> --with-storyboard
+pkit new agent <capability> <name> --with-storyboard
+```
+
+The flat stamp produces `<agents folder>/<name>.md`, where the agents folder is `.pkit/agents/<namespace>/` for `core` / `project` and `.pkit/capabilities/<capability>/agents/` for a capability (created on first use). The `--with-storyboard` stamp produces `<agents folder>/<name>/<name>.md` plus a sibling `storyboard.md` scaffold. Both contain:
+
+- Frontmatter scaffolding (`name`, placeholder `description`, default `tools`, empty `reads` / `owns` / `needs`).
+- Body headers: `## When to invoke this agent`, `## Files you own`, `## Key documents to read`, `## How you work`, and a finished `## Intermediate files` section.
+
+The `--with-storyboard` stamp also declares the pair on both sides: the agent's `storyboards:` names the sibling `storyboard.md`, `## How you work` opens with the line loading it, and the storyboard's `consumers:` names the agent — the fresh pair passes `pkit refs validate` as stamped.
+
+Refuses if the name already exists in core, project or any capability (the deploy resolves one agent per name, so a colliding one would silently mask the other), and refuses a capability name that names no capability under `.pkit/capabilities/`.
+
+### 6. Draft the body
+
+For each section:
+
+- **Description (frontmatter)** — single sentence; what the agent does and when to invoke it. This surfaces in the harness's agent picker; the first 1,500 chars compete with every other agent's description for the model's attention. Lead with the load-bearing keywords.
+- **`## When to invoke this agent`** — bullet list of trigger conditions. Concrete; an author scanning the list should know whether their situation matches.
+- **`## Files you own`** — the paths whose modification is this agent's responsibility. Per the bidirectional reference-graph rule (COR-013), every path here must also appear in frontmatter `owns:`. Use `<category-name>` placeholders for adopter-specific paths; declare each in `reads.patterns` so the deploy-time substitution covers them. A path written only through a mutating command the agent runs — a friction writer, a stamp — is not listed: name the command and the conditions for running it in the body, or point at the skill that does (COR-013).
+- **`## Key documents to read`** — paths, record IDs (`COR-NNN`, `PRJ-NNN`), and hook contracts the agent consults at task time. Every entry here must also appear in `reads.{paths,records}` in frontmatter; the validator walks both directions. For scripted-scenario agents (per COR-016), the agent's storyboards belong here too — declared in frontmatter `storyboards:` by their bare sibling filename (`storyboard.md`), cited by that same name in the body, and load-bearing on it. The deploy rewrites the sibling name to the storyboard's source path in the deployed copy, so the source stays portable and the deployed agent still finds it (`.pkit/agents/storyboards.md`, "Frontmatter declaration").
+- **`## How you work`** — the agent's procedure or principles. For *judgment-driven* agents (no storyboards), numbered steps if the role follows a fixed sequence; principles + examples if the role is more judgement-bearing. For *scripted-scenario* agents (with `storyboards:` declared), the body is much thinner: it states that the agent's scripted behavior is documented in its declared storyboards, instructs the runtime to load them at session start via the `Read` tool, and may summarize at a high level what scenarios the agent drives — but does **not** restate or sketch the scenarios. The storyboard is the source; the agent body's job is to point at it. Cite authority by record ID rather than restating it (`per COR-005` not "per the skill/command pairing rule").
+- **Tool access (frontmatter)** — the stamp grants `tools: [Read, Glob, Grep, Bash]`. Trim the grant to what the role needs, keeping `Read` where it declares storyboards. Grant when the agent must lack a tool, such as a reviewer that must change no file: a grant fails closed, so a tool it leaves out is not given. Withhold, with `withheld:` in place of `tools:`, only when the agent should have every tool but a few. A withheld list fails open: it gives every tool it does not name, a tool a later harness release adds among them, so it never shows that the agent lacks a tool. Never write both keys, and never a harness's own key such as Claude Code's `disallowedTools` (COR-013 point 7, and `.pkit/agents/README.md`, "Tool access").
+- **`## Intermediate files`** — stamped finished: the one sentence every shipped agent carries, sending its intermediate files to the agent workspace (`.agent-workspace/`, the core rules' workspace rule), written with the file tools. Leave the wording as stamped, identical across agents.
+- **A reviewer** — an agent that judges work and returns a verdict or findings — is read-only on what it judges, not on everything: say so with that scope wherever the description or body claims read-only. If it can execute (a shell among its `tools`), add the `## What read-only covers` section just before `## Intermediate files`, copied word for word from a shipped reviewer; it sends every working file of a review — a dumped diff, a reproduction, captured output — to the agent workspace. `.pkit/agents/README.md`'s "Reviewers" paragraph has the rule.
+
+### 7. Declare hooks (if any)
+
+If the agent invokes external operations (settings changes, work-tracker writes, deploys), declare each as a hook in frontmatter `needs:` rather than hard-coding a shell command in the body. See `.pkit/agents/hooks.md` for the naming and signature contract.
+
+Two-segment hooks (`<topic>.<operation>`) are portable across bundles. Three-segment hooks (`<topic>.<provider>.<operation>`) lock the agent to a specific provider; only use these when the operation genuinely has no portable equivalent.
+
+### 8. Self-check against disciplines
+
+Before showing the draft, walk it against:
+
+- **Bidirectional reference-graph consistency.** Every frontmatter `reads.{paths,records,patterns}` / `owns` / `needs` entry must appear in the body. Every path / record-ID / hook-name in the body must be declared in frontmatter. The validator runs the same check; running it mentally first saves a rejection.
+- **Universal applicability** (core namespace only). Would the agent read naturally, in identical form, in any project that adopts the methodology (COR-014)? If it leaks vocabulary of the methodology's own source project, such as the ids of that project's own PRJ or ADR records, demote to project namespace or generalise.
+- **Role-not-procedure.** The body should read as "what you are and how you think", not as "step 1 do this, step 2 do that". Procedures live in skills the agent invokes.
+- **Description quality.** Read the description aloud. Does it tell the harness's auto-loader exactly when this agent applies? Sharpen until yes.
+- **Lead with meaning.** The agent opens by saying plainly what it is and when to reach for it, before the detail; sentences cite what they need (roughly one reference per point), not pile five-deep. An agent definition a reader can't grasp on a first pass has the same failure mode as a cryptic record: `.pkit/decisions/README.md`'s "Writing a record" gives the discipline for records.
+
+If any check fails, revise.
+
+### 9. Show the draft for review
+
+Surface the draft to the user. Do not commit until approved.
+
+### 10. Commit (after approval)
+
+Per COR-008, conventional-commits format. Type is `feat` for a new agent; scope reflects the area:
+
+```
+feat(agents): add <name> agent
+
+<body — 1–3 paragraphs on role, why it exists, what it owns>
+
+Co-Authored-By: <as appropriate>
+```
+
+The agent lands and is deployed by the next `pkit sync` or via running the adapter's deploy primitive (`bash .pkit/adapters/<harness>/deploy-agents.sh`). For Claude Code, the resolved file lands at `.claude/agents/<name>.md`.
+
+## Variations
+
+- **Promoting from flat to folder form.** When the agent gains its first sibling helper (a reference matrix, a generated template, a script), migrate from `<name>.md` to `<name>/<name>.md` with helpers as siblings. Update any links in the body that referenced the old path. This is a structural change worth its own commit.
+- **Refining an existing agent.** Edit in place. Git history is the change log. Skip this skill — it stamps new agents only.
+- **Adopter overrides for a core agent.** Do not edit `.pkit/agents/core/<name>.md` — that's core-owned and silently overwritten by sync. Instead, add per-agent overrides to `.pkit/agents/project/overlay.yaml` under `overrides.<name>:` to customise paths the agent references via `<category-name>` placeholders.

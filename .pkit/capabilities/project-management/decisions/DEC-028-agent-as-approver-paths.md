@@ -1,0 +1,456 @@
+---
+id: DEC-028
+title: Agent-as-approver — remote bot identity or locally-invoked kit agent satisfies `done-work` in agent mode
+status: accepted
+date: 2026-05-27
+author: Ales Kalfas
+---
+
+## Context
+
+[project-management:DEC-027-review-modes] establishes review modes (`agent` default, `human` opt-in) with three-layer per-PR override resolution. It defines *which mode applies* but defers *how an agent counts as approval* to this DEC.
+
+When the resolved mode is `agent`, `done-work`'s gate cannot rely on human review (no human reviewer is auto-assigned in agent mode). The methodology needs a concrete mechanism for "this agent's review counts as approval".
+
+Two execution paths cover the real-world cases:
+
+- **Remote path**: an agent with its own GitHub identity (bot account, GitHub App, CI service account) reviews out-of-band — fired by webhook, GitHub Action, or scheduled job. Posts the verdict via its own identity.
+- **Local path**: a kit-shipped or project-shipped agent (e.g., a Claude Code agent under `.claude/agents/`) is invoked on the developer's machine — typically as part of the standard workflow. Posts the verdict via the user's gh credentials.
+
+The remote path is the lower-friction *operational* path (no developer involvement after setup; fully autonomous loop closure). The local path is the lower-friction *adoption* path (no GitHub App / bot account setup needed; leverages the kit's existing `.claude/agents/` deployment surface).
+
+The mechanism has to answer:
+
+1. **What is the approval signal?** A comment? A review? Something parseable and recognised.
+2. **Whose signal counts?** Anyone? A specific identity? A list of identities? Different per path?
+3. **What prevents self-approval?** The whole point of an approval gate is an external signal.
+4. **What if the signal goes stale (new commits invalidate it)?**
+
+This DEC settles all four for both paths, **singleton at v1** (one remote agent OR one local agent OR both — but no multi-agent pipelines yet). Multi-agent review pipelines (N agents in sequence) are deferred per COR-007 until a second specialist-agent use case appears.
+
+A verdict also carries findings. The commands that read it must tell which findings hold up the change, which only inform, and which a person must judge. This DEC settles that with three finding tags.
+
+This DEC builds on DEC-027's mode resolution and on DEC-026's `done-work` gate. DEC-026 and DEC-027 must accept before DEC-028 can accept (the cite-graph is one-directional: DEC-028 → DEC-027 + DEC-026, not bidirectional).
+
+## Decision
+
+In `agent` mode (per DEC-027), `done-work`'s approval gate is satisfied when **a registered reviewer agent's latest verdict comment on the PR is a fresh `APPROVED` — the author has changed nothing its reviewer checks since the head it reviewed — via either the remote path (bot identity) or the local path (user attestation of locally-run agent)**.
+
+This adds a fourth path to `done-work`'s approval-gate OR in `agent` mode (the other three are still available: APPROVED review, `Approved`-prefix comment from non-author human, `--bypass "<reason>"`).
+
+### The verdict signal
+
+The agent posts a PR comment whose **first line** carries an uppercase verdict, with `Reviewer agent:` prefix. (That first-line placement describes the *posted comment*; a consumer extracting the verdict from an agent's *raw output* instead scans for the verdict line anywhere — see "Verdict-line grammar and the consumer scan contract" below.) Two verdicts at v1:
+
+| Verdict | Effect |
+|---|---|
+| `Reviewer agent: APPROVED` | Satisfies `done-work`'s gate in `agent` mode. |
+| `Reviewer agent: CHANGES_REQUESTED` | Explicit "needs work" signal. Does not satisfy the gate. Informational signal to the author and to any reviewer-watching automation. |
+
+The first line is the gate signal; the rest of the body (everything after the first newline) is **freeform commentary** — findings, summary, rationale, links. Only the findings have a form: each is a list item that begins with a tag saying what the finding does to the merge (see "Finding tags" below). Example:
+
+```
+Reviewer agent: CHANGES_REQUESTED
+
+- [block] `find_target_root` in `install.py` line 122 — `.git` should be tested with `.exists()` not `.is_dir()` to cover worktrees.
+- [block] Tests at `tests/test_install.py` don't cover the worktree-no-git case.
+- [advisory] (pre-existing: the change neither edits nor calls it) `find_source_root` on line 140 tests `.git` with `.is_dir()` too.
+- [person] RS-GUIDE-003, `docs/install.md` line 12 — whether the new paragraph on worktrees says only what the page's reader needs.
+```
+
+The verdict vocabulary (`APPROVED`, `CHANGES_REQUESTED`) matches GitHub's native PR-review state names — transferable mental model, and future migration from comment-based sentinels to actual `gh pr review` objects is mechanically straightforward (the verdict maps to the Review state).
+
+The verdict comment also carries a **provenance marker** on a line of its own, `<!-- pkit-verdict -->` — `<!-- pkit-verdict sha=<oid> base=<oid> -->` when it names the head the reviewer reviewed and the base branch's head it was reviewed against (see "Stale-verdict handling") — and **the gate counts a verdict only when that marker is present**. The reviewer path stamps it (`review-pr` on post; a directly-posting reviewer includes it), and the gate-checker requires it (step 2 of "Gate-checker algorithm"). The marker guards the read side against the sentinel spoof that [project-management:DEC-047-freeform-comment-verb] guards against on the write side: a bare verdict-grammar first line — hand-typed, or slipped past a write-side guard — does not satisfy the merge gate unless the reviewer path stamped it. The **read surface** (`show-pr --field review`) is permissive and displays every verdict-shaped comment, marked or not; only the *gate* requires the marker.
+
+A comment without the `Reviewer agent:` first-line prefix is implicitly informational commentary — no special verdict needed. Comments from the agent without the prefix do not affect the gate.
+
+### Verdict-line grammar and the consumer scan contract
+
+The verdict line is a precise grammar, identical whether it is read off a posted comment or extracted from an agent's raw output. The remote-path form is exactly `Reviewer agent: <VERDICT>`; the local-path form is exactly `Reviewer agent (local, <name>): <VERDICT>` — where `<VERDICT>` is one of `APPROVED` or `CHANGES_REQUESTED`, and the match is taken **after stripping surrounding whitespace** from the candidate line.
+
+A consumer that extracts a verdict from an agent's *raw output* — as opposed to reading an already-posted comment — scans for the **first line anywhere in the output** that matches this grammar, rather than requiring the verdict on the literal first line. The reason is the nature of the producer: a reasoning agent emits its verdict non-deterministically, often after a few lines of preamble (a restatement of the task, a "here is my review", a leading blank line). A parse that insists the verdict sit on line 1 fails intermittently against exactly the producers this path is built for — it posts no verdict and stalls the gate. Scanning the whole output for the first grammar-matching line tolerates incidental preamble without loosening what counts as a verdict: the *grammar* stays exact so the signal is unambiguous, while the *search* for it is lenient about position. Preamble before the matched line is throat-clearing and dropped; commentary after it is the freeform body.
+
+The scan resolves the two edge cases deterministically:
+
+- **Multiple matching lines** — the first match, top-to-bottom, wins. A later, possibly-contradictory verdict line in the same output is ignored; the agent's verdict is taken to be the first one it commits to.
+- **No matching line anywhere** — the consumer **fails closed**: it posts no verdict (so the gate stays unsatisfied) and surfaces the agent's *full* output, not a truncated fragment, so the operator can debug the non-conforming run. A missing or unparseable verdict never silently satisfies the gate and never silently disappears.
+
+This contract is the bridge between the freeform output a reasoning agent produces and the exact-grammar signal the gate-checker consumes (per the gate-checker algorithm below). It also pins the verdict to a single agent: a consumer invoking a named local agent accepts only that agent's grammar form (`<name>` bound), so one agent's output cannot post another's verdict.
+
+### Finding tags
+
+A verdict says whether the reviewer approves. Each finding under it says what it does to the merge, with one of three tags at its head:
+
+- **`[block]` withholds the approval.** It names an objective failure the change owns, one the reviewer's remit settles with no reading left to choose.
+- **`[person]` withholds no approval, and leaves the finding to the person who authorises the merge.** It cites by id an accepted rule that binds on an artefact the change alters or brings under a rule (COR-051 point 7), and it judges a passage the change owns. Judging the passage against that rule needs a reading the rule does not settle, or a fact the rule does not name. The command that lands the pull request shows the finding to that person. A landing run given its authorisation in advance merges only if it found the finding's verdict when it started, and that verdict stands for the head it merges ([project-management:DEC-055-pr-lists-answers] point 3). It is not a blocking finding. This capability's skill says which findings a fix round carries.
+- **`[advisory]` withholds nothing and holds nothing.** It is any other finding. It may name a defect the change does not own, a point the reviewer's remit settles as not blocking, or a point of taste. A pre-existing defect the change does not own is tagged `[advisory] (pre-existing: <reason>)`.
+
+**What a reviewer tags.** What the change owns, and what a pre-existing finding's reason says, is each reviewer's own discipline. Which rules a reviewer judges is its own remit too, and the tags widen no remit. A reviewer cites a rule, in a `[block]` or a `[person]` finding, only when its own instructions have it judge that rule. The tags bind every reviewer's verdict, on either path. A remote reviewer gets no brief, so whoever sets it up has it write them.
+
+**Tags and grades.** A tag is not a validation severity ([project-management:DEC-014-validation-severity-model]). A severity says how this capability answers a failed validation of its own. A tag says what a finding does to the merge. A reviewer that also grades its findings writes its grade after the tag, as `[block] (hard-reject)`.
+
+**The grammar.** A tag is the first thing in a top-level item of a bulleted or numbered list, in square brackets and lower case, as `[person]`. The finding is that item, with its sub-items. A consumer reading tags is lenient about their form, as the scan above is lenient about the verdict line's position: bold, backticks, a trailing colon or another case still mark a tag. Text in a fenced block carries no tag.
+
+**What decides the gate.** The verdict line alone decides the gate. A reviewer with a `[block]` finding requests changes, and one with none approves. A reviewer that could not review the change requests changes and says why. A finding with no tag counts as `[advisory]`. So a finding a person must judge reaches that person, and holds a merge, only when its reviewer tags it `[person]`.
+
+### Two paths, two registration lists
+
+The project declares registered agents in `project/config.yaml`:
+
+```yaml
+review:
+  agents:
+    # Remote path — agents with their own GitHub identity (bot, App, service account)
+    remote_registered:
+      - github_login: claude-bot          # the agent's GitHub identity
+                                          # (additional fields may be added later)
+    # Local path — kit-shipped or project-shipped agents under .claude/agents/
+    local_registered:
+      - name: pm-reviewer                 # matches `.claude/agents/pm-reviewer.md` (default, shipped by this capability)
+      - name: code-review                 # matches `.claude/agents/code-review.md` (adopter-authored)
+```
+
+Both lists are optional; at least one path must have at least one entry for the agent gate to be satisfiable. At v1 **both paths may be populated** — a project that wants belt-and-suspenders (bot for autonomous flow + local agent for developer-at-keyboard) configures both. When both paths are populated, the gate is satisfied if **either path's component-of-the-gate is satisfied** (the natural OR composition).
+
+Within each path, the list is **singleton** at v1 — exactly one entry per populated list. If more than one entry appears in either list, validation refuses with "v1 supports one agent per path; multi-agent pipelines are not yet specified".
+
+> **Cap lifted by [project-management:DEC-032-conditional-reviewer-requirements].** The singleton-per-path refusal is removed there: required reviewers may exceed one, resolved per-PR from classification and contributed by installed capabilities, AND-composed (all-must-approve). DEC-032 is the grounded second-specialist case this DEC deferred per COR-007.
+
+The **strict-composition** question (when both paths are configured, should the gate require *both* to approve? prioritise one over the other? defer to the more-rigorous?) is deferred to a future DEC per COR-007 — the OR default works without requiring lived evidence on which strictness rule matches adopter intent. Adopters who need stricter composition today can configure only one path until the future DEC settles the question.
+
+(`review.agents.registered:` was the v0 field name; the rename to `remote_registered:` distinguishes the two paths.)
+
+**The shipped default local reviewer is named `pm-reviewer`**, registered as `pm-reviewer` and deployed at `.claude/agents/pm-reviewer.md` from the canonical `agents/pm-reviewer.md`. It is not the single-token `reviewer`, which collides with the English role-noun "reviewer" that saturates this capability's schemas and prose (required reviewers, reviewer-contribution rules, per-reviewer overrides), making the *registered agent name* indistinguishable from the *role* it plays (#770). The name is only the value bound to `<name>` in the local verdict grammar, `Reviewer agent (local, <name>): <VERDICT>`. The default was formerly named `reviewer`, and two consequences follow:
+
+- **An adopter's own agent literally named `reviewer` is unaffected** — the rename is scoped to the capability's shipped default, keyed on provenance by the same-change-set migration, not on the config string.
+- **A verdict under the former name never gates.** A PR that carries a `Reviewer agent (local, reviewer): …` verdict comment from before an adopter's upgrade goes stale once the config names `pm-reviewer`: the gate looks for the `pm-reviewer` name, which the old line does not carry. The mechanism is **name-membership, not freshness**: the old `reviewer` line may still be fresh (so the freshness predicate does not drop it), but `reviewer` is not in the resolved required set, so `local_reviewer_ok` excludes it and the gate never counts it. (Consequently `show-pr --field review` may still *display* the old-name verdict as non-stale even though it does not gate.) This self-heals on the next `review-pr` run, which posts a fresh `pm-reviewer` verdict; no manual cleanup of the stale comment is needed.
+
+### Path 1: Remote agent (bot identity)
+
+When a remote-registered agent reviews, it posts the verdict comment using its own GitHub identity (bot account, GitHub App installation, service account). The verdict satisfies the gate via **identity match + author exclusion**:
+
+- Comment first line exactly `Reviewer agent: APPROVED`.
+- The comment carries the verdict marker (see "The verdict signal").
+- Comment author matches `review.agents.remote_registered[0].github_login`.
+- Comment author is **not** the PR author (author-exclusion enforced).
+- The verdict is fresh (see "Stale-verdict handling").
+
+The remote path's invocation is **adopter-managed** — the kit does not ship the bot; adopters wire their own via GitHub Action, webhook, or external service.
+
+### Path 2: Local agent (kit-invoked)
+
+When a local-registered agent reviews, it runs on the developer's machine via a kit-shipped command (see "Invocation command (local path)" below). The agent's output is posted as a PR comment by the **developer's** gh identity, with a structured attestation indicating the local path:
+
+- Comment first line exactly `Reviewer agent (local, <name>): APPROVED` — where `<name>` matches an entry in `review.agents.local_registered:`.
+- The comment carries the verdict marker (see "The verdict signal").
+- Comment author is the developer who ran the local command (typically the PR author in a solo workflow).
+- **Author-exclusion is relaxed** for the local path — the developer attests they ran the agent and is taking responsibility for the verdict.
+- The verdict is fresh (see "Stale-verdict handling").
+
+The local path's *trust model* is the same as DEC-026's `--bypass "<reason>"`: the developer attests via the kit command that they ran the agent and accepts the verdict; the comment records what was attested; the kit does not verify what actually happened. The *mechanisms* differ (`--bypass` posts a single audit comment at merge time with a freeform reason; `review-pr` posts a structured verdict comment before merge with `APPROVED` or `CHANGES_REQUESTED` + freeform commentary) — but the same honor-system trust posture applies. The honor-system aspect is acknowledged — see Rationale.
+
+The local-registered name `<name>` must (a) appear in `review.agents.local_registered:` AND (b) correspond to an actual file at `.claude/agents/<name>.md` (or wherever the harness deploys agents). The kit command refuses to invoke a registered name that has no corresponding file (and vice versa: an agent file not in the registered list is not invoked).
+
+### Invocation command (local path)
+
+The local path has a single entry point:
+
+- **`review-pr <N>`** — invokes all locally-registered agents against the PR's diff. Each agent runs in parallel; each posts its verdict comment under the developer's identity, naming the head it reviewed and the base it reviewed it against. Re-runs are idempotent: a newer verdict supersedes an older one, and a verdict goes stale on its own once the author changes what its reviewer checks (see "Stale-verdict handling" below).
+
+**`review-pr` also delivers each verdict as a native GitHub review**, added alongside the comment sentinel, not replacing it. After posting the verdict comment, `review-pr` posts a **native `gh pr review`** carrying the state — `APPROVED → --approve`, `CHANGES_REQUESTED → --request-changes` — with the same verdict body. The two signals compose: the **comment** (with the `<!-- pkit-verdict -->` marker) is what `done-work`'s gate reads, while the **native review** is the GitHub-facing state that shows in the PR UI and satisfies branch protection. `--no-native` opts out (comment-only). This is the migration from comment-based sentinels to `gh pr review` objects that "The verdict signal" names, taken as far as delivery:
+
+- **Self-approval degrade.** GitHub refuses a native review (approve *or* request-changes) on your **own** PR. On the local path `review-pr` posts under the developer's own credentials, so when the **reviewer identity == the PR author**, the native review is **skipped** (the comment verdict stands). Native delivery is therefore fully autonomous only on a **non-author / bot identity** (the remote path). Any other gh failure (missing review permission, API error) likewise degrades to comment-only — native delivery never fails `review-pr`. The missing review permission is the constraint the comment sentinel was chosen for (Rationale, "Why a comment sentinel"): native review is delivered **where GitHub permits it** and degrades where it does not.
+- **Native-only is deferred.** A `native`-**only** delivery mode (drop the comment; make `done-work`'s gate read the native agent-review state directly) is deferred — delivering both by default keeps `done-work` reading the comment while giving GitHub the native state, which fully solves the branch-protection gap (Rationale, "Why a native review alongside the comment"). The gate already accepts a native APPROVED review via the human path; extending the agent path to native-only is a follow-up if a comment-free flow is wanted.
+
+`review-pr` is a new verb-subject command added to the pm capability, fitting DEC-020's verb-subject convention (verb=`review`, subject=`pr` — `pr` is an established entity per DEC-020's verb-subject set). It is **not** part of DEC-026's seven-command lifecycle palette — DEC-028 introduces `review-pr` as a sibling addition to DEC-020's verb-subject set. DEC-026's `review-work` is unchanged by this DEC.
+
+The standard developer flow:
+
+1. `start-work <N>` — branch + assignee
+2. (work, commits)
+3. `review-work <N>` — open PR, mark ready, assign human reviewers if `human` mode
+4. **`review-pr <N>`** — invoke local agents (if `agent` mode and any are registered)
+5. (fix findings if `CHANGES_REQUESTED`; push; re-run `review-pr`)
+6. `done-work <N>` — merge
+
+`review-work` and `review-pr` are deliberately separate commands. `review-work` is a fast, deterministic state-transition wrapper (per DEC-020's verb-subject performance profile); `review-pr` is a potentially-long-running LLM invocation. Folding the LLM call into `review-work` would make the transition wrapper slow and non-deterministic — strain the methodology-as-executable-commands philosophy. Keeping them separate preserves DEC-020's performance contract.
+
+The two commands share the `review` verb across different subjects (`work` for the lifecycle wrapper, `pr` for the agent-invocation command). The asymmetry is deliberate: `review-work` operates on the work-in-progress (issue + branch + assignee context per DEC-026); `review-pr` operates on the pull request as a methodology entity (per DEC-020's `pr` subject). Reading them together: "mark the work ready for review" (`review-work`) precedes "run the agent review on the PR" (`review-pr`).
+
+The `done-work` refusal template (see below) names `review-pr` as the remediation when the agent gate isn't satisfied — closing the discoverability gap that automatic invocation would have addressed.
+
+**`review-pr` in `human` mode (per DEC-027).** The command runs regardless of resolved mode — it's a tool, not a gate-satisfaction trigger. In `human` mode, the verdict comments are informational (pre-flight checks the developer wants before requesting human review); the gate is DEC-026's three-way OR and ignores the local-path verdict format. A developer in `human` mode who runs `review-pr` and sees `CHANGES_REQUESTED` fixes the findings and re-runs before requesting human review — but `done-work`'s gate path doesn't change. This makes `review-pr` useful in both modes: gate-satisfying in `agent`, advisory in `human`. In `human` mode a verdict does not gate. Its `[person]` findings are still shown to the person who authorises the merge, and still hold a landing run authorised in advance ([project-management:DEC-055-pr-lists-answers] point 3). The landing command re-runs no reviewer in this mode, so a stale verdict's `[person]` finding holds such a run until its reviewer posts a verdict that stands for the head.
+
+### Multi-local-agent composition
+
+When `review.agents.local_registered:` lists N local agents (v1 caps at 1; future v2 may extend), the gate semantics are **all-must-approve**:
+
+- All N local agents must have a fresh `Reviewer agent (local, <name>): APPROVED` (see "Stale-verdict handling").
+- If any local agent's most recent verdict is `CHANGES_REQUESTED`, the gate is not satisfied via the local path.
+- The agents run in parallel during `review-pr`; ordering is implementation-detail.
+
+At v1 (singleton), all-must-approve trivially reduces to the single agent's verdict.
+
+### CHANGES_REQUESTED behaviour
+
+`CHANGES_REQUESTED` verdicts are observed and surfaced in operational diagnostics (e.g., `done-work`'s refusal message names them) but do not block in a separate way — the gate fires on **absence of fresh APPROVED**, not on presence of `CHANGES_REQUESTED`. An author who pushes a fix doesn't need to mark the prior verdict resolved; the agent's fresh re-review (manual via `review-pr` or automatic via remote path) produces a new verdict line.
+
+The gate-checker takes **each agent's latest verdict by timestamp**, then requires it to be fresh. If an agent has posted several verdicts (e.g., the developer re-ran `review-pr` and the agent's second invocation disagreed with its first — possible for non-deterministic LLM calls), the most recent verdict wins, and a verdict it superseded never counts again, however fresh. A `CHANGES_REQUESTED` after an `APPROVED` means the agent's current opinion is "needs work"; the gate doesn't satisfy until a newer fresh `APPROVED` exists — also once that `CHANGES_REQUESTED` has gone stale, since a stale latest verdict leaves the agent with no verdict that counts.
+
+### Gate-checker algorithm
+
+The pm capability's `done-work` runs the algorithm:
+
+1. Determine which paths are configured (either or both of `remote_registered:` and `local_registered:` non-empty).
+2. Find all PR comments that carry the verdict marker (see "The verdict signal") and whose first line matches the verdict shape of any configured path — `Reviewer agent: <VERDICT>` (remote) or `Reviewer agent (local, <name>): <VERDICT>` (local), per "Verdict-line grammar and the consumer scan contract".
+3. **Remote path filter**: author matches `review.agents.remote_registered[0].github_login` AND author is not the PR author.
+   **Local path filter**: `<name>` matches an entry in `review.agents.local_registered:`. No author-exclusion check.
+4. **Latest-per-agent**: among comments passing steps 2–3, take the latest by timestamp per agent identity (remote) or per `<name>` (local). An earlier verdict the latest superseded takes no further part.
+5. **Freshness of the latest**: if that latest verdict is an `APPROVED` and fresh (see "Stale-verdict handling"), the agent's path-component is satisfied; if it's `CHANGES_REQUESTED`, or stale, not satisfied.
+6. **Per-path satisfaction**: the remote path is satisfied if the remote agent's component is satisfied (singleton at v1). The local path is satisfied if every local agent in `local_registered:` has a satisfied component (multi-local all-must-approve; trivial at v1 singleton).
+7. The gate is satisfied if **any configured path is satisfied** (OR composition across configured paths).
+
+When only one path is configured, step 7 reduces to "that path's satisfaction". When both are configured, the OR-composition is the v1 default; strict-composition rules defer per COR-007.
+
+> **Generalised by [project-management:DEC-032-conditional-reviewer-requirements] (steps 6–7).** Once the required-reviewer set can exceed one, satisfaction is computed **per reviewer, OR across the paths that reviewer is registered on, and AND across the resolved required set** — the gate is satisfied when *every* required reviewer is individually satisfied. For a single configured reviewer this reduces exactly to the cross-path OR above, so existing single-reviewer behaviour is unchanged. Steps 1–5 stand as written.
+
+### Stale-verdict handling
+
+A verdict stays fresh until the author changes something its reviewer checks. The gate-checker judges only each reviewer's latest verdict (step 4) and accepts it only when it is a fresh `APPROVED`. **A superseded verdict never counts**: freshness decides whether a reviewer's current verdict stands, never which verdict is current, so an `APPROVED` its own later `CHANGES_REQUESTED` overrode does not count again when that rejection goes stale.
+
+**The verdict names the head it reviewed and the base it reviewed it against.** `review-pr` reads the PR's head commit and the base branch's head before it invokes a reviewer, names the head in the reviewer's brief, and stamps both into the verdict marker: `<!-- pkit-verdict sha=<oid> base=<oid> -->`. Before posting, it reads the head again. If the head moved while the reviewer ran, the verdict is still posted against the head the reviewer saw, and the rule below judges the commits that arrived meanwhile like any later push; the native review is skipped, since GitHub would attach it to a head the reviewer never saw.
+
+**The author's changes since that head** are the union of the paths changed by each commit after it, walking the branch's own line of commits (first parents) back from the PR's head:
+
+- a merge commit whose second parent is on the base branch contributes the paths where the merge as committed differs from the clean three-way merge of its two parents (`git merge-tree --write-tree`) — nothing for a clean merge, the files of a resolved conflict, any edit made inside the merge;
+- any other commit contributes its own diff against its first parent, a merge of a branch other than the base included, since what it brings in has been reviewed nowhere on this PR.
+
+A floor may read these commits more widely than their paths. Where the author changed something inside a merge of the base, `touches-ruled-artefact` reads that merge whole, as below.
+
+**Freshness, per verdict.** A verdict on the PR's current head is fresh. Otherwise:
+
+- an `APPROVED` from a reviewer whose whole remit is its diff-property floors stays fresh while the author's changes satisfy none of its floors. Such a reviewer is one a floor requires on this PR, and whose every rule is a floor and nothing else ([project-management:DEC-032-conditional-reviewer-requirements]). Each floor kind reads those changes its own way:
+  - `touches-code` reads them through the not-code list the resolver applies to the PR's diff. A Markdown fix leaves `code-reviewer`'s and `security-reviewer`'s approvals standing.
+  - `touches-ruled-artefact` reads them through the backbone's `pkit rule-sets altered`, which DEC-032 reads for the PR's own change, a stretch at a time (below).
+  - A floor pm does not know is reached by any change, as it requires its reviewer on every change (DEC-032).
+- an `APPROVED` from any other reviewer goes stale on any change: the baseline, and a reviewer with any classification rule, matched on this PR or not — `docs-reviewer` rides the `touches-code` floor but also `type: "*"`, and its remit is the documentation, so a Markdown fix stales it even on an unclassified PR;
+- a `CHANGES_REQUESTED` goes stale on any change, whoever posted it. The author is answering it, and the fix it asks for may sit outside the reviewer's floors — a changeset, a README — so floor scoping protects approvals only. While a `CHANGES_REQUESTED` is fresh (nothing changed since, or only clean merges of the base), `review-pr` does not re-run its reviewer, and `done-work`'s refusal names `review-pr <N> --force` as the way to have it re-review the PR as it stands.
+
+**Freshness for `touches-ruled-artefact`.** pm asks the backbone what the author's changes since the reviewed head altered or brought under a rule, one stretch at a time.
+
+- **A stretch** is a range of commits pm asks about. For the author's own commits, it runs from the commit before a run of them, between merges of the base, to the run's last commit. Where the author changed something inside a merge of the base, that merge is a stretch of its own, from its first parent to the merge, the base's changes included. pm asks nothing about a clean merge.
+- **What reaches the floor.** An artefact a stretch alters reaches the floor when an accepted rule binds on it at the stretch's start or end. So does an artefact a stretch brings under an accepted rule without altering it (DEC-032). A rule a pin behind its set holds back binds nothing.
+- **What follows.** The approval stands while no stretch since the review alters a ruled artefact or brings an artefact under a rule.
+  - A code fix or a revalidation alters none.
+  - A stretch that changes only rule sets alters no artefact they govern, and one that changes only a place's type alters none. Each stales the approval where it brings an artefact under a rule, such as by accepting a rule, widening a set's scope, updating a pin or typing a place. A change to the rule sets stales it too where an accepted rule binds on a rule it alters.
+  - An edit counts when a rule binds on it at the start or end of its stretch. So a later commit of the same run that brings the edit under a rule stales the approval. An edit undone within a run is no change.
+  - A change that brings a ruled artefact into the declared places, or takes one out, stales it.
+  - A merge the author changed something inside stales it when that merge alters a ruled artefact or brings one under a rule. The base's changes count too, even where the author's own change there touched code alone.
+  - A clean merge of the base stales nothing, whatever it brings: an edit, a rule or a place.
+
+**The base it was reviewed against.** A verdict naming its reviewed base is stale, whatever the author changed, once that base is not an ancestor of the base branch's head: the PR was retargeted or its base rewritten. A stacked PR moved onto `main` after its parent branch was abandoned gets no new commit, yet its diff over `main` carries the parent's commits, which no verdict covers. A base that moved forward keeps the verdict. A marker naming no base is not checked.
+
+**A verdict that names no head** — a remote reviewer's, one posted by hand with the bare marker, or one whose head `review-pr` could not read — is fresh when it was posted after the PR's head arrived on the host, and stale otherwise. The host's record of the PR's branch moving to that head says when it arrived. The head commit's own dates do not, since the committer's clock sets them and a rebase or an amend keeps them. Where the arrival cannot be read, the verdict is stale, and the reason says why.
+
+**`review.floors.not_code` does two jobs, for `touches-code` alone.**
+
+- **Who is required.** A changed path the list matches satisfies no `touches-code` floor, so it pulls in no reviewer of that floor (DEC-032).
+- **Whose approval survives a change.** A change it matches reaches no `touches-code` floor, so an `APPROVED` scoped to that floor stands.
+
+Widening it has both effects: a path added to the list neither requires the code floor's reviewers nor costs their approval when it changes. It narrows no other floor. A change to a path the list matches still satisfies `touches-ruled-artefact` when it alters a ruled artefact or brings one under a rule.
+
+**Local repository state can make the gate stricter, never looser.** The author's changes and the base's history are read from the local repository. That is the invariant that makes the dependency on it safe. A commit the checkout lacks is first fetched from origin by its object name, and the question asked again. Such a commit is the reviewed head or base, the PR's head, or the base branch's head. When the fetch does not settle it, the verdict is stale, and the reason names the cause:
+
+- the commit could not be fetched
+- the checkout is shallow, so ancestry cannot be told
+- in a full checkout, the reviewed head is outside the branch's history (a rebase or force-push)
+- the reviewed head reached the branch only through a merge
+- git is older than 2.38, which `merge-tree --write-tree` needs
+
+An approval scoped to `touches-ruled-artefact` also needs the backbone's `pkit rule-sets altered`, asked about each stretch as above. When pm asks the backbone, the verdict is stale, with the reason, on any of these:
+
+- a shallow checkout, refused outright, since the backbone finds where one commit left the other, which a shallow history may not hold
+- a command that fails, or whose answer cannot be read
+- a backbone without the command
+
+A missing fetch costs a re-review, never an unreviewed merge.
+
+**The merge is pinned to the head the gate checked.** `done-work` merges with `--match-head-commit` naming the head its gate judged the verdicts against, so a push between the gate and the merge fails the merge rather than landing commits no verdict covers.
+
+**What it does not cover.** A clean merge of the base branch leaves every verdict fresh, so a semantic conflict the base introduces — changes that merge cleanly but no longer work together — is not re-reviewed. CI on the merged result is the backstop.
+
+A clean merge of the base keeps an approval scoped to `touches-ruled-artefact` whatever the merge brings, a rule or a place, since pm does not ask about it. So the reviewer may never judge this PR's text under a rule or a place the base brings in through a clean merge.
+
+- **Who judges it instead.** Nobody at this gate, once the reviewer has approved.
+- **How to have it judged.** `review-pr <N> --force` has the reviewer judge the PR as it stands.
+
+Every command that judges whether a verdict stands applies this one rule, so none disagrees about which verdict stands. Each names a stale verdict's reason; `review-pr` names it for every reviewer it re-runs.
+
+This handles the common cycle: agent reviews, posts `APPROVED`; author pushes a fix the reviewer checks; the prior `APPROVED` is stale; agent must re-review and post a fresh verdict (remote path: triggered out-of-band; local path: developer runs `review-pr` to re-invoke).
+
+The `back-to-draft` cycle (per DEC-026) explicitly dismisses prior `APPROVED` GitHub reviews; it does **not** dismiss the verdict comments (comments are informational; the freshness rule above already invalidates a verdict once the commits `back-to-draft` is reacting to change what its reviewer checks).
+
+### Allowlist as attestation, not security
+
+The `review.agents.remote_registered:` and `review.agents.local_registered:` allowlists are the project's **attestation** that these identities / names are trusted to satisfy the approval gate. They are not security controls in the cryptographic sense:
+
+- An adopter with repo write access can add an identity to either list by editing `project/config.yaml`. Anyone who can push to `main` can modify the allowlists.
+- The local path's relaxation of author-exclusion makes the honor-system aspect explicit: the developer attests they ran the agent and accepts the verdict. A malicious developer could post the structured comment without actually running the agent. The kit doesn't prevent this; the comment records what was claimed, and the developer bears the same responsibility as for a `--bypass "<reason>"` invocation.
+- The actual server-side enforcement of "who can merge" is GitHub branch protection (CODEOWNERS, required reviewers, required status checks). The allowlists do not interpose between a malicious actor with repo write and a merge.
+- What the allowlists *do* prevent: an honest mistake (a random identity posting `Reviewer agent: APPROVED` by accident or as a joke; a developer typing a non-existent local agent name), a typo in agent setup, an unregistered identity / name satisfying the gate.
+
+Adopters who need cryptographic guarantees configure GitHub branch protection with required-reviewer constraints layered on top of this DEC's mechanism. The methodology provides the attestation surface; server-side security is out of scope here.
+
+### Refusal when agent-mode + no APPROVED verdict
+
+`done-work` refuses to merge when the resolved mode is `agent` and the gate has no valid `APPROVED` verdict on either path:
+
+```
+[refused] Agent approval required but no valid APPROVED verdict present
+            → resolved mode: agent (source: <project default | label `review:agent`>)
+            → remote registered: <github_login or "(none)">
+            → local registered: <name(s) or "(none)">
+            → most recent verdicts on this PR:
+                - remote (<github_login>): <APPROVED | CHANGES_REQUESTED | none>[ (stale <VERDICT> — <why>)]
+                - local (<name>): <APPROVED | CHANGES_REQUESTED | none>[ (stale <VERDICT> — <why>)]
+            → Remediation:
+                a) wait for the remote agent to post APPROVED (or trigger it manually)
+                b) run `review-pr <N>` to re-invoke the local agent(s)
+                   [it skips a fresh CHANGES_REQUESTED (<names>): push the fix it asks for,
+                    or have it re-review the PR as it stands with `review-pr <N> --force`]
+                c) merge with `done-work --bypass "<reason>"`
+                d) if no agent is configured, set `review.mode: human` or merge with --bypass
+```
+
+When the most recent verdict is `CHANGES_REQUESTED`, the refusal message surfaces that fact — the developer knows there are findings to address before re-review will produce `APPROVED`. When that `CHANGES_REQUESTED` is fresh, `review-pr` skips its reviewer, so the refusal names `review-pr <N> --force` as the way to a re-review of the PR as it stands. A stale verdict is named with why: the head it reviewed and what changed since (`reviewed <sha>; changed since: <paths>`), a base outside the base branch's history, why that could not be read, or — for a verdict naming no head — that it was posted before its head arrived, or why the arrival could not be read. The developer sees which change cost the approval. For `touches-ruled-artefact`, the reason also names the ruled artefacts altered or brought under a rule, which may lie outside the changed paths.
+
+### Sub-decisions index
+
+| Topic | Resolution |
+|---|---|
+| Two execution paths | Remote (bot identity) and local (developer attestation of locally-run agent). Project may use either or both. |
+| Verdict format — remote path | First line: `Reviewer agent: APPROVED` or `Reviewer agent: CHANGES_REQUESTED`. Body below is freeform commentary. |
+| Verdict format — local path | First line: `Reviewer agent (local, <name>): APPROVED` or `Reviewer agent (local, <name>): CHANGES_REQUESTED`. `<name>` matches `review.agents.local_registered:` entry. Body below is freeform commentary. |
+| Verdict marker | `<!-- pkit-verdict -->`, with the reviewed head and base when known, on a line of its own. The gate counts only a verdict that carries it; the read surface shows every verdict-shaped comment. |
+| Verdict vocabulary at v1 | `APPROVED` (satisfies gate) and `CHANGES_REQUESTED` (does not satisfy gate). Matches GitHub native PR-review state names for transferable mental model. |
+| Verdict-line grammar | Remote: `Reviewer agent: <VERDICT>`; local: `Reviewer agent (local, <name>): <VERDICT>`; `<VERDICT>` ∈ {`APPROVED`, `CHANGES_REQUESTED`}; matched after stripping surrounding whitespace. |
+| Consumer scan contract | A consumer extracting a verdict from an agent's raw output scans for the first grammar-matching line **anywhere** in the output (not line-1-only — reasoning agents emit preamble). First match wins; no match anywhere → fail closed (no verdict posted, gate unsatisfied, full output surfaced for debugging). |
+| Comments without the prefix | Implicitly informational. Do not affect the gate. |
+| Finding tags | Each finding begins with `[block]`, `[advisory]` or `[person]`, with any grade of the reviewer's own after it. `[block]` is an objective failure the change owns, and withholds the approval. `[advisory]` withholds and holds nothing. `[person]` cites an accepted rule that binds on what the change alters or brings under a rule, but does not settle it. It withholds no approval and is not a blocking finding. It is shown to the person who authorises the merge, and a landing run authorised in advance merges only if it found the finding's verdict when it started, and that verdict stands for the head it merges (DEC-055 point 3). The tags widen no reviewer's remit, and a consumer reads their form leniently. The verdict line alone decides the gate, and an untagged finding counts as `[advisory]`. |
+| Remote-path identity check | Author matches `review.agents.remote_registered[0].github_login` AND author is not the PR author. |
+| Local-path identity check | Author-exclusion **relaxed** — the developer attests they ran the agent. The local agent name must be in `review.agents.local_registered:` AND a file must exist at `.claude/agents/<name>.md`. |
+| Freshness | Judged on each reviewer's latest verdict only. A superseded verdict never counts. A verdict naming its reviewed head stays fresh until the author's changes since reach what its reviewer is required for. For an `APPROVED` from a reviewer whose every rule is a floor, that is a change satisfying one of its floors. For every other `APPROVED` and for every `CHANGES_REQUESTED`, it is any change. A clean merge of the base is no change. A verdict naming its reviewed base goes stale once that base is outside the base branch's history. A verdict naming no head must post-date its head's arrival on the host, and is stale where that cannot be read. A missing commit is fetched first, and what the fetch does not settle makes the verdict stale, never fresh. Each floor reads the changes its own way, and the not-code list narrows `touches-code` alone. For `touches-ruled-artefact`, a shallow checkout or a backbone command that cannot answer makes it stale too. Both paths. |
+| Multi-local-agent composition | All-must-approve — every locally-registered agent must have a fresh APPROVED verdict for the gate's local path to satisfy. At v1 (singleton), trivially reduces to one agent. |
+| Number of registered agents at v1 | At most one remote, at most one local. Multi-agent pipelines deferred per COR-007. |
+| Invocation command (local path) | `review-pr <N>` is the sole entry point. The developer invokes it after `review-work` (and after any subsequent fix-push cycle). `review-work` is unchanged by this DEC. |
+| Native review delivery | `review-pr` also posts each verdict as a native `gh pr review` alongside the comment; the gate reads the comment, branch protection the native review. Skipped when the reviewer is the PR author or the head moved while the reviewer ran, degraded to comment-only on any other gh failure; `--no-native` opts out. Native-only delivery is deferred. |
+| Allowlist framing | Attestation, not security. The local path's relaxation of author-exclusion is explicit honor-system; the developer takes responsibility. |
+| Stale verdict | Ignored by the gate-checker (the freshness rule). Re-invoke (remote: out-of-band; local: `review-pr`) to produce a fresh verdict. |
+| `back-to-draft` interaction | Does not dismiss verdict comments; the freshness rule handles staleness automatically. |
+| Refusal when agent-mode + no fresh APPROVED | `done-work` refuses with remediation pointer (wait for remote, run `review-pr`, bypass, or switch mode). |
+
+## Rationale
+
+**Why a comment sentinel (not a review, not a label).** Three reasons:
+
+- *Reviews require write authority to a specific GitHub permission level* that not every agent identity has. Comments require only repo-comment permission, which is a lower bar.
+- *Labels are heavyweight for transient approval signals* — they persist on the issue/PR until explicitly removed, and don't carry timestamps cleanly. Comments do.
+- *Comments are streams the methodology already uses for audit trails* (DEC-026's `Promoted`, `Approved`, `Handoff` comments). The sentinel fits the existing pattern.
+
+**Why a native review alongside the comment.** On a dogfooding adopter (mockingbird, on GitHub Enterprise) the comment verdict did **not** satisfy branch-protection "required approving reviews", and an agent had to hand-post a native review. Delivering the native review alongside the comment gives GitHub the state branch protection reads, while the gate reads the comment, so `done-work` needs nothing from it.
+
+**Why first-line-exact-match (not whole-body-exact-match or arbitrary regex).** A whole-body-exact-match (where the comment is *only* `Reviewer agent: APPROVED` with nothing else) conflates the *gate signal* with the *commentary*: findings the agent wants to surface require a separate comment with a different shape. First-line-exact-match separates them cleanly — the first line is the signal (machine-parseable, auditable at a glance), the rest of the comment is the explanation (free-form, human-readable). Anyone scanning the PR thread sees the verdict line and knows the state; anyone wanting detail reads on.
+
+**Why GitHub-aligned verdicts (`APPROVED` / `CHANGES_REQUESTED`).** Three reasons: (a) the vocabulary is already in adopters' mental models from GitHub's native PR review — no new terminology to learn; (b) the verdicts map 1:1 to GitHub Review states (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`), so future migration from comment-based verdicts to actual `gh pr review` objects is a mechanical change with no semantic shift; (c) "REJECTED" was considered and rejected as too terminal — `CHANGES_REQUESTED` correctly signals "iterate, don't abandon".
+
+**Why three finding tags.** A finding a person must judge fits neither `[block]` nor `[advisory]`. As `[block]`, it would hold the change at `CHANGES_REQUESTED` on a judgement call until someone overrides the reviewer ([project-management:DEC-050-per-reviewer-override]). That trains the override reflex that blocking only on objective failures exists to avoid. As `[advisory]`, it would ride an approval, and no step would bring it to anyone. `[person]` brings it to the person placed to judge it, the one who authorises the merge, and blocks the change on nothing.
+
+**Why a `[person]` finding holds a merge and a point of taste does not.** A `[person]` finding judges the change under an accepted rule, and an accepted rule binds on the artefacts its set reaches (COR-051 points 4 and 7). A point of taste binds nothing, so it stays `[advisory]`. So does a judgement call within the reviewer's remit that no rule backs, since the reviewer's own reading binds the change to nothing. The finding cites its rule by id, so a reader can check which side of the line it falls on, and the line does not rest on how sure the reviewer is.
+
+**Why the tags widen no remit.** Every local reviewer gets the same brief. If the tags let a reviewer cite any rule it came across, every reviewer could block or hold merges under rules nobody asked it to judge. Nobody would have tried it on those rules either. Which rules a reviewer judges stays in its own instructions, where its owner decides it.
+
+**Why an untagged finding holds nothing.** Reading an untagged finding as `[person]` would hold merges on every line of commentary, from every reviewer whose instructions do not name the tags. What this gives up is a finding a reviewer means for a person but leaves untagged. The landing command's hold on a `[person]` finding cannot prove that a person read it in any case ([project-management:DEC-055-pr-lists-answers] point 5).
+
+**Why two verdicts at v1 (not three, not just one).** GitHub natively supports four review states (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`). For v1, only `APPROVED` and `CHANGES_REQUESTED` carry verdict semantics. `COMMENTED` is unnecessary — any comment without the `Reviewer agent:` prefix is already implicitly commentary. `DISMISSED` doesn't apply to comments (it's a transition on a GitHub Review object). Two verdicts cover the gate-relevant cases; the third (commentary) is absence-of-verdict.
+
+**Why singleton (one remote, one local) at v1.** Per COR-007's recurrence test: zero specialist-agent use cases exist today. No kit-shipped reviewer agent produces the verdict yet; no project has two reviewer agents in use. Pinning a multi-agent contract before single-agent observation is premature abstraction. The v1 singleton mechanism per path is forward-compatible — the list shape of both `remote_registered:` and `local_registered:` permits future extension.
+
+**Why two paths (remote + local), not one.** The two paths serve distinct adoption modes. The remote path is the *operational* path — fully autonomous, no developer involvement after setup, supports CI-driven workflows and closes the autonomous-feature-delivery loop. The local path is the *adoption* path — leverages the kit's `.claude/agents/` deployment surface that's already configured for any Claude Code-using project, requires no GitHub App installation or service-account creation, fits the developer-at-the-keyboard workflow. Shipping only the remote path would force every adopter to set up a bot (high friction for solo developers and exploratory projects); shipping only the local path would block fully autonomous workflows. Both paths together cover the real-world spectrum.
+
+**Why relax author-exclusion for the local path (the honor-system trade-off).** The local agent runs on the developer's machine and posts the verdict using the developer's gh credentials. The developer is also the PR author in solo workflows. Strict author-exclusion would reject every local-path verdict; the path would be useless in its primary use case.
+
+The relaxation is structurally equivalent to DEC-026's `--bypass "<reason>"`: the developer signals via the kit command that they are taking responsibility for the merge, with the comment as the recorded reason. The local path adds two constraints over a raw `--bypass`:
+
+- **A structured shape** — the comment must match the `Reviewer agent (local, <name>):` format and uppercase verdict. Manually fabricated verdicts are at least *visible as such* in the PR thread (a verdict comment without a corresponding `review-pr` invocation log entry is detectable on inspection).
+- **A registered-name constraint** — the agent name must appear in `review.agents.local_registered:` AND have a deployed agent file at `.claude/agents/<name>.md`. The developer can't claim a verdict from a nonexistent agent.
+
+Beyond those, the kit does not verify that the agent actually ran or that its output matches the verdict claimed. The honor-system aspect is essential to the local path; concealing or overstating it would mislead adopters about what guarantees the gate provides.
+
+Adopters who need stronger guarantees layer GitHub branch protection on top — required-reviewer constraints on `main` enforce server-side checks that the local path cannot satisfy alone. The methodology's responsibility is to provide the *attestation surface*; the *enforcement floor* is the substrate's job.
+
+The honor-system relaxation is provisional at the capability level: the pattern "kit-invocation grants developer-attestation that substitutes for identity-based author-exclusion" is methodology-level by shape (it would recur in any capability that invokes agents on the developer's machine to satisfy a gate). Per COR-007, when a second capability adopts the same shape, the principle should promote to a kit-level COR that captures the trust model uniformly. Flagged in Implications for future maintainers.
+
+**Why `review-pr` is the sole local-path entry point (no auto-invocation in `review-work`).** Two reasons:
+
+- *Performance contract*: DEC-020's verb-subject command surface is implicitly fast and deterministic. Folding LLM calls into `review-work` would make a state-transition wrapper potentially-multi-minute and non-deterministic — strain the philosophy. `review-pr` is the explicit slow-command entry point; the developer knows what they're signing up for when they run it.
+- *Failure isolation*: an LLM call failing (rate limit, timeout, network error) shouldn't fail the state transition. Keeping `review-pr` separate means `review-work` always exits cleanly regardless of LLM availability; the developer runs `review-pr` independently and handles failures there.
+
+The "discoverability gap" concern (developer forgets to run `review-pr` after `review-work`) is closed by `done-work`'s refusal template: when `done-work` is invoked without a valid local-agent verdict, the refusal names `review-pr` as the remediation. The developer cannot accidentally skip the local-agent review and still merge.
+
+**Why all-must-approve for multi-local-agent composition.** When N local agents are registered, each represents a specialist concern the project decided matters (e.g., a security checker plus a code-quality reviewer). Any-approves semantics would let a passing-but-unrelated agent satisfy a gate the project explicitly wanted N concerns checked for. All-must-approve preserves the project's stated review surface. (At v1 N=1, so the rule is moot operationally; the contract is pinned for future N>1 extension.)
+
+**Why identity-check on the comment author.** Without it, anyone with repo-comment permission could post `Reviewer agent: APPROVED` and satisfy the gate. The identity match limits the signal to the configured agent. The combination of (a) identity-match and (b) author-exclusion prevents both impersonation (a random commenter pretending to be the agent) and self-approval (the PR author posting as themselves).
+
+**Why allowlist-as-attestation (not allowlist-as-security).** The allowlist file is project-side and adopter-editable. A malicious actor with repo write can modify it. Calling it "security" overstates what it provides; the real security boundary is GitHub branch protection (server-side, not adopter-modifiable). The attestation framing is honest about what it guarantees: "this identity is the one the project agreed to trust", subject to the project's own access controls.
+
+**Why a verdict goes stale when the author changes what its reviewer checks (not other freshness rules).** Four alternatives considered:
+
+- *No freshness check* — would allow a sentinel posted in PR week 1 to satisfy a merge in week 4 after substantial changes. Defeats the gate.
+- *Post-date a specific marker (e.g., last `review-work` invocation)* — depends on a methodology event that isn't always invoked. Some PRs may bypass `review-work`.
+- *Post-date the latest commit* — simple, but every commit stales every verdict: a clean merge of the base branch, a changeset, or a Markdown fix after a documentation finding costs a full round from reviewers whose concern the change never touched (#1179). And a comment that does not record what it reviewed cannot tell a commit made before the review but pushed after it from one the reviewer saw, so such a commit passes the gate unreviewed.
+- *Stale once the author's changes since the reviewed head reach the reviewer's remit* (chosen) — the verdict names the head it vouches for, so what was reviewed is exact, and only a change the reviewer is there to check costs a re-review. A reviewer whose every rule is a floor has its floors as its remit; the baseline's remit, and that of a reviewer with any classification rule, is the whole change, so any change stales theirs — a classification rule declares what the reviewer is for whether or not it matched this PR. Floor scoping spares only approvals: a rejection is what the author is answering, so any change stales it, and a reviewer is never left blocking a fix it was not shown. Judging only the latest verdict keeps a rejection gone stale from handing the gate back the approval it overrode, and pinning the reviewed base keeps a retargeted PR from carrying its old verdicts over commits they never covered. A merge of the base branch is not the author's change: the base reached its branch through its own review, and the clean three-way merge is computable, so only what the author did inside the merge counts. What this gives up is a semantic conflict introduced by the base, which no reviewer re-reads; CI on the merged result catches what tests can, and the gate claims no more than that. The rule needs the commits locally, fetches what is missing, and fails closed when it cannot read them even so, so a missing fetch costs a re-review, never an unreviewed merge.
+- *Reading the ruled-artefact floor a stretch at a time* (chosen for that floor) — the reading comes as close as it can to the resolver's reading of the whole PR, cut only where a clean merge forces it. Whether an artefact is ruled depends on the repository's state, not only on the paths a commit changes. Within a run, as in the resolver's reading of the whole PR, an edit and a later commit that brings it under a rule are judged together. An edit undone within a run is no change ([COR-050](../../../decisions/core/COR-050-anchors-and-friction.md) point 5). A clean merge ends a run, since a stretch across it would count what the base brought. A merge the author changed something inside counts whole, since no path tells what the author's change there brought into the declared places. The backbone's command compares two commits, and the author's part of a merge is no commit of its own. That has a cost: where the base often edits ruled pages, resolving any conflict there can cost the floor's reviewer a re-review, in code alone included. Keeping the approval through a clean merge is a choice of cost for this floor, not a guarantee, since the base's own review never saw this PR's text. It spares the re-review rounds [project-kit#1179](https://github.com/aleskalfas/project-kit/issues/1179) removed. CI on the merged result catches only the parts of a rule that checks enforce ([COR-051](../../../decisions/core/COR-051-rule-sets.md) point 2), where the pipeline runs them.
+- *Reading each of the author's commits on its own, for the ruled-artefact floor* — an edit that a later commit of the run undoes would stale the approval, while the resolver counts nothing for that edit. It would also ask the backbone once a commit, where the stretch reading asks once a run.
+
+**Why no separate `--require-agent` flag in DEC-027.** DEC-027's Layer 3 has `--require-human`. There's no symmetric `--require-agent` because the agent path is the default; an operator who wants agent review uses no flag (and the default kicks in). If the project default is `human` and the operator wants agent for this invocation, they can flip the issue label (`review:agent`) per Layer 2 — but per-invocation agent-override is a rare enough case that a flag isn't worth shipping.
+
+### Alternatives considered
+
+- **Multi-agent pipelines (named ordered chains) at v1.** Rejected — no recurrence; premature per COR-007. Future DEC pins the pipeline contract when a second specialist-agent use case appears. The singleton mechanism here is forward-compatible (the list shape of `registered:` extends without breaking).
+
+- **Verdict line includes the agent name in the remote path (`Reviewer agent (<name>): APPROVED`).** Rejected *for the remote path only*. The remote path's identity-check on the comment author already disambiguates the agent (the GitHub author metadata is authoritative); baking the name into the remote-path body would be redundant and create two sources of truth. The **local path includes the name in the body necessarily** — when multiple local agents are registered, all post under the same developer's identity, so the body name is the only disambiguator. The asymmetry is intentional: remote-path uses author metadata, local-path uses comment-body marker; whichever source is authoritative for the path is the disambiguator.
+
+- **Use a GitHub Review object (not a comment) as the sentinel.** Rejected. Reviews require specific GitHub permissions some bot identities don't have; the comment-based mechanism works for any identity with repo-comment permission. Reviews are also coupled to the PR's diff state in ways that make freshness harder to control than a reviewed head the comment records itself.
+
+- **Allow the PR author to post the sentinel if it matches a kit-known agent signature.** Rejected. Defeats the identity check. The author-identity exclusion is what makes the path different from self-approval.
+
+- **No allowlist; any non-author identity posting `Reviewer agent: APPROVED` counts.** Rejected. Without the allowlist, a random commenter (or a stale CI bot, or a misconfigured workflow) could trivially satisfy the gate. The allowlist makes "which agents count" explicit and version-controlled.
+
+- **Allow multiple registered agents per path; any of them satisfies the gate.** Rejected at v1 — the question of "do all of them have to approve, or any one?" depends on the project's review surface (specialist agents typically should all approve; redundant general-purpose agents typically any-approves). The multi-agent extension defers per COR-007 until concrete patterns emerge. Singleton-per-path at v1; the all-must-approve rule is pinned for future multi-local extension.
+
+- **Remote-path only — no local path at v1.** Rejected. The local path is the lower-friction adoption path for solo developers and exploratory projects; requiring a bot setup for every agent-mode adoption is a friction cliff. The two paths cover distinct workflows; shipping both at v1 is small marginal cost over the remote path alone.
+
+- **Local-path only — no remote path at v1.** Rejected. The remote path is required for the autonomous-feature-delivery loop (no developer at the keyboard). Without it, agent mode can't run fully autonomously. The two paths together cover both adoption modes.
+
+- **Strict author-exclusion for the local path (no honor-system relaxation).** Rejected. Strict author-exclusion would reject every local-path verdict in solo workflows (the developer is both the runner and the PR author). The local path would be unusable in its primary use case. The honor-system trade-off is acknowledged and bounded by the structured comment shape + registered-name constraint; adopters who need stronger guarantees layer branch protection.
+
+- **Local agents register only via `.claude/agents/` filesystem presence (no separate config allowlist).** Rejected. Filesystem-only registration means any agent file in `.claude/agents/` could satisfy the gate — including agents the project hasn't reviewed or approved. The dual requirement (registered AND deployed) makes the project's review surface explicit in config.
+
+- **Auto-invoke local agents in `review-work` (after the PR opens).** Rejected. Folding LLM calls into `review-work` would make a fast state-transition wrapper potentially-multi-minute and non-deterministic, straining DEC-020's verb-subject performance profile. It also extends DEC-026's `review-work` contract from another DEC — an architectural smell. v1 ships `review-pr` as an explicit separate command; the developer chooses when to incur the LLM-call latency.
+
+- **Auto-invoke local agents on `after_open_pr` hook (per DEC-024).** Considered as a way to keep `review-work` fast while still automatically firing agents on PR creation. Deferred — adopters who want auto-invocation can wire it themselves via DEC-024's `custom-script` hook kind invoking `review-pr`. A kit-shipped default hook is an additive future option once DEC-024's hook surface and the `review-pr` mechanism both stabilise.
+
+- **Freshness via last `review-work` invocation, not the commits.** Rejected — depends on a methodology event that isn't always invoked. The commits after the reviewed head are the substrate-authoritative freshness signal.
+
+## Implications
+
+- The pm capability extends `project/config.yaml` with `review.agents.remote_registered:` and `review.agents.local_registered:` (each a list of at most one entry at v1). `pre-check.py` validates the singleton-per-path constraint and verifies that every `local_registered:` name has a corresponding file at `.claude/agents/<name>.md`.
+- `done-work` extended: when resolved mode is `agent` (per DEC-027), the gate-checker query runs the seven-step algorithm above. If satisfied via the configured path(s), merge proceeds; if not, the refusal template fires.
+- The pm capability gains a new `review-pr` verb-subject script at `.pkit/capabilities/project-management/scripts/review-pr.py`. It fits DEC-020's verb-subject convention (verb=`review`, subject=`pr` — `pr` is an established entity); it is sibling to DEC-026's seven-command lifecycle palette, not a member of it. `review-work` is unchanged by this DEC.
+- `review-pr <N>` reads `review.agents.local_registered:`, validates each name against `.claude/agents/`, dispatches each agent in parallel against the PR's diff, captures verdicts, and posts each as a comment in the local-path format under the developer's gh identity, and as a native review where GitHub permits one (see "Invocation command (local path)").
+- `review-pr`'s brief names the three finding tags, what each means, and that they widen no remit, so every local reviewer tags its findings alike. `pm-reviewer` writes its severity after the tag. Its `[block]` findings are exactly the ones that make it request changes. The command that lands a pull request reads the tags: it prints the `[block]` findings of a `CHANGES_REQUESTED`, and prints and holds on `[person]` findings as [project-management:DEC-055-pr-lists-answers] point 3 says.
+- **Local-path default reviewer agent.** The pm capability ships a default `pm-reviewer` agent at `.pkit/capabilities/project-management/agents/pm-reviewer.md` (per COR-026 — discipline-implying agents live in the capability that ships the discipline). Adopters who configure `local_registered: name: pm-reviewer` get the kit-shipped default; adopters may also replace or add to it with their own agents under `.claude/agents/` (subject to v1's singleton-per-path constraint). The reviewer agent's body emits the local-path verdict format and applies the capability's conventions (Conventional Commits, branch/type alignment, classification axes, surface-change discipline). The remote path ships no default — bot identity, GitHub App, or service-account setup is adopter-managed. The methodology specifies the contract; the local-path agent implementation is now kit-shipped via this capability, the remote-path agent implementation is adopter-side.
+- DEC-026's `done-work` approval-gate row is mode-conditional after this DEC lands: in `human` mode, the three-way OR per DEC-026; in `agent` mode, the remote-or-local agent paths from this DEC plus `--bypass`.
+- v1 ships singleton-per-path support. Multi-agent pipelines are a future DEC after COR-007 recurrence; the all-must-approve rule for multi-local is the contract that future extension will inherit. The list shapes of `remote_registered:` and `local_registered:` are forward-compatible — extending each to lists of N agents is additive, not breaking.
+- **Acceptance gate** (per `.pkit/rules/core.md` rule 2): this DEC depended on **DEC-026 and DEC-027 accepting first** — the cite-graph is one-directional (this DEC depends on both, not vice versa). All three are now `accepted` and the implementation (the gate-check algorithm, the config schema fields, the refusal template, `review-pr.py`) has shipped; this bullet stands as the record of that satisfied dependency.
+- **Universal-applicability flag for methodology review**: "designated agent satisfies an authorisation gate via attested comment" is a pattern potentially reusable across other capabilities (decision-record acceptance, release management, incident management — anywhere an approval gate exists). Both paths (remote bot identity, local user attestation) have the same universal shape. COR-007's recurrence test should fire on second-instance use; the pattern may promote to a kit-level COR at that point. Flagged here for future maintainers.

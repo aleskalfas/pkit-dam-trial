@@ -1,0 +1,1982 @@
+---
+reader: user
+kind: reference
+pkit:
+  friction:
+    anchors:
+      path:
+        - .pkit/capabilities/project-management/scripts/**
+        - .pkit/capabilities/project-management/schemas/**
+        - .pkit/capabilities/project-management/agents/**
+        - .pkit/capabilities/project-management/skills/**
+        - .pkit/capabilities/project-management/templates/**
+        - .pkit/capabilities/project-management/permissions/**
+        - .pkit/capabilities/project-management/adapters/**
+        - .pkit/capabilities/project-management/decisions/**
+        - .pkit/capabilities/project-management/package.yaml
+        - .pkit/capabilities/project-management/rule-sets/pm.md
+      record: [COR-008, COR-017, ADR-076, COR-020, COR-021, COR-023, COR-030, COR-039, "COR-050#16", COR-053, COR-057, COR-061, COR-064, COR-070, ADR-004, ADR-016, ADR-019, "ADR-025#5", ADR-026, ADR-031, ADR-035, ADR-037, ADR-038, ADR-042, ADR-050, ADR-066]
+      artefact:
+        - .pkit/decisions/README.md#checking-a-changes-numbering
+---
+
+# project-management capability
+
+A project-management discipline an adopter installs to get a team-wide rulebook for filing, validating, and transitioning work — encoded as data the engine reads at runtime. Issue hierarchy, state machine, body shape, title format, branch and PR conventions, validation severity, and time containers are all schemas; the skills and agent are methodology-agnostic and act on whatever the schemas say.
+
+Install this capability when:
+
+- Your team wants a single rulebook for project-management work across multiple projects, not folklore re-invented per project.
+- You want AI agents to file, validate, transition, and close issues *mechanically* — the methodology in data, not in agent prompts.
+- You're on GitHub (Issues, sub-issues, Milestones, Projects v2). The methodology binds to GitHub primitives directly; it does not transfer to Linear/Jira without rewriting.
+
+Skip it for solo projects with no shared methodology, for teams whose tracker is not GitHub, or for projects where ad-hoc issue management is sufficient.
+
+## Relationship to the pm-workflow spec
+
+This capability is the **operational realization** of the [pm-workflow](https://github.com/aleskalfas/pm-workflow) methodology. pm-workflow is the *spec* — the team's authoring workspace where the methodology is iterated, debated, and ratified (its `MET-NNN` decisions, its narrative `METHODOLOGY.md`, its review-agent ceremony). This capability *distills* that spec into a form `pkit` can install: per-decision DECs that cite their `source: MET-NNN` upstream, schemas that encode the operationally-material rules, and an engine that consumes them.
+
+The authority signal for distillation is pm-workflow's `main` branch. Capability DECs carry the upstream commit SHA in their `source:` frontmatter; readers can always walk back to the MET they came from. See `decisions/DEC-001-distillation-lineage.md` for the contract.
+
+## What this capability ships
+
+`pkit capabilities install project-management` copies the following into the adopter's `.pkit/capabilities/project-management/`:
+
+- `decisions/DEC-NNN-*.md` — principles distilled from pm-workflow's METs (1:1). Some are schema-backed; others ship as policy prose adopters read.
+- `schemas/<name>.yaml` + `<name>.schema.json` — the operationally-material rules in data form: issue hierarchy, workflow state machine, body shape, title regexes, label classification, git conventions, validation severity, time containers.
+- `skills/pm/` — the composite engine skill (`pm.md` dispatcher + `create-issue.md` + `validate-body.md` + `transition-state.md` + `batch-plan.md` + `fix-drift.md` + `work-loop.md` sub-procedures, per COR-020). Methodology-agnostic; reads schemas at runtime.
+- `agents/project-manager/project-manager.md` (with its storyboard) — orchestrates the three skills, enforces methodology gates.
+- `templates/{EPIC,Feature,Umbrella,Task,PR}.md` — body shapes adopters fill in.
+- `scripts/pre-check.py` — read-only diagnostic verifying every methodology prerequisite is in place (DEC-017). Hard-gate on every pm operation.
+- `scripts/bootstrap.py` — first-time setup. Creates the required initial GitHub state (labels per classification axes; optionally a starter EPIC). Additive idempotent.
+- `scripts/migrate.py` — adopter-state reconciliation after capability upgrades. Reads `migrations/<version>.yaml` manifests; per-change confirmation gates on every destructive step.
+- `scripts/detect-state.py` — the issue lifecycle's classifier, the detection the process engine runs to find where an issue stands. Read-only: it reads the issue once and answers which lifecycle state it is in, by `move-issue`'s inference (closed → `done`; the first `state:*` label; a milestone → `backlog`; else `todo`), or `null` — with the inferred value in its reason — when that value is not a lifecycle state (a derived `open` / `blocked`, a stray state label). Every state of `schemas/workflow.yaml` names it under `mode: classified` ([project-management:DEC-033-rebind-issue-lifecycle-onto-process-substrate] D2), so `pkit process status` and each lifecycle verb read an issue once per reading of its position rather than once per state. When the issue cannot be read it says why on standard error and exits non-zero, and the engine shows every state as indeterminate with that cause. The five per-state detectors (`scripts/detect-<state>.py`) answer from the same read and stay registered, for direct use; the shipped lifecycle does not run them. The classified lifecycle needs a backbone that implements the mode: under an older `pkit` the engine cannot tell where any issue is, so the lifecycle verbs move issues on their own local inference and warn that the engine did not record the move — upgrade the backbone with the capability.
+- `migrations/` — versioned manifests of adopter-state changes the capability has shipped. Empty in v0.2.0; populated on subsequent surface changes.
+- `rule-sets/pm.md` and `rules.md` — the work tracker's own operational rules, the capability's loaded rule set `PM` and the loaded file generated from it ([COR-070](../../decisions/core/COR-070-capability-loaded-rules.md)). Every session loads `rules.md` wherever the capability is installed, through [the capabilities' rules index](../../rules/README.md#the-capabilities-rules-index) `CLAUDE.md` includes, and its accepted rules bind on the session's work (the rules README, "A capability's rules"). Its two accepted rules: a pull request that closes issues names each with a closing keyword, first in its body as the PR template puts it (`project-management:RS-PM-001`); and an issue carries one value on each required axis the project's substrate map carries (`project-management:RS-PM-003`). Branch naming, and a branch's related issue, are core's (COR-008). Here that issue is the GitHub issue of the Task the branch closes, whose number the branch name carries ([project-management:DEC-013-branch-and-pr-conventions], `schemas/git-conventions.yaml`'s `branch-name` entry).
+
+The engine is **methodology-agnostic by design**: when the methodology evolves upstream, schemas change; the engine picks up the new rules automatically without skill-code edits. Adding a state, a new issue type, or a new title regex becomes a schema edit.
+
+## Version provenance on issues and PRs
+
+Every issue and PR the capability's scripts file or edit is stamped with the methodology version in force — so when a bug surfaces you can tell whether it was filed before or after a given upgrade, and whether the installed CLI has drifted from the synced project tree. Per [project-management:DEC-041-version-provenance-stamp] (the what/why) and ADR-037 (the write-path contract), the stamp has two parts, both written **only by the scripts** — never by an agent or a human:
+
+- **A one-time filing comment** posted when the issue/PR is created, recording the version it was *born under* (backbone tree, capability, and installed CLI). It is immutable — the load-bearing record that answers "was this filed before or after the buggy upgrade?".
+- **A self-replacing footer** at the foot of the body, showing the version of the *current* touch, with a `⚠` when the installed CLI and the synced tree disagree. The footer carries versions only (no date — the date lives in the comment) so re-stamping is idempotent.
+
+The footer is a methodology-managed region delimited by `<!-- pkit-provenance:start -->` / `:end` sentinels. On every body write the scripts strip any existing region and reissue exactly one, so a doubled or stale footer is structurally impossible; the agent's read path (`show-issue`) strips it, so agents compose against footer-free bodies and never own the footer bytes. Provenance is **best-effort**: a failed stamp never blocks the underlying operation.
+
+**Accepted gap:** issues created before the capability adopted this convention, or by hand in the GitHub web UI, carry no stamp — there is no back-fill obligation. Triage of such an issue falls back to correlating its creation date against the version file's history.
+
+## Adopter setup
+
+> **Short form**: every `pkit project-management <subcommand>` shown below also works as `pkit pm <subcommand>` — the capability registers `pm` as an alias via `aliases:` in its `package.yaml`. Both resolve to the same dispatch group; pick whichever reads better.
+
+**project-management needs a GitHub repository.** The capability keeps its work in a GitHub repository, as labels, issues and pull requests. Steps 1 and 2 work without one. From step 3 on, the checkout needs a remote on GitHub, and `gh`, GitHub's command-line tool, must be signed in to that host with `gh auth login`. Without both, `bootstrap` refuses at its first run, `--dry-run` included, and names what is missing.
+
+Four phases, in order:
+
+### 1. Install
+
+```
+pkit capabilities install project-management
+```
+
+Copies the capability subtree into the adopter and registers it in the backbone manifest.
+
+### 2. Author the project-side config
+
+Create `.pkit/capabilities/project-management/project/config.yaml` declaring the adopter's specifics:
+
+```yaml
+# project/config.yaml
+schema_version: 2
+has_projects_v2_board: false          # set true + projects_v2_board_id when the project has a board
+workstreams: []                       # the key stays, and the workstreams live in their own file
+# Optional:
+# projects_v2_board_id: 12
+# projects_v2_node_id: PVT_xxx        # board→node-id cache; populated at adoption
+#                                     # (bootstrap writes it; adopt-existing recommends
+#                                     # it) so create-issue skips a per-create read
+# code_path_to_doc_mapping:           # per DEC-015 + ADR-019
+#   enforce: false
+#   rules:
+#     - { code: "src/foo/**", docs: [docs/foo.md] }
+# doc_check:                          # per DEC-053 — see "Connections"
+#   sources:
+#     friction: enforcing             # a contributed source; advisory by default
+# pre_close_triage_lead_days: 3
+# gh:                                 # per DEC-023 — both fields optional
+#   host: github.com              #   target a non-`github.com` host
+#   default_owner: ai-platform-incubation   # spliced as `--owner` on cross-owner ops
+```
+
+Declare the workstreams beside the config, in `.pkit/capabilities/project-management/project/workstreams.yaml` ([project-management:DEC-018-workstream-taxonomy-and-lifecycle]):
+
+```yaml
+# project/workstreams.yaml
+schema_version: 1
+workstreams:                          # one entry per allowed workstream value
+  - capabilities
+  - schemas
+  - cli
+```
+
+An entry can also carry attributes, such as a status and a deprecation reason, in the mapping form DEC-018 shows. `config.yaml`'s `workstreams:` key is the legacy place for the workstreams, and `pre-check` reports a legacy fallback where `workstreams.yaml` is absent. "Workstream lifecycle", under "Then use", says what filing does without the file.
+
+Further optional blocks are documented where the features that read them are described: `milestone_categories:` (per [project-management:DEC-016-time-bound-containers]), `review:` (the review-mode block under "Then use"), and `mesh_peers:` / `mesh_source:` (per [project-management:DEC-022-methodology-mesh]). The companion schema below is the complete enumeration.
+
+This config is adopter-owned. The capability's schemas are immutable kit-shipped content per the no-shared-files invariant; the config is the seam where adopter-specific values plug in.
+
+#### The default branch is the backbone's
+
+The branch work is cut from, pull requests target (DEC-013), `merge-pr` and `done-work` switch back to, and `pre-check` holds to the repository's default is **declared once, for every reader, in the backbone configuration**: `repository.default-branch` in `.pkit/project/config.yaml`, `main` when undeclared ([COR-054](../../decisions/core/COR-054-default-branch.md); the CLI reference, "Configuration file"). A project on another branch declares it there — `pkit config set repository.default-branch develop --yes` — and the core friction check, any other capability that reads the default branch and this capability then read the same branch.
+
+- **Read through the backbone.** pm asks `pkit repository base --json` and never resolves a branch itself: the default branch's name for the verbs; the commit `start-work` cuts from and `create-draft` counts commits beyond, for the default branch and an integration branch alike (COR-054 point 2 — the remote's copy, and the local branch only in a clone with no remote, which the backbone warns about); and the base `check-doc-mapping` compares with and where the branch left it — `--base`, else `$PKIT_CHECK_BASE`, else the default branch (point 3). `open-pr` and `land-work` name the pull request's base to the change check when they list the answers its change wrote — the default branch too, so `$PKIT_CHECK_BASE` in the environment never changes it — and the check resolves it as it resolves every branch named as a base (point 2); they fetch it first.
+- **Never a guess** (point 4). When the backbone cannot answer — `pkit` missing, a timeout, a failed run, a backbone older than `pkit repository base` — the verbs that act on the branch (`start-work`, `create-draft`, `open-pr`, `review-work`) refuse, naming the cause; `merge-pr` / `done-work` skip the local clean-up and say so; `pre-check` fails its default-branch check. A base that resolves to no commit refuses `start-work`, `create-draft` and `check-doc-mapping` with the backbone's reason and fix.
+- **pm's own `default_branch` is retired.** The capability's upgrade migration carries a value other than `main` over to `repository.default-branch` while the backbone declares none, and removes pm's key; only where carrying it over would need a guess (a backbone file it cannot append to, a value that is no branch name) does it keep the key and say how to declare it. Until a project upgrades, a value that differs from the backbone's still names the branch while the backbone declares none, with a warning; a declared value always wins. The schema still accepts the key, as deprecated.
+
+#### The config has a schema — unknown keys are refused
+
+`config.yaml` ships a companion JSON Schema at `schemas/config.schema.json`, bound to the installed config path by a COR-023 `binds_to:` glob in `schemas/config.yaml`. Validate a hand-edited config with:
+
+```
+pkit data validate .pkit/capabilities/project-management/project/config.yaml
+```
+
+The schema sets **`additionalProperties: false`**, so an unknown or misspelled key is a loud refusal naming the offending key rather than a silent default. This matters because every reader gets at the file through defensive `.get()` access: before the schema existed, `has_projects_v2_boards` (trailing `s`) validated fine and left the adopter in label-fallback mode, discovered only when classification landed in the wrong substrate. `pre-check` covers value-level problems (the board id resolves, the branch matches, the host is reachable) but cannot see a key that was never read; the schema covers exactly that gap. `schemas/config.yaml` is also the shipped reference instance — a valid minimal config with every optional key listed as a comment.
+
+The schema's required set (`schema_version`, `workstreams`) mirrors `pre-check`'s, so the two gates agree. `workstreams:` is required only as the legacy key step 2 describes, and both gates drop it when that key is retired.
+
+#### The `gh:` block (per [project-management:DEC-023-gh-host-and-owner])
+
+Adopters whose GitHub host is not `github.com` (Enterprise GHE deployments such as `github.com`), or whose Projects v2 board lives in a different owner from the repo, declare this in the `gh:` block:
+
+- **`host:`** — the GitHub host every `gh` shell-out should target. When set, the kit threads `GH_HOST=<host>` into every `gh` invocation and pre-check verifies `gh auth status -h <host>` succeeds. Single-org `github.com` adopters omit the field.
+- **`default_owner:`** — the owner spliced as `--owner` on cross-owner operations (board / org / cross-owner labels). Single-owner adopters whose board lives in the repo's owner omit the field.
+
+Both fields are optional and additive — an existing config without a `gh:` block continues to validate. **Config wins over ambient** per DEC-023: if both `GH_HOST` is set in the shell and `gh.host` is configured, the config value reaches `gh`. This makes the methodology reproducible from `config.yaml` alone.
+
+#### Where each axis lives — the board flag and the substrate map (per [project-management:DEC-062-axes-chosen-in-the-map])
+
+`has_projects_v2_board: true` says only that the project has a Projects v2 board. It names which board, with `projects_v2_board_id`, and puts every issue on it ([project-management:DEC-019-mandatory-issue-state]). It carries no axis (DEC-062 point 1).
+
+An axis lives where `project/substrate-map.yaml` binds it. With no map, every axis reads the kit's own labels, board or no board. In a present map, an axis it leaves out or marks `unsupported` degrades. `kit-label: true` binds an axis to the kit's own labels, so a project can move one axis to its board and keep the others.
+
+```yaml
+# project/substrate-map.yaml
+schema_version: 1
+axes:
+  type:
+    kit-label: true      # the kit's own `type:*` labels, as with no map
+  priority:
+    board: true          # a field of the configured board
+  workstream:
+    kit-label: true
+  state:
+    board: true          # the board's Status is where an open issue stands
+```
+
+`board: true` puts an axis on the board, and is admissible on `priority`, `workstream` and `state`, never on `type`. On `state`, the board's Status is the source of an open issue's position: Todo, Backlog, In Progress or Review (DEC-062 point 5). A closed issue is Done whatever its card says, so the closure cascade never needs the board.
+
+Before you bind state to your board, give its Status an option for each of the five states. Give every open issue a card and a Status too, since a position the Status does not give is never guessed.
+
+The Status is read as [project-management:DEC-051-axis-carriage-activation] point 6 says, and four outcomes are reported apart, each with its own message:
+
+- the board cannot be read. Where the configuration names no board, the read says so and makes no call to GitHub
+- the issue has no card
+- its card has no Status
+- its Status names no open state, such as Done on an open issue
+
+None falls back to the labels or the milestone, so no command acts on a position it guessed. Each command says what such a read means to it, in its own section below.
+
+A command reads only the cards of the issues it acts on: one issue's card, each ancestor's card its forward cascade walks, or the cards of the issues it lists. An archived card still places its issue. If part of a listing cannot be read, the command treats the board as unreadable, and never takes those issues for issues with no card.
+
+Where a present map leaves `state` out, or marks it `unsupported`, the state degrades. It is read from the issues themselves, and the capability writes no board Status for it. So the Status stays with the people who move it on the board.
+
+Upgrading to this version moves `schema_version` in `project/config.yaml` from 1 to 2 (DEC-062 point 6). Where the flag is not set, only the version moves.
+
+Where the flag is set, the upgrade keeps priority and workstream on the board through the map, each `default:` kept, and leaves state out. Where the flag is set and there is no map, it writes one, with `kit-label: true` on type. Its report names each binding it wrote, and each comment of the map that speaks of the board.
+
+### 3. Bootstrap
+
+```
+pkit project-management bootstrap
+```
+
+(Or the direct-path equivalent `.pkit/capabilities/project-management/scripts/bootstrap.py` — both forms work per the capability-command-dispatch convention from COR-021.)
+
+Reads the config and the capability's schemas; creates the methodology's required GitHub labels. Additive idempotent — re-running on a fully-bootstrapped repo creates nothing.
+
+**Labels created by bootstrap:**
+
+bootstrap provisions the **kit's own** labels, so it creates a palette only for an axis the kit's labels actually carry — asked per axis of the carriage accessor (per [project-management:DEC-051-axis-carriage-activation]):
+
+- `type:*` — one label per type value in `classification.yaml`.
+- `priority:*` — one label per priority value.
+- `workstream:*` — per declared workstream.
+- `state:*` — one label per lifecycle state in `workflow.yaml` (`state:todo`, `state:backlog`, `state:in-progress`, `state:review`, `state:done`). These are the substrate for `move-issue`'s state machine.
+
+An axis gets a palette where the kit's own labels carry it: with no map, or where `substrate-map.yaml` binds it with `kit-label: true` ([project-management:DEC-062-axes-chosen-in-the-map] point 4). An axis the map binds elsewhere gets none, and neither does one a present map leaves out. Each suppressed palette is reported in the plan with the substrate that carries the axis instead. Adopting an existing repo's own labels is `adopt-existing`'s job, not bootstrap's.
+
+Optionally, file a starter EPIC so subsequent Task filings have a default parent:
+
+```
+pkit project-management bootstrap --with-starter-epic
+```
+
+EPICs are PM-authority filing per [project-management:DEC-008-pm-and-implementer-roles]; the flag is the PM's explicit authorisation gesture.
+
+### 4. Verify with pre-check
+
+```
+pkit project-management pre-check
+```
+
+Read-only diagnostic. Walks every prerequisite the methodology depends on (gh auth, repo accessible, required labels present, default branch matches, config parses). Exit zero when every check passes; non-zero with remediation hints when something is missing.
+
+Pre-check is the **hard gate** on every pm operation per [project-management:DEC-017-prerequisites-bootstrap-migrate-discipline]. The project-manager invokes it as Step 0 of every action; CI workflows wire it in as a PR check.
+
+Each kit-label check runs only where the kit's own `<axis>:*` labels are that axis's substrate. That is asked per axis of the carriage accessor, which reads your `substrate-map.yaml` alone ([project-management:DEC-062-axes-chosen-in-the-map] point 1). Every other carriage skips with a line naming the substrate that does carry the axis, rather than demanding a label you may be unable to create.
+
+**What pre-check covers at v0.17.0+:**
+
+| Check | Label |
+|---|---|
+| `git`, `gh` on PATH | tooling |
+| `gh auth` active (ambient) | auth |
+| Adopter config present + parses | config |
+| `gh:` block valid; host-pinned auth works | config / DEC-023 |
+| Repo accessible | connectivity |
+| Projects v2 board resolves (where a board is configured) | substrate |
+| The board's Status has an option for each of the five states, where it is a projection of the state (DEC-006) | substrate (advisory: warns, never fails) |
+| `type:*` labels present | labels |
+| `priority:*` / `workstream:*` labels present (where the kit's labels carry the axis) | labels |
+| `state:*` labels present (where the kit's labels carry the axis) | labels — new in v0.17.0 |
+| Default branch matches config | config |
+| `workstreams.yaml` parses cleanly | config / DEC-018 |
+| `mandatory-issue-state.yaml` present + valid | schema / DEC-019 |
+| Mesh config URIs valid | config / DEC-022 |
+| `hooks.yaml` shape + per-kind validation | hooks / DEC-024 |
+| `review:` block valid; each contributed-reviewer opt-out listed with its reason | config / DEC-027 + DEC-028 + DEC-032 |
+| Title-prefix alignment (sample of open issues) | data quality — new in v0.17.0 (advisory: warns, never fails) |
+
+### 4b. (Optional) Smoke-test the installation
+
+```
+pkit project-management self-test
+```
+
+Creates a throwaway issue, advances it through the full state machine (create → backlog → in-progress → backlog → close), then cleans up. Catches transition / identity-resolution / label-routing bugs before adopters hit them in real work.
+
+Use `--dry-run` to preview the plan without mutating. Use `--skip-cleanup` to leave the issue/milestone open after a failed run for debugging.
+
+Each step prints `[ok]` or `[fail] <reason>`. Final summary line: `self-test: N passed, M failed`. Exit non-zero on any failure.
+
+### Then use
+
+```
+claude --agent project-manager "File an EPIC for <outcome>"
+```
+
+The project-manager walks the methodology end-to-end: picks a title matching the EPIC pattern, fills the body against the template, validates against the body-format and validation-severity schemas, creates the GitHub issue, runs the cascade check.
+
+**How review findings become work.** Four rules keep a review from multiplying the work it reviews; each is stated in the procedure where it applies:
+
+- whether a follow-up a reviewer produced gets a Milestone — [create-issue](skills/pm/create-issue.md), intent recognition;
+- the order of Tasks that share a file, and when they are planned as one Task — [batch-plan](skills/pm/batch-plan.md), the slicing step;
+- when `review-pr` runs, on its own or inside `land-work` — [transition-state](skills/pm/transition-state.md), the review step;
+- what a fix round carries — the same review step, and for the builder's side the builder agent, where the project deploys one.
+
+#### Issue body — parent-ref first line
+
+Every non-EPIC body opens with a parent-ref on the first line. The ref form depends on the parent type:
+
+- **Issue parent** (EPIC, Feature, Umbrella): plain `<Label>: #<N>` — e.g. `EPIC: #42`. GitHub auto-links `#42` correctly to that issue.
+- **Milestone parent**: `Milestone: [#<N>](../milestone/<N>)` — e.g. `Milestone: [#6](../milestone/6)`. The explicit markdown link is required because GitHub auto-links bare `#N` to an *issue*, not a milestone. `create-issue --milestone <N>` emits this form automatically.
+
+EPIC bodies may omit the parent-ref line entirely (EPICs are not always scheduled under a milestone when filed).
+
+`validate-issue` enforces these forms. The old plain `Milestone: #<N>` form is accepted with a deprecation warning during the grace period; update existing bodies to the link form.
+
+For an **issue parent**, `create-issue --parent <N>` also sets GitHub's **native sub-issue link** between the new child and the parent, *in addition to* the textual first-line ref (per [project-management:DEC-005-linking-and-containment]: native sub-issues are the canonical containment mechanism; the textual ref is the universal spine). Without `--parent`, filing **links from the body's first line**: the issue parent it names (an `EPIC:` / `Feature:` / `Umbrella:` ref — typically a `--body-file` filing) is linked the same way, under the same containment-mode gate, while a `Milestone:` first line links nothing; `--parent` together with a first line naming a *different* issue is refused before anything is filed, so the two records never start out disagreeing. Issues filed without the link — before this, or outside `create-issue` — are linked after the fact with `link-parent` (below). The native link is what surfaces the child in the parent's sub-issues panel and feeds the Projects v2 "Sub-issues progress" field. It is idempotent (re-linking an already-linked child is a no-op) and degrades to a no-op where the instance does not support sub-issues (e.g. an older GHES / the feature off) — the textual ref carries the relationship in that case, and a native-link failure never fails the create. **A 422 is never read as an instance without sub-issues.** GitHub answers HTTP 422 for a request it refused — a child that already has a parent (below), a malformed request — on instances where sub-issues work, so neither its status nor its wording says the feature is absent (ADR-035). pm treats only a 410, or a 404 it has attributed to the endpoint by probing the parent issue, as an instance without sub-issues. Every refusal is reported as what it is — a link already in place, a conflict, or a failure — with GitHub's message shown after pm's sentence (gh's own line, attributed to gh, when GitHub's response carried no message). When `create-issue`'s link fails that way the issue is still filed on its textual ref, and the warning names `pkit pm link-parent <N>` for making the link once the cause is fixed. If your GitHub does not offer sub-issues and pm cannot establish that on its own, every native link is refused this way: set `containment: textual` in `project/substrate-map.yaml` (below), and pm stops attempting the native link — each refused write says so. A milestone parent (`--milestone`) is not a sub-issue relationship and carries its own native Milestone field, so no sub-issue link is set for it. The native write goes through `scripts/_lib/containment.py` as a single construction point (the ADR-031 sole-constructor discipline applied to the containment substrate), reusable by any future parent-link mutation.
+
+**An issue has one native parent, and pm keeps the two records together after filing.** A child that is already natively under a *different* parent is a **conflict**, never an unsupported instance: the seam reads the child's current native parent before adding the link, and reads GitHub's refusal (an HTTP 422 whose error body states the one-parent rule) when the record does not show it, and reports the child, the parent it has and the parent asked for — `link-parent` shows it in its plan, `--dry-run` included, and does not link it. **`set-field --parent <N>` moves the native link** along with the first line: it reads where the issue sits natively while validating, then moves the link to `#<N>` in one write (GitHub replaces the old parent; nothing sits in between) and only then rewrites the first line. A link or move GitHub refuses, or a native parent that cannot be read, stops the call before anything is written and names the reason, so the first line and the native link never end up naming different parents through a pm verb. On an instance without sub-issues only the first line changes; in `textual` mode (below) `set-field` writes no native link, as `create-issue` does not.
+
+**Reading a parent's children goes through one seam, and that seam says whether its answer is complete.** `scripts/_lib/containment.resolve_children` unions both substrates with native-wins — never one or the other by configured mode, since a repo can hold children under both (ADR-035). It also **acquires the issue corpus itself** rather than taking whatever a caller happened to fetch, and returns a completeness verdict alongside the child set. That verdict is not decoration: a close gate that cannot see the whole corpus must hold rather than report "no open children", and an incomplete answer is what makes holding possible. An answer is incomplete when the corpus could not be read at all, when it was not enumerated to exhaustion, or when the native sub-issues read *failed* — the last being distinct from the endpoint being absent, which is a complete textual-only answer. The three are reported separately so an operator reading a held gate is not sent looking for a size problem when the query simply failed. A caller may still supply its own corpus, but must state whether it is whole; absent that claim the seam declines to vouch for it.
+
+**Reading an issue's parent goes through the same seam, from the other end.** `scripts/_lib/containment.resolve_parent` answers "what is this issue's parent?" from one read of the issue's record — the native parent it carries, and the body whose first line names one — and returns the parent with how the two records stand: agreeing, native alone, first line alone, disagreeing, none, or unread. The native parent is the parent wherever one was read ([project-management:DEC-005-linking-and-containment]). The forward cascade, the closure cascade's report, the close gate's per-child membership step and `show-tree` resolve a parent only through it (`show-tree` through its comparison alone, with each issue's native parent taken from the child sets it has already resolved, so it reads nothing upward), and a first line is read in one place, `scripts/_lib/body_parent_ref`, so the issue a line names is the same for every reader and for the textual side of `resolve_children`. A reader that **writes** on the parent — the forward cascade — acts only where the two records agree, or where a first line in a form the issue's type allows is the only record; anywhere else it stops and says how the two are brought into agreement: the native parent wins, and `set-field <N> --parent <P>` rewrites the first line to name it. A reader that only **reads** follows the native parent, counts a first-line parent as well, and labels the disagreement: a child whose first line names one parent under a native link to another is in both parents' child sets, so a close gate on either waits for it, and `show-tree` places it under its native parent and lists it under the other marked `[native parent #<P>]`. A first line naming its parent in a form the issue's type does not allow — `Epic: #5`, `Feature: #12 — auth`, `Epic:#5` — names that parent all the same, for every child set and gate, and is reported as not an allowed form (`show-tree` marks it `[first line not an allowed form]`, and says how each issue's records stand in its JSON as `parent_resolution`); a milestone ref, in either form, names no issue. A first line naming the issue itself names no parent — no child set holds an issue under itself — and each reader says so. An EPIC's first line names a milestone, never an issue: where an EPIC has a native parent, the line that would settle the two says that its container is a milestone, since no rewrite of its first line can name an issue. `show-tree`'s `parent_resolution` carries `kind`, `native_parent`, `native_parent_known`, `first_line_parent`, `first_line_form` and `first_line_names_itself`. `show-tree` sees a native parent only in the native child sets it resolves, so a `native_parent` of `null` says none was *seen*, and `native_parent_known` says whether that is the same as none: `true` for a native parent seen, and for none on an instance the seam found without sub-issues; `false` wherever the native parent may be in another repository, outside the fetched issues (`--state`, `--limit`), behind a native panel that could not be read, or under an untyped issue no first line names (whose sub-issues are not read) — and then `kind` (`textual-only`, `none`) is read from what was seen and says nothing of the native parent. A native child in another repository is shown under its parent as a leaf of its own, named `owner/repo#<n>` and marked `[in another repository]` (in markdown, a code span marked `_(in another repository)_`), with no state, since `show-tree` reads nothing in another repository; its JSON lists it in the parent's `children_in_other_repositories` — each `ref`, `repository` and `number` — never in `children`, which holds this repository's issue numbers.
+
+The **containment substrate is selectable** (per [project-management:DEC-039-containment-substrate-selection], contract ADR-035) via a top-level `containment: native | textual` key in the optional brownfield `substrate-map.yaml` (`schemas/substrate-map.yaml` documents the axes; the selector is a manual operator key beside `hierarchy:`, not a per-axis binding). `native` (the default, and the greenfield behaviour when no map is present, or when the key is absent from a present map) sets the native sub-issue link as described above. `textual` — for a tracker that does not support native sub-issues, or an operator who prefers the textual representation — makes `create-issue --parent` record *only* the textual child-side parent-ref and **skip the native link entirely**. The textual ref is the universal spine, written in **both** modes (so it is the containment record in `textual` mode). The selector intent lives in the committed map; no resolved value is written back (one-consumer contract). The mode resolves through the same substrate-map read seam (`scripts/_lib/axis_labels.containment_mode`) the other axes use.
+
+**`show-tree --limit` bounds the view, and a bounded view says so.** The flag is a deliberate view control for a large tracker and keeps its default. What changed is honesty about the result: the tree is built from the seam's corpus, which reports whether it was enumerated to exhaustion, so a render is labelled `[partial]` whenever it may be short — because the issue fetch struck the limit, or because the seam could not vouch for some parent's child set (an unreadable native panel), or because the PR fetch struck the limit (so PR-to-issue links and orphan-PR detection may miss PRs). The note names which it was, since the remedies differ and raising `--limit` cannot help with the unvouched case; a PR truncation is independent of the issue-side causes, so it is appended to whichever of them also holds — on stdout *and* stderr in text (so a redirected render keeps the caveat), as a `> **Partial view**` note in markdown, and as `"complete": false` with an `incomplete_reason` in JSON. Without that a reader cannot tell "this parent has no other children" from "I stopped looking" — and this is the diagnostic people use to judge whether a container is ready to close. A complete render carries no notice, so the label means something.
+
+**The children-view refresh refuses instead of labelling, on each of its triggers.** A render is discardable; this is a *write* that replaces each parent's comment wholesale, and that comment is the only parent-side view of children in `textual` mode, carrying no hedge of its own — so a short list published there is confidently wrong and outlives the command. `create-issue` skips the publish when the corpus is incomplete, leaving the previous render in place (stale beats wrong); `link-parent` refuses the refresh when the issue list was not read in full, and withholds any parent whose native sub-issues could not be read; `show-tree --refresh-children-views` exits non-zero without writing — both when the corpus is short and when it is *filtered*, since `--state open` yields a corpus that is complete for what it asked while every closed child is missing from it, which the completeness verdict cannot see. A truncated PR list does not trigger it: the refresh writes from issues alone. It names whichever fact the seam established — a struck limit, or a parent whose child set it could not vouch for — so the operator can tell whether raising `--limit` would help at all. The same refusal covers a corpus that could not be read at all, which previously rendered an *empty* children list — indistinguishable from a parent that genuinely has none.
+
+In `textual` mode a parent has no native sub-issues panel, so its **parent-side children view is render-on-demand** (per DEC-039 D4 / ADR-035 section 4): a generated **do-not-edit children comment** on the parent, written by **full overwrite** through one construction point (`scripts/_lib/containment.refresh_children_comment`) and refreshed by the read path. The comment is a *derived, regenerable view* — the child-side ref + the `resolve_children` read-seam remain the source of truth; it is **never an append** (there is exactly one marked comment per parent, found by its `<!-- pkit:children-view do-not-edit -->` marker and updated in place). It carries a visible "do not edit — auto-generated" notice so a human knows not to hand-edit it, and lists each child as a `#<n>` link (a textual-only child is marked `(textual)`), and a native child in another repository as `owner/repo#<n>` in a code span, which GitHub does not link — a link would add a cross-reference to that issue's timeline, and pm writes nothing there. The refresh is **idempotent** — re-rendering the same child set is a no-op (no comment-edit churn) — and **failure-posture-neutral**: a failed refresh is reported as a one-line note and never fails the create (the textual ref is the spine). It is a **no-op in `native` mode** (the native panel already gives parent-side visibility). Refresh triggers: automatically on **child-create** (`create-issue` in textual mode, with `--parent` or a first-line issue parent, after the textual ref is written), explicitly via **`show-tree --refresh-children-views`** (textual mode only; a write, so it is gated by the foreign-repo session guard), and via **`link-parent`** in textual mode, for the parents its issues name. Like the native link, the comment write goes through `scripts/_lib/containment.py` as a single construction point under the same grep/AST sole-constructor guard (`tests/test_pm_containment_write_seam.py`).
+
+#### Linking existing issues from their first line — `link-parent` (per [project-management:DEC-005-linking-and-containment] / [project-management:DEC-039-containment-substrate-selection])
+
+An issue whose body names its parent on the first line but that was never linked natively — filed from a body file while only `--parent` linked (#1033), filed by hand, imported — sits in pm's own tree (`show-tree` reads the textual ref) yet under no parent in GitHub's sub-issue panel. `link-parent` makes the native record agree with the textual one. It reads the first line exactly as `create-issue` does, against the forms the issue's own type allows, and never edits a body.
+
+| Command | What it does |
+|---|---|
+| `link-parent <N> [<N> ...] [--dry-run] [--yes]` | Link each named issue natively under the issue parent its first line names. |
+| `link-parent --all-open [--dry-run] [--yes]` | The same, for every open issue in the repository. |
+
+Each issue is reported with one outcome, followed by a summary:
+
+- **would link / linked under #P** — the first line names an EPIC / Feature / Umbrella and the link is made.
+- **already linked** — the native link exists and is never posted again, so re-running is safe.
+- **milestone parent** — a `Milestone:` first line; a milestone is not an issue, so nothing is linked.
+- **no parent line** — the first line names no issue, or names the issue itself, or the title's type is not recognised.
+- **parent line not an allowed form** — the first line names its parent, non-conforming: in a form the issue's type does not allow (`Epic: #5`, `Feature: #12 — auth`, an EPIC's `Feature: #N`). Every reader takes it as naming that parent, and the close gate counts the issue under it; `link-parent` links only from an allowed form, as `create-issue` does, so it reports the line and links nothing.
+- **parent not found or closed** — the named parent is not an issue here, or it is closed while the issue is open. A closed parent is linked only to a closed child: an open issue under a closed parent is the state the close gate exists to prevent and usually means the first line is stale, so it is reported for you to reopen the parent or re-parent the issue; a re-run then links it.
+- **conflict (another native parent)** — the issue is natively a sub-issue of a different parent than its first line names. An issue has one native parent, so it is reported with both parents named, not linked, and not mistaken for an instance without sub-issues. The native parent wins (DEC-005): each conflict is followed by the containment seam's line for settling it — `set-field <N> --parent <native parent>` rewrites the first line to name it (for a native parent in another repository, which no first line can name, the line says so instead).
+
+Each parent's sub-issue list is read once per run — for the plan and the links alike — however many of its children are selected. On an instance pm establishes has no native sub-issues (a 410, or a 404 attributed to the endpoint) nothing is linked, and that is reported rather than counted as a failure. A 422 is never read as an instance without sub-issues. A refusal stating the one-parent rule is a conflict and a duplicate is a link already in place; any other 422 is a failure: it is reported with GitHub's words, the run exits 3, and it ends with the `containment: textual` way out. `--dry-run` prints the plan and writes nothing — run it first. Otherwise the plan is printed and the verb asks before linking; `--yes` skips the prompt, and a non-interactive run without `--yes` refuses and prints the command to re-run. In `textual` containment mode it links nothing and refreshes the named parents' children views instead. It runs the membership gate and, before its first write, the foreign-repo guard. It exits 0 for anything short of a failure (already linked, nothing to link, a conflict reported, a dry run, a declined prompt); 3 when a link or a refresh failed (the other issues are still processed); 1 for a membership or foreign-repo refusal, or a textual refresh refused for a short issue list; and 2 for a usage error — no selection, a number that is not an issue here (the run stops before any link), or a non-interactive run without `--yes`.
+
+```
+pkit pm link-parent --all-open --dry-run     # see what every open issue would get
+pkit pm link-parent 1101 1102 --yes          # link two issues without the prompt
+```
+
+#### Issue body validation — required sections and universal rules (per [project-management:DEC-010-issue-body-minimum-structure])
+
+`create-issue` checks the body against `schemas/body-format.yaml` before it writes anything, `--dry-run` included. It checks a body file and a body stamped from the template alike, since the schema is the contract and the template is not.
+
+- **Refused:** a body that lacks a section its issue type requires, such as a Task's `## Doc impact`, or that holds a heading of the first level (`# ...`). The refusal names what is wrong, and nothing is filed.
+- **Warned of:** a `file:line` reference, a `## Implementation` or `## How` section, and a predicted decision id. The warning is printed, and filing goes on.
+
+Each type's required sections, and their severity, come from its entry under `bodies`. Each universal rule's severity comes from the entry of `universal_body_rules` whose `id` is the finding's label. The two lists above give the severities as shipped. A `# ` line inside a fenced code block is no heading.
+
+A predicted decision id is an id that no record holds, written as if one did. The check reads two forms of id, outside fenced code blocks, HTML comments and struck-through text:
+
+- a core, project or architecture record's id: `COR-NNN`, `PRJ-NNN` or `ADR-NNN`
+- a capability's decision named with its capability: `[<capability>:DEC-NNN-<slug>]` or `<capability>:DEC-NNN`, looked up by its capability and its number alone
+
+A bare `DEC-NNN` is not checked. Each capability numbers its own decisions, so a bare id names no record until its capability is named.
+
+Each id the check reads is looked up through `pkit`, and one that no record holds is reported as `body.predicted-decision-id`, naming it. Where `pkit` gives no answer for an id, one notice, `body.decision-ids-unchecked`, names the ids not checked and why, at the rule's severity:
+
+```
+[warning] body.predicted-decision-id: cites COR-999, which no record holds. Cite a decision only once its record exists, and describe one not yet written without an id.
+[warning] body.decision-ids-unchecked: decision ids not checked (COR-999): the records could not be read — `pkit` is not on PATH. None is reported as predicted on that ground.
+```
+
+`validate-issue` and `edit-issue` run the same checks.
+
+#### Issue body validation — residual placeholder detection (per [project-management:DEC-031-reject-unauthored-placeholder-bodies])
+
+`validate-issue` detects bodies that still carry the stamped template skeleton the author was supposed to fill. Two signals, both derived structurally from the live template at runtime:
+
+- **Empty required checkbox section** — a required checkbox section (per [project-management:DEC-010-issue-body-minimum-structure]) with **zero authored items** is the primary "unauthored" signal. An *authored item* is a checkbox line with non-whitespace content after the `]`, regardless of checked state — `- [ ] Real criterion` and `- [x] Real criterion` are both authored; a bare `- [ ]` (nothing after) is a skeleton item. Severity: `warning` at `create-issue` (the issue is filed, but the warning is visible); `hard-reject` from the **first lifecycle transition** (Todo → Backlog) onward. Lenient: a trailing bare `- [ ]` alongside real authored items is fine — only a section with *no authored items at all* triggers.
+- **Surviving template placeholder prose** — if the body still contains placeholder text from the template (e.g. "The thesis or outcome being de-risked…"), `validate-issue` emits a `warning` at every validation call. Detection is runtime-derived from the matching `templates/<Type>.md`, so it stays in sync automatically when a template is edited.
+
+The asymmetry is deliberate: `create-issue` keeps stamping the template skeleton for the author to fill (stamp-then-fill workflow is preserved), and a just-filed Todo that cannot advance is harmless. The **block** lives at the first transition — that is where the harm of an unauthored body advancing through its whole lifecycle is closed.
+
+`create-issue` always emits the warning when filing an unauthored body; it never silently admits one.
+
+#### Use cases in planning and in bodies (per [project-management:DEC-054-use-case-validation])
+
+A project may keep a written account of what its software must do, as use cases, each with a stable id (`UC-NNN`). This capability does not write them, and does not know who keeps them. It defines one data point, `pkit::work-tracking:use-cases` — the use cases settled on the default branch ("Connections", below) — and reads it. What happens depends on what the point says:
+
+| The point | Batch planning | Body validation |
+|---|---|---|
+| **Off** — nothing defines it, or nothing fills it | Nothing. Use cases are never mentioned. | Nothing. |
+| **Has entries** | Walks the active use cases before it slices. | Warns of a cited id the set does not hold. |
+| **Empty** — every filler answered, and no use case has settled | Plans a Task to author the use cases ahead of work that touches what users do — unless you declined it in this checkout earlier today. | Warns of each cited id: none exists yet. |
+| **Partly checked** — it answered without a filler that was meant to answer | Walks what it holds, and says the set may be incomplete. | An id it holds passes; the ids it lacks are named as not checked. |
+| **Could not check** — it gave no set, as in a clone that has not fetched the default branch | Says the use cases could not be read, and why, and plans without them. | One notice says the citations were not checked, and why. |
+
+- **Batch planning walks the use cases before it slices.** With entries, the project-manager reads the active use cases against your intent: their documents where the entries give a path, their titles alone otherwise, and then the plan says so. Each planned Feature and Task names the use cases it serves, and its filed body lists them in a `## Use cases` section, one per line (`- UC-003 — Export a report`). An issue that serves none — a refactor, a chore — has no such section. The section is optional and outside the required minimum; no template carries it.
+- **The approval gate shows both kinds of gap**: a use case your intent touches that no planned issue names, and behaviour the plan builds that no use case describes. Neither blocks: you approve, revise or cancel. Over a partly checked set the plan names the filler that did not answer, and shows the second kind as a *possible* gap, since that filler may describe the behaviour.
+- **Over an empty set, a plan whose work touches what users do opens with a Task to author the use cases.** Work touches what users do when it serves a goal someone using (not building) the software reaches, which a use case would describe. The build, tests, CI, refactors, tooling and the documentation of how the software is built and worked on are internal; for a library or a command-line tool, using it is calling or running it, and building, testing or releasing it is internal. The slicing table's Use cases column shows the judgement for every Feature and Task: the Task's number where the issue depends on it, `declined` where the issue touches what users do and you declined the Task, `none` for internal work. Only the issues that touch what users do depend on the Task; they state the goals they serve as text and cite no use case, since none has settled, and one of the Task's acceptance criteria is that they name their use cases. A plan of internal work only has no such Task, and the approval gate says why; say if the work does touch what users do. The project-manager never writes use cases itself.
+- **A declined Task is kept until the next day, in this checkout.** Revise the Task away at the gate to plan without use cases: the plan's topmost new issue then says so in prose — or each filed issue does, where the plan files only under an existing issue — and when you approve the plan, your answer is kept in this checkout, never committed, for the rest of the day in your machine's local time. Until midnight, plans from this checkout leave the Task out and their gate says when you declined it ("You declined the Task at 09:12 today; it is offered again from tomorrow."); from the next day on it is offered again. The answer is kept per checkout: another clone or worktree asks separately, and a worktree removed after planning takes its answer with it. Removing the Task because an open issue already plans the use cases is not a decline: the dependent issues depend on that issue instead, and nothing is kept. The project-manager keeps the answer through `decline-use-case-task`; you need the command only to look at the answer or to drop it:
+
+  | Command | What it does |
+  |---|---|
+  | `decline-use-case-task` | Keep the answer: the Task was declined now. The project-manager runs it on approving a plan you revised the Task out of. |
+  | `decline-use-case-task --show [--json]` | Print the kept answer — `declined` with the local time of the answer and of the next offer, `expired`, `none`, or `unreadable` with why. Read-only. |
+  | `decline-use-case-task --clear` | Drop the kept answer, so the next plan offers the Task again. |
+
+  The answer is a git-ignored runtime file, `project/instance/use-case-task.json` under the capability's folder (declared in `package.yaml`'s `runtime_ignore:`), holding the UTC time of the answer and nothing else. A file that cannot be read never hides the Task: it is offered, and the gate says that an earlier answer could not be read.
+- **A body's citations are checked for existence.** On a Feature or Task body, `validate-issue`, `edit-issue` (on a body edit) and `create-issue --body-file` read the ids in the `## Use cases` section against the point. A citation is an id there matching the point's id pattern — `UC-` and three or more digits. One the set does not hold is reported as `body.use-case-citation`, naming what the set was read against — the default-branch commit, or your own filler file where it answered:
+
+  ```
+  [warning] body.use-case-citation: cites UC-042, not among the use cases settled on the default branch (read at origin/main 1a2b3c4d5e6f). The check is of existence only. If the use case has landed since, fetch the default branch and validate again.
+  ```
+
+  An id the point holds passes, whichever use case you meant, and so does a withdrawn one: an id is never reused unless your project declared that nothing cites it, so the citation stays a true reference. An id anywhere else in the body is not a citation. EPIC, Umbrella and Milestone bodies are not read: a `## Use cases` heading there is ordinary content. The point is resolved only for a body that cites, so a body without the section starts no filler.
+- **A warning, never a refusal.** The severity is the rule's token in `schemas/body-format.yaml`, `warning`; no project setting changes it, and no verb refuses or changes its exit code over it. A use-case id is settled once its use case reaches the default branch — until then another line of work may take the same id — and this clone's view of that branch may lag the remote, so the finding names a likely guess and blocks nothing.
+- **When the citations cannot be checked**, the same verbs say so in one notice, `body.use-cases-unchecked`, at the same severity, and report no use case as unknown on that ground. A point that gave no set names the reason, and with it the fix; a partly checked one names the ids it lacks and the filler that did not answer:
+
+  ```
+  [warning] body.use-cases-unchecked: use-case citations not checked (UC-042): the use cases could not be read — <why>. None is reported as unknown on that ground.
+  [warning] body.use-cases-unchecked: UC-042 not checked: the use-case point answered without <filler> (<its reason>), so the set it holds may be incomplete.
+  ```
+
+  `validate-issue --json` carries both labels among its `findings`, like any other finding.
+
+#### PR body validation — residual placeholder detection (per [project-management:DEC-031-reject-unauthored-placeholder-bodies])
+
+`validate-pr` applies the same two-signal rule to PR bodies, derived structurally from `templates/PR.md` at runtime:
+
+- **Empty required checkbox section** — same authored-item definition as the issue side. `hard-reject` at the merge gate (`done-work`) **and, since #569, at the ready-for-review transition** — see "validate-at-ready" below.
+- **Surviving template placeholder prose** — if the body still contains placeholder text from `templates/PR.md`, `validate-pr` emits a `warning` at every validation call. Detection is runtime-derived from the live template, so it stays in sync automatically when the template is edited.
+
+##### validate-at-ready (#569) — the same validator runs when a PR goes ready-for-review
+
+The comprehensive PR-body validator lives in `_lib/pr_validation.py` (one source) and runs at **every point a PR becomes ready-for-review**, not only at merge — closing the fail-late trap where a skeleton body (empty `## Summary`, a bare `- [ ]` `## Test plan`, empty `## Doc impact`) sailed past open + review and only blocked at `done-work`:
+
+- **`open-pr` without `--draft`** and **`review-work`** (opening a ready PR, or flipping a draft → ready) validate the body at the merge-gate strictness (empty checkbox → `hard-reject`) *before* the PR goes ready, and refuse with the findings. This mirrors `create-issue`'s validate-at-creation.
+- **Drafts are exempt** — `open-pr --draft`, `create-draft`, and `back-to-draft` never validate; a skeleton-of-TODOs is legitimate WIP. Fill it (`edit-pr`), then `review-work` flips it ready (which validates).
+- **`--force`** on `open-pr` / `review-work` overrides a blocking body. Where each leaves its trace is under "Override flags" below.
+- **`done-work` stays the backstop** — it always runs the validator before the approval gate; a placeholder-body failure is reported and the merge is refused.
+
+Practical consequence: you cannot take an *empty* body to ready-for-review. Use `open-pr --body-file <filled>`, or `create-draft` → `edit-pr` → `review-work`.
+
+#### The seven workflow wrappers (per [project-management:DEC-026-work-ownership-lifecycle])
+
+For the standard development flow, seven verb-subject commands compose over `move-issue` and own the side-effects (branch, PR, merge, audit comments) at each step. They replace ad-hoc combinations of `move-issue` + `gh` calls that adopters previously had to wire by hand.
+
+| Command | Issue transition | Side-effects |
+|---|---|---|
+| `promote-issue <N> [--milestone "<M>"] --reason "<R>" [--bypass-owner "<R>"]` | Todo → Backlog | Audit comment; milestone attach only when `--milestone` is given (omit to promote on `--reason` alone — per DEC-026, "The seven commands") |
+| `start-work <N> [--bypass "<R>"]` | Backlog → In Progress | Branch `<type>/<N>-<slug>` + assignee. **Precondition:** the issue's current state must be able to move to In Progress under `workflow.yaml` (or already be there). Otherwise it refuses before creating a branch or writing an assignee, and names the move to make first. From Todo, that is `move-issue <N> --to backlog` (`promote-issue` carries the audit). The state is read from the issue's labels and milestone (no state label and no milestone reads as Todo), the same reading `review-work` checks its move with; `move-issue` reads the state itself when it moves (#1242). If the composed `move-issue` still fails after the branch is cut (for instance because the state changed since the check and the move is no longer legal), the run ends on a failure naming the branch and any assignee it left behind (#942). With an instance id set, it claims an issue no instance owns for this clone, ahead of the move, and refuses one another instance owns unless `--bypass` gives a reason (see "What the lifecycle commands write for an instance" below). |
+| `create-draft <N>` | (none — issue stays In Progress) | Opens draft PR via `gh pr create --draft` |
+| `review-work <N> [--reviewer @<u>] [--bypass-owner "<R>"] [--force]` | In Progress → Review | Opens ready PR or flips draft→ready; assigns reviewers. **Precondition:** the issue's current state must be able to move to Review under `workflow.yaml`, or already be there, so a re-run (after `back-to-draft`, say) flips the PR ready again. Otherwise it refuses before opening or flipping a PR or requesting reviewers, and names the moves to make first. From Backlog, that is `move-issue <N> --to in-progress`; from Todo, `--to backlog` comes first. The state is read as for `start-work`, and the two verbs share one implementation of the refusal and of the late-failure message (#1242). A `gh` failure opening the PR, reading its description or making it ready exits 3. If the composed `move-issue` still fails after the PR was opened or made ready, the run ends on a failure naming what it left behind: the PR, its ready state and the reviewers it requested (#947). The closing line, `[ok] PR ready; #<N> in Review`, claims no move; `move-issue`'s own output above it says whether it moved the issue or found it in Review already. It also refuses a description that gives no sentence on what changed in a document the change check at the PR's head marks `updated`, or a sentence that reads as a closing reference, and stops (exit 2) where that check cannot be run, unless `--force` is passed ("Where the sentences live", under "The answers a change wrote, in its pull request" below). |
+| `back-to-draft <N>` | (none — issue stays in Review) | Flips PR to draft; dismisses prior APPROVED reviews |
+| `done-work <N> [--bypass "<R>"] [--bypass-ci "<R>"] [--bypass-owner "<R>"] [--skip-checkbox-gate] [--bypass-reviewer <name> … --bypass-reviewer-reason "<R>" \| --bypass-reason "<R>" (deprecated)] [--no-wait \| --wait-minutes <M>] [--force] [--yes]` | Review → Done (In Progress → Review → Done for an issue that never reached Review) | Squash-merge via three-way approval gate (APPROVED review / `Approved`-prefix comment / `--bypass`), the **DEC-007 checkbox close-gate** on **every issue the PR closes** (`<N>` first, then each `Closes #M` the PR body carries: every `- [ ]` ticked in each, the refusal naming the first issue that fails; an issue already closed is skipped with a note; `--skip-checkbox-gate` overrides, discouraged) **and** the CI-status gate (checks must be green; `--bypass-ci` overrides only that gate — `--bypass` never clears a red CI); `--bypass-reviewer` (agent mode) satisfies ONE named required reviewer's slot, audited, leaving the rest gating. As the last step before the merge, an issue `<N>` still In Progress is moved to Review (`move-issue --to review`; see "A merge moves an issue still In Progress through Review" below). After the merge: transitions issue `<N>` (`move-issue --to done`) **first**, then closes every issue the PR closes as completed and runs its closure cascade (`close-issue <M> --mode=pr-merge --pr <PR>`, `<N>` first), then best-effort branch cleanup — the head branch deleted on GitHub by the backbone (`pkit pull-request delete-branch`), only while its tip is the head that merged, what became of it said in one line, naming the command that deletes it later where it was not deleted. Then, only in a clone on the head branch with a clean working tree, `checkout main` + `pull --ff-only` + delete the local head. The delete runs only once the branch on GitHub was deleted or is gone, and everything on the local one merged. A clean clone on `main` is only fast-forwarded, and any other clone is left where it is (see "What landing does to the clone" below). Each local step is a warning on failure (`main` held by another worktree), never an abort (#878). Where the base merges through a merge queue, the PR is enqueued instead and everything after the merge waits for the queue to make it — see "Merging through a queue" below |
+| `handoff-issue <N> --to @<u> --reason "<R>"` | (none — no state change) | Audit comment + reassign |
+
+**A merge needs the person's authorisation** ([project-management:DEC-006-state-machine-and-cascade], [project-management:DEC-055-pr-lists-answers] point 3, #1760). `done-work` takes it as `--yes`, or as a yes to the question it asks at a terminal. The question names the PR and the head the merge is pinned to: `Squash-merge PR #496 at 1a2b3c4 + close? [y/N]`. `--yes` names no head: it merges the head the gates read when the run starts. A merge authorised for a named head goes through `land-work --yes --expect-head <sha>` (below). Off a terminal with no `--yes`, nobody can be asked, so it runs its gates and then refuses (exit 2). The refusal names the head it would merge. It says to merge it with `done-work <N> --yes` on the person's authorisation, or to run `land-work <N>` without `--yes` for a `ready:` line that names the head. Nothing is posted, moved or merged. `merge-pr` does the same. Completing a PR that has merged already merges nothing, so that run goes on without `--yes` off a terminal, as before.
+
+**How a verb finds an issue's branch.** `start-work`, `create-draft`, `review-work`, `back-to-draft`, `review-pr`, `done-work` and `land-work` find the issue's branch by its name, `<type>/<N>-<slug>` ([project-management:DEC-013-branch-and-pr-conventions]). They all read it one way, in `scripts/_lib/issue_branch.py` (#1608):
+
+- **One local branch matches.** It is the issue's branch.
+- **Several match.** The one with the issue's open PR is the issue's branch. The open PRs of all of them are read in one `gh` call. An earlier attempt may leave a branch behind, for example an empty one from a builder that was stopped. That branch no longer takes the place of the one carrying the PR.
+- **Several match, and none has an open PR.** The verb refuses before it changes anything. It names each branch and says to delete or rename the ones that are not the issue's. `done-work` and `land-work` first look for a PR that has merged, from the issue's own closing references, as with no branch at all. They complete it when they find one.
+- **Several match, and more than one has an open PR.** The verb refuses. It names each branch with its PRs and says to close the ones that are not the issue's.
+- **`gh` does not answer.** The verb refuses. An unanswered reading is never taken for "no open PR".
+
+`land-work` hands the branch it read to `review-pr` and `done-work`, so the open PRs are read once in a run. A local branch that names the issue in another shape, such as `feat/42` or `feat/42-Foo`, is never the issue's branch. `start-work` refuses to cut a branch beside one, as before, but only when no branch of the right shape matches.
+
+**A merge moves an issue still In Progress through Review.** The move to Done a merge makes for a Task is `review → done`, the transition `schemas/workflow.yaml` gives to `done-work`. A Task's `in-progress → done` is `close-issue`'s, the close of a Task completed without a pull request. A Task whose PR was opened without `review-work` (by a builder from a worktree, or by an operator who skipped the step) is still In Progress when `done-work` runs. So, once every gate has passed and as the last step before the merge, `done-work` moves it to Review (`move-issue <N> --to review`), and the merge then makes the declared `review → done` as usual. Both are declared moves made through `move-issue`, so each is journaled where the project keeps a journal and fires `after_move_issue`. The move to Review comes before the merge because afterwards GitHub may close the issue at any moment, and a closed issue reads as Done, from which no move to Review is declared. The PR is open and ready by then, which is what Review means: if the merge fails, the issue rightly stays in Review, and if the move itself fails, nothing is merged. Neither move posts a comment of its own at the default `audit.projection`. The pr-merge close that follows records the merged PR as the cause: its `completed by merged PR #<PR>` comment when the merge left the issue open, or GitHub's own "closed in" event when GitHub closed it first. The other issues a PR closes are not moved this way: `close-issue <M> --mode=pr-merge --pr <PR>` closes each, whatever its state, and reconciles its label to done.
+
+**Merging through a queue** ([project-management:DEC-026-work-ownership-lifecycle], "Merging through a queue"). When the PR's base branch merges through a GitHub merge queue, the merge verbs — `done-work`, and `merge-pr` — do not merge: once every gate has passed they enqueue the PR (`gh pr merge <N> --auto --match-head-commit <head>`, pinned to the head the gates checked) and the queue makes the merge. The queue runs the base's required checks on the merge it is about to make, on top of the base and of every PR queued ahead, so a check that compares the change with its base gets the base the merge lands on. The verb reads the queue before any gate and again just before the merge, prints where the PR stands (`position 2 in the queue, awaiting checks, about 5 min to merge`) and waits for the merge — as long as the queue estimates plus 2 minutes, at most 30, or `--wait-minutes`:
+
+- **It merges in time.** What follows the merge runs — for `done-work` the move to Done, the close and cascade of every issue the PR closes and the branch clean-up, for `merge-pr` its `after_merge_pr` hooks and the clean-up — and the run exits 0. A merge counts only once GitHub reports it: on a base that requires a queue a plain `gh pr merge` enqueues and exits 0, and the verb waits for such a PR like any queued one.
+- **The wait ends first**, or `--no-wait` returns at once. The run exits 4 (see "Exit 4" below) and the issue stays in Review. Run the same verb again once the PR has merged: it runs only what follows the merge. `done-work` finds the merged PR from the issue's closing references as well as from the branch, so any clone completes it whatever its local branch holds — a local branch with commits the merge does not have is kept, not deleted — and it refuses only when the issue was reopened after the merge. `merge-pr` run again fires its `after_merge_pr` hooks and cleans up once: the clone records that the hooks fired (`pkit/merge-pr/<N>.json` in its git directory, shared by its worktrees), so a further run from it does nothing and says so. It completes a PR the queue merged, from any clone — another clone has no record and fires the idempotent hooks again — and one a run from this clone left owed; a PR someone else merged without a queue is refused. A run while the PR is still queued waits for it again rather than enqueueing it twice.
+- **The queue drops the PR** — its checks failed on the prospective merge, or it no longer merges cleanly onto what merged ahead of it; the verb declares it out of the queue on two readings running, never one. Nothing merged; the issue stays in Review and the run exits 3. Fix the branch, push and run the verb again: the head the queue dropped is not enqueued again unchanged unless `--force` says so, and the refusal gives GitHub's reason when it has one.
+- **A push after the enqueue** takes the PR out of the queue — GitHub's dequeue once it is in, the auto-merge cancelled while it waits to enter — and the run exits 3: commits nobody checked do not merge.
+
+The queue is the only path to such a base, and the squash commit it makes must still be the convention's. Refused before anything is posted or enqueued: `--admin`, which would merge around the queue; `--bypass-ci` (see the CI-status gate below); a queue whose merge method is not squash; and a repository whose default squash-commit title and message are not the PR title and body — the queue composes its commit from those and ignores what the merge command passes ([project-management:DEC-013-branch-and-pr-conventions], "Merge mechanics"). Set them with `gh api -X PATCH repos/{owner}/{repo} -f squash_merge_commit_title=PR_TITLE -f squash_merge_commit_message=PR_BODY`. Where the base has no queue — or the GitHub host's API knows no merge queues — both verbs merge directly, as they always have.
+
+The reading, the merge and the enqueue, the wait, the dequeue and the head branch's deletion are the backbone's one merge mechanic — `pkit pull-request`, which the verbs run in the environment the `gh:` block pins — the same one `pkit release merge` lands a release PR with ([project-management:DEC-013-branch-and-pr-conventions], "Merge mechanics"). After their own steps after the merge, both verbs have the backbone delete the head branch on GitHub (`pkit pull-request delete-branch <PR> --expect <the head that merged>`), and keep no deletion of their own: it deletes the branch only while its tip is the head the PR merged at, so a push made after the merge is not lost and a newer PR's branch of the same name is not deleted. A branch kept — its tip moved, another open PR uses it as its head or as its base, or GitHub refuses to delete it — not there, or asked for with no answer that tells whether it was deleted, is said in one line, and a fork's head is left to its owner; none fails the verb. Where the branch was not deleted, the line names the command that deletes it later (`pkit pull-request delete-branch <PR> --expect <sha>`, with `--allow-foreign-repo` where the landing was confirmed): `merge-pr` records that its after-merge steps ran before it deletes, so a re-run of it does not retry the deletion, and that command is the way to. The local head goes only with the branch on GitHub: it is deleted only once that one was deleted or is gone, and kept, said in one line, otherwise — and when no merged head is known. A backbone that predates the command leaves the verbs unable to read how the base merges, so they merge nothing until it is upgraded (`pkit upgrade`); the error names the `pkit` that ran. Each call is bounded — a minute and a half for a reading, a minute for the squash-commit defaults, three and a half for a merge or an enqueue, three for a branch deletion, ten for a dequeue, a wait's own limit plus five minutes — and one that does not answer in time is stopped with everything it started, the `gh` request it runs among it. Each bound holds the longest the backbone states the subcommand can run, every `gh` call at its own bound (the CLI reference, "Pull-request commands"), with room to start `pkit`, so its answer comes back first. A merge or an enqueue that gets no answer the backbone settles by reading — made; not seen made, on two readings, the second no sooner than 40 seconds after the request; or unconfirmed, the PR not readable since — and the verbs take that from its document. Not seen made is what the readings saw, not that the request was not made: the service may still apply it, so the verbs say so, and their re-run reads the PR first and completes a merge that showed since — `merge-pr` because it records the after-merge steps as owed whenever its run sent a merge or an enqueue GitHub did not refuse and did not see merged. When taking a PR out of the queue finds it merged, the verbs say it merged, at which head, never that it may still merge. One the backbone gave no answer to at all is read once: merged, it is the merge; queued, it is waited for; anything else is unconfirmed, never "not made", which takes two readings.
+
+**What landing does to the clone** (#2183). After the merge, `done-work` and `merge-pr` move their clone only when it is on the head branch with a clean working tree. There they switch to the default branch, pull it and delete the local head, as above.
+
+A clean clone already on the default branch, where a landing clone sits, is fast-forwarded (`pull --ff-only`) and not switched. The local head is kept, and the run says so in one line. A fast-forward that fails warns and changes nothing.
+
+Any other clone is left where it is, nothing pulled, and the run says so in one line:
+
+- **On another branch or a detached HEAD**, such as a worker's clone in the middle of its next Task. A checkout would take the clone off that Task's branch, and its next commit could land on the default branch
+- **With uncommitted changes**, untracked files included, or with a working tree that git cannot read, even on the head branch or the default branch. A checkout would carry the changes onto the default branch, and a pull would update the files around them
+
+In both cases the local head is kept. The backbone deletes the head branch on GitHub as above, wherever the clone is. Where the switch fails, as when another worktree holds the default branch, the run warns and keeps the clone on the head branch. `land-work` lands through `done-work` and so treats its clone the same way.
+
+**The backbone guards the changes it makes.** `pkit pull-request merge`, `enqueue`, `dequeue` and `delete-branch` run the cross-repository guard (COR-039) themselves before the request, with no terminal to ask: the verbs run them with no input. So the verb's own guard, which runs first, is the one that asks. When the operator confirmed at the verb — gave `--allow-foreign-repo` on its command line, whatever its own comparison found, or answered yes at its prompt — the verb passes `--allow-foreign-repo` on, and never otherwise, so the operator is asked once and nothing is confirmed that they did not confirm. It goes to the backbone with the merge and with the head branch's deletion, and to the verbs `done-work` starts — the move ahead of the merge, and after it the move to Done and each close — so a confirmed landing is not refused, or asked about again, halfway. `land-work` passes a confirmation on to `done-work` the same way, so a run at a terminal asks once, not twice. Should the backbone's guard refuse all the same — its comparison of the session's anchor with the target and the capability's disagree, and the operator confirmed nothing — the landing stops refused (exit 1), naming both verdicts, with nothing asked of GitHub: a disagreement with no confirmation refuses, and the flag, passed on, settles it. The capability keeps its copy of that comparison until it reads the backbone's by command (#1220); a test holds the two to one table of cases.
+
+All seven are idempotent at the level of observable state — re-running after a partial failure recovers cleanly, and a re-run does not repeat an audit comment the failed attempt already posted.
+
+**What makes an audit comment unique.** Each audit comment `move-issue`, `done-work`, `merge-pr` and `handoff-issue` post ends with a hidden idempotency key, `<!-- pkit-audit-key: <writer>:<digest> -->`, built by `scripts/_lib/audit.py`. The digest hashes what identifies the specific audited act, so a retry of that act reproduces the key exactly and a distinct act does not — which is what makes two distinct acts render two distinct comments. Hashing also means no reason or reviewer name can close the HTML comment early. The key is not a kind marker; the comment's kind is still its first-line marker.
+
+**What stops suppression.** The key can be predicted from public facts, so carrying it proves nothing. A writer skips a post only when a comment on the issue or PR has **exactly the body it is about to post** (only line endings and trailing whitespace are normalised) **and** was posted by the account `gh` posts as (GitHub's own `viewerDidAuthor`) **and** has never been edited. Any signed-in GitHub user can comment on a public repository, but none of them can post as that account, so a comment someone else writes cannot suppress an audit post, whatever it contains.
+
+That trusted account is broader than "pkit's own path", and the guard does not pretend otherwise. In CI it is the workflow token's account, so every workflow using `GITHUB_TOKEN` posts as it; locally it is the operator, so every comment the operator ever typed by hand counts as "own" too. Exact-body matching is what narrows that down: a same-account comment that merely contains a key — a multi-line `--bypass-reason`, `--bypass-ci` or reviewer-override reason quoting another writer's key line, a note pasted by hand — is not the same body and does not suppress anything. A same-account comment that *is* the exact body already says, word for word, what the post would have said, so the record is there. The unedited check is defence in depth: pkit never edits an audit comment after posting it, so an edited one is not counted. It is not a boundary against editors, though — anyone who can edit another person's comment can already delete it, and the guard does not claim to stop someone holding the posting account or delete rights.
+
+Every doubt resolves toward posting again, never toward skipping: comments that cannot be read, a comment without the authorship fields, a retry run under a different `gh` account than the first attempt, or a retry whose body differs in any visible character. An extra audit comment is noise; a missing one is a lost record, and for a gate override the comment is the only record. The fetch / compare / post logic lives once, in `scripts/_lib/comment.py`'s `post_audit_once`; every writer calls it.
+
+The keys, by writer:
+
+- **Transition audit (`move-issue --bypass`, key `move-issue`).** The comment is the canonical audit line from [project-management:DEC-049-audit-journal-model]'s one schema template (`<!-- pkit-audit -->` marker first). It is posted **before** the label write, so the justification survives a failed mutation. The digest hashes the transition (from and to), the stripped reason, and a count of the moves that have landed on the issue: a failed attempt leaves the count as it was, and a landed move grows it. So a retry of a failed attempt reproduces the comment exactly and posts nothing new, a different reason posts its own comment, and so does the same transition for the same reason made again later. What counts the moves follows the project's journal setting (`process.journal`, the process README's "The journal — optional audit"):
+  - **Logging on:** the issue's engine-journal length. The journal is written only after the label write succeeds. The key relies on the journal recording each landed move: when it does not — the journal write is best-effort and can fail after the label write succeeds, or a move is made outside pkit — a later bypass identical in transition and reason reproduces the old comment and is skipped (`history --check-drift` flags the out-of-band case).
+  - **Logging off (the default):** the issue's count of state-label events on the GitHub timeline — state labels put on and taken off — read from the timeline just before posting. A landed move changes the state label, and a failed label write changes nothing. State-label changes made outside pkit only ever make a later bypass post again.
+
+  The count is empty when it cannot be known: the engine is unreachable, the timeline cannot be read, or, with logging off, a board or a derivation carries `state`, so `move-issue` writes no label and the timeline has no move to count. An empty count differs from every known one, so a retry across that boundary posts again, but two attempts that both fall there look alike. At `audit.projection: full` an unbypassed move's provenance comment is posted only *after* a successful label write, so a failed attempt leaves none to repeat.
+- **`done-work`'s per-reviewer override (key `done-work-reviewer-override`).** The same canonical line, with the per-reviewer detail as prose below it. The digest hashes the reviewer, the reason and HEAD ([project-management:DEC-050-per-reviewer-override]).
+- **`done-work`'s whole-gate bypass and CI bypass, and `merge-pr`'s CI bypass (keys `done-work-bypass`, `done-work-ci-bypass`, `merge-pr-ci-bypass`).** The first line is still the comment's `<!-- pkit-hook: <name> -->` kind marker. The digest hashes the stripped reason and the PR's head commit, so a second bypass with a different reason, or the same reason after new commits, is recorded, and a retry on an unchanged head is not. The prose names the short head commit too (`… at PR head 0123abc`), so two bypasses with the same reason either side of a force-push are told apart by a reader, not just by the hidden key. A CI-bypass retry whose set of failing checks changed renders a different comment and posts again. All `done-work` audit comments post before the merge.
+- **`handoff-issue` (key `handoff-issue`).** The first line is the `<!-- pkit-hook: handoff-issue -->` kind marker, then `Handoff: @<from> → @<to> (<date>, reason: <reason>)`. The digest hashes from, to, the stripped reason, and the issue's count of assignment events (assigned plus unassigned), read with one GraphQL call just before posting. The comment posts **before** the reassignment. A successful handoff adds at least one assignment event and a failed one adds none, so a retry of a failed attempt reproduces the comment and posts nothing new, while A→B, B→A, then A→B again for the same reason is recorded each time. If the count cannot be read the component is empty; that differs from any readable count, so a retry across that boundary posts again, but two attempts that both fail to read it look alike. Assignments made outside pkit only ever make a later handoff post again. The date is in the prose, so a retry on a later day posts a second comment.
+
+#### Landing a pull request in one command — `land-work` (#1203)
+
+`land-work` is not a workflow wrapper: it owns no transition. It composes `review-pr` and `done-work` — the merge and the move to Done are `done-work`'s — to run the steps that land the PR of an issue in Review, in order: wait for the checks on its head, have the reviewers the merge gate still needs review that head, show the findings a reviewer left for a person to judge, read the answers the change wrote, check the merge with the base as it stands, merge it. A project can have the reviewers start before every check has passed (the `ci` step below), and the merge still waits for them all. It calls those verbs' own functions, so it adds no review loop or merge mechanic of its own, and no flag skips the checks or the review: the bypasses stay on `done-work`, with their audit. The rules of its own are on the answers the change wrote (the step below whose lines begin `documents this change affects:`). It refuses answers it cannot read, a sentence that reads as a closing reference and a base that moved under the answers. It removes a list an earlier run left. It prints what the person is told just before it stops ready, asks or merges. A change with answers merges under the same authorisation as any other. Its `ready:` line tells what changed and what is left out of date, as information. And on the findings a reviewer left for a person to judge (the step whose line begins `findings to judge:`): it prints each whole, and `--yes` merges only on verdicts carrying them that it found when it started, standing for the head. Beside them, the step prints each accepted decision record the change alters, for the person to judge too.
+
+```
+pkit project-management land-work <N> [--yes --expect-head <sha>] [--wait-minutes <M> | --no-wait] [--dry-run]
+```
+
+Each step prints one line, the verbs it runs printing their detail above it, and the run stops at the first step that cannot go on:
+
+```
+head: 1a2b3c4 (PR #496, feat/42-land-it)
+ci: passed on 1a2b3c4 (8m, run https://github.com/<owner>/<repo>/actions/runs/77)
+review: 2 kept fresh, 2 re-run — all approved
+  [code-reviewer] [person] RS-GUIDE-003, `docs/install.md` line 12 — whether the new paragraph says only what the page's reader needs.
+findings to judge: 1, above
+documents this change affects: 1
+merge check: the change check passes on 1a2b3c4 merged with main at 9f8e7d6
+  What changed in docs/install.md: "The install steps name the renamed flag."
+ready: 1a2b3c4 — CI passed, all required verdicts approved, what changed in 1 updated document above, for information, 1 finding to judge above; merge with: pkit pm land-work 42 --yes --expect-head 1a2b3c4…
+```
+
+- **head.** The issue's branch and its open PR, found as `done-work` finds them; a lookup gh does not answer stops the run, and is never read as "no open PR". Of several local branches matching the issue, the one with its open PR is the branch, and the run hands it to `review-pr` and `done-work` (see "How a verb finds an issue's branch"). The PR's head on GitHub is read once and *pinned*. Where it is not the head `--expect-head` names, the run fetches the PR's head where this clone lacks it, and the base where it is a remote's. It then asks the backbone whether every change since the named head lies inside answer files the change adds (the merge step below). A local branch holding commits that head lacks is refused with the push to make; one that has diverged from it is refused with no command, since after a force-push a pull would put back what the push replaced. A local branch behind the head, or a checkout on another branch, is only noted: `land-work` lands the head on GitHub, never your working tree. With no open PR, `done-work` is asked only to complete a PR that has merged, and refuses one it finds open.
+  - **Two open PRs that share the branch's name** stop the run (exit 2), naming both, since one may be a fork's.
+  - **A head from elsewhere,** such as a fork's, gets a line saying why it is one, and its change check runs here. So a head that needs a person stops before any wait or review ("Which heads may start programs" below). A head that passes shows no such line.
+- **ci.** The checks on the pinned head, read together with the head and judged by `done-work`'s CI gate, waited for up to `--wait-minutes` (30 by default; `--no-wait` reads once). No check reported yet is never green, and neither is a green run on an earlier head. A failed check stops the run, naming the check and where to read it. A PR that conflicts with its base stops it at once, with the merge to make: GitHub runs no `pull_request` workflow on such a PR. So does a PR GitHub reads as behind a base it merges only up to date (`mergeStateStatus` `BEHIND`), unless the base merges through a queue, which builds the merge with the base itself. The queue is read once a run; where it cannot be read, one line says so and the run goes on. A reading GitHub has not settled (`UNKNOWN`), or one of another block (`BLOCKED`), goes on too, and the `merge` step names the merge if the host then refuses it. A wait that runs out with no check reported names the other cases where none will start: no workflow runs on pull requests, the workflows skip the paths the PR changes, `[skip ci]`, a run from a fork awaiting approval. **A project that runs no checks on pull requests** has nothing to wait for: land with `review-pr <N>`, then, on the person's authorisation, `done-work <N> --yes` — and only such a project: `done-work`'s gate does not wait for a check nobody reported, and passes a head with none wherever the base requires no check, so falling back to it because a wait ran out could merge a head no check ran on.
+  - **The checks that start the review.** A project can name them under `review.agents.start_after_checks`, such as every check but its test suite, by the names the host reports them under. Once each has passed and no check has failed, the step's line says the review starts beside the rest, and the run goes on to the `review` step.
+    ```
+    ci: the remainder passed on 1a2b3c4 — the review starts beside the rest: slice 1 of 2 (IN_PROGRESS), slice 2 of 2 (IN_PROGRESS)
+    review: 0 kept fresh, 2 re-run — all approved
+    ci: passed on 1a2b3c4 (12m, run https://github.com/<owner>/<repo>/actions/runs/77)
+    ```
+  - **After the review,** the step runs again for the rest, waiting up to `--wait-minutes` again, and every stop above still applies. A check that fails then stops the run before the merge (exit 1). So a round costs the longer of CI and those checks plus the review, not all of CI plus the review ([project-management:DEC-063-task-builder] point 8).
+  - **A run with `--yes` or `--no-wait`** starts no reviewer until every check has passed. A `--yes` run can post a verdict with a finding to judge, and a stop in that wait would come before the `findings to judge` step's hold on it. So run `land-work <N>` first, and `--yes` on its `ready:` line.
+  - **What it does not change.** A check that has failed starts no reviewer. A check that was skipped has not passed, so the review then waits for every check, as in a project that names none. A name no check bears is read once more, then draws a `warn:` line, and the checks are read again after the review. `done-work`'s gates judge every check and every verdict as before ("The CI-status gate" below). A check run again on the same head leaves every verdict as it stood ("When a verdict stays fresh" below).
+- **review.** In agent review mode, `review-pr` on the pinned head: a verdict judged fresh for that head is kept, a stale or missing one re-run. The reviewers it re-runs run at the same time, so the step waits for the slowest of them ("The reviewers run at the same time" below). A head that moved while they ran stops the run, and the verdicts they made are posted against the pinned head. A `CHANGES_REQUESTED` stops the run before the merge, with the first line of each `[block]` finding ("Findings a person judges" below) — else the verdict's first lines — and it is reported ahead of a reviewer that could not be run. Where the review started beside checks still running, that stop's last line also names each that has failed by then, so one fix round carries both. The advisories of the approvals — `[advisory]` findings, and findings with no tag — are printed in this step too, with where to read every verdict in full. In human review mode, or where the PR requires no local reviewer, registered or contributed, the approval is `done-work`'s gate.
+- **findings to judge.** Each `[person]` finding, printed whole under its reviewer, from each reviewer's latest verdict as the merge gate reads it; one whose verdict no longer stands for the pinned head is marked stale, with why. A `--yes` run merges only when it found each such verdict at its start, standing for the head; otherwise it stops on the `ready:` line, which says why ("Findings a person judges" below). Where the review ran beside checks, the step runs before the run waits for the rest, so no stop in that wait hides a finding. It runs again after the wait, for a verdict posted during it. A stop inside the `review` step prints them too, just above its last line, so no way that step ends hides a finding. There a verdict is judged for the head the PR has by then. What it cannot read draws a `warn:` line and leaves the stop as it is. A run with no `[person]` finding prints no line here and goes on as it would without the step. The verdicts that cannot be read, or — with a `[person]` finding among them — whose reviewers cannot be resolved, stop the run with nothing merged. So does a remote reviewer's verdict carrying a `[person]` finding on a PR whose author cannot be read, since it cannot be told from the author's own; a local reviewer's finding is shown as before (the merge gate's "An author the gate cannot read" below). Beside the findings, the step prints each accepted decision record the change alters, a line each, and counts it among them ("Accepted records a change alters" below).
+- **documents this change affects.** The answers the change wrote, and the friction settings the change alters, derived from the change check at the pinned head against the PR's base — named to the check, and fetched first ([project-management:DEC-065-answers-read-from-check] point 2). The step's line counts the documents the answers are on, and prints no answer: what the person is told of them is printed just before the run stops ready, asks or merges (the `merge` step below). A sentence under the description's `## What changed in each updated document` on a document the check does not mark `updated` draws a `warn:` line naming the edit that removes it, and refuses nothing ("Where the sentences live" below). The description carries no list of the answers. The region an earlier run wrote is removed, and the step's line says so ("The answers a change wrote, in its pull request" below). A change that wrote none and alters no setting goes on exactly as it would without the step. The step stops the run, with nothing merged, when the answers cannot be derived or the base cannot be fetched — never read as a pass. It refuses a file the change touches whose front matter the check cannot read, since the answers on it cannot be read. It refuses a sentence that reads as a closing reference, which the host would close an issue with at merge. Where there are answers or settings, it refuses a base whose commits since the head left it changed a file the answers' words are on, or the friction settings the change alters, or whose changes to them cannot be read. The merge could then land answers other than those the reviewer checked and the person was told: merge the base into the branch and run again. The step takes the file each answer is on from the change check, and the answer's document where the check names none (DEC-065 point 5). A base that moved on and changed none of them stops nothing — the change check itself only reports an outdated base (COR-050 point 12). A removal the host answers with an error stops the run with nothing merged (exit 7). The host may have kept it all the same, and running again removes the list or finds it gone. A change with answers merges under the same authorisation as any other. Beside what the person is told, the run prints each revalidation on the base's tip that the change's answer on its document did not read (`Answered apart once merged: …`). The change check reports them against the base the step fetched. Once the change merges, each of them and the change's own revalidation are answered apart, which the whole-repository check reports as debt until a revalidation reads both (DEC-055 point 3). They stop nothing, and the `ready:` line counts them among what it tells. The run also prints there, a line each, every grant and refusal the change adds to the fixers' grant list or removes from it, read where the head left its base and at the pinned head ([project-management:DEC-056-drift-fixers] point 2). Those lines are printed only, never written into the description, and the `ready:` line names "a change to which fixers may start" among what it tells. A grant list that cannot be read stops the run (exit 2), since what the step cannot read it cannot show.
+- **merge check.** Last before the `ready:` stop, the prompt or the merge, the change check runs on the merge as it would land ([project-management:DEC-055-pr-lists-answers] point 6). The step fetches the PR's base and builds the merge of the pinned head with its tip, as a commit on no branch. It runs `pkit friction check --json` on that merge against the tip, reading it from git objects. Only where the backbone refuses to run an anchor's resolver away from the merge does it take a temporary checkout, removed afterwards. The head is named as the change's own head (`--own-head`), as the checks on a PR name it, and no branch or working tree of yours changes.
+  - **A merge can need a resolver its head did not.** For a head from elsewhere nobody named, the step then asks or stops as the head's own check does ("Which heads may start programs" below).
+  - **Where the check fails** in the project's friction mode, the run stops with nothing merged (exit 1). Each finding is a line, `<document>: <kind> — <message>`, and the last line names each document: `merge check: refused — the change check fails on 1a2b3c4 merged with main at 9f8e7d6, on 1 document (docs/core.md), above`. It ends with what to do: merge the base into the branch, settle each finding there, push, and run `land-work` again.
+  - **Two changes that each passed alone** are held so: another PR landed an anchor on what this one changes, and the merge leaves the anchored document stale.
+  - **In warning mode** the check fails nothing. The findings are printed the same way, and the line says they are for information.
+  - **A merge that conflicts** with the base as fetched stops the run (exit 1), with the merge to make. A check that cannot be read, or a base that cannot be fetched, stops it with nothing merged (exit 2), never read as a pass.
+  - **A reviewer the merge requires.** A rule the base accepted after the head left it can bring the change's text under it ([project-management:DEC-064-base-merge-named] point 8). The head does not then require that rule's reviewer.
+    - **When it asks.** In agent review mode, where the check fails nothing and the base has moved on, the step asks once. It asks only where a contribution in force names the `touches-ruled-artefact` floor, and the head does not require each reviewer of it.
+    - **What it asks.** The backbone answers through `pkit rule-sets altered --json`, from the base's tip to the merge.
+    - **Where it lists an artefact an accepted rule binds on,** the run stops with nothing merged (exit 1), naming the merge of the base: `merge check: refused — 1a2b3c4 merged with main at 9f8e7d6 alters or brings under an accepted rule 1 artefact (docs/guide.md), so it requires rule-set-reviewer, which 1a2b3c4 does not`. After the merge, the review runs that reviewer on the new head.
+    - **Where it lists none,** the step's line says `and the merge requires no reviewer 1a2b3c4 does not`, before any report of warning mode. An answer that cannot be read stops the run with nothing merged (exit 2).
+  - **Where the head holds the tip** its own check read in the answers step, that check is the merge's, and nothing runs again. Otherwise the step takes about as long as one change check on the repository.
+  - **What it does not check.** The whole-repository check is not run at the merge: for a stale page it reports what the change check reports, save the cases COR-050 names where the two checks part. A page the base had already left stale is the base's debt. Code of the declared surface the merge leaves unanchored is not checked. Nor is a commit that reaches the base after the step.
+- **merge.** `--yes --expect-head <sha>` is the authorisation to merge that head, Review → Done being user-authorised. An authorisation is for a named head ([project-management:DEC-055-pr-lists-answers] point 3), so `--yes` without `--expect-head` is refused (exit 2) before anything is read, waited for or reviewed, `--dry-run` included (#1760). A `--yes` that named no head would merge whatever head the run found, one the person may not have been shown. The refusal offers no command with a head in it: run `land-work <N>` without `--yes`, and its `ready:` line names the head and the command that merges it. Without `--yes`, off a terminal, `land-work` runs `done-work`'s gates as a dry run and stops on that `ready:` line. At a terminal, `done-work`'s prompt asks, naming the head, as `move-issue`'s does, after what the person is told. That is printed just above the `ready:` line, and before `done-work` asks or merges ([project-management:DEC-065-answers-read-from-check] point 4). It tells what changed in each updated document, in its author's sentence, which documents are left out of date, with each deferral's words, and which targets of a link a revisit entry leaves out of date, with the source that names each and the entry's words. It tells each answer the change check did not ask for, and each reason for having no anchors, with its words, each friction setting changed, each change to the fixers' grant list, and each revalidation the merge would leave answered apart. It prints no other answer, such as a document still accurate. That is information, not a gate. `--expect-head` names the head the authorisation is for. That authorisation also covers a later head after a merge round that changed nothing but answers ([project-management:DEC-055-pr-lists-answers] point 3). Every change since must lie inside answer files the change adds, apart from what a clean merge of the base brings. An answer file removed, or one the base holds, lies outside. The backbone's `pkit friction since` answers that.
+  - **At the later head,** the run goes on as at any head, and its `head:` line says the authorisation covers it. The checks, the review and `done-work`'s gates run on that head.
+  - **It stops at `ready:`,** naming the later head, where it finds a reviewer's `[person]` finding or an answer the change check did not ask for. It stops too on a change to the fixers' grant list, or a list of the accepted records the change alters, other than the one at the head authorised, or one it cannot read there ("Accepted records a change alters" below). So does a document or target left out of date that the head authorised did not leave, or left in other words, or answers it cannot read there ([project-management:DEC-065-answers-read-from-check] point 4). Each needs the person, and the run cannot tell whether they were shown it.
+  - **When it merges,** its `merge:` line says which head merged and why the authorisation covered it.
+  - **Any other later head** stops the run before anything is checked (exit 3), naming the changes outside the answer files the change adds. So does a later head the backbone cannot answer for.
+  - **A host that merges only a branch up to date with its base** refuses the merge of a head behind it, and running again would fail the same way. The `ci` step stops on it first. Where the base moved on after that, and the merge request fails with GitHub reading the PR as behind, the run stops (exit 1) with the merge of the base to make. After a clean merge, the same command lands the new head on the same authorisation, where nothing at that head needs the person, as at any later head above.
+  - **A sentence no reviewer checks** holds the run: the description gives a sentence on a document the change check does not mark `updated` (the `documents this change affects` step). The run stops at `ready:`, naming the edit that removes it. Once it is removed, the same command merges.
+  - **A missing sentence** holds the run too: the change check marks a document `updated` that the description gives no sentence for. An edit of the description stales no verdict, and no move to review runs again, so nothing else stops it here. The run stops at `ready:`, naming the edit that writes it. Once it is written, the same command merges.
+
+  `done-work` lands the pinned head or nothing, and `land-work` reports how its run ended — never its exit code, which one code covers several ends of — saying "merged" only when GitHub does.
+
+The pinned head is checked at each step: the checks are read with the head they belong to; `review-pr` keeps only verdicts judged fresh at the pinned head and shows a reviewer the head only when it is the pinned one; the findings to judge are read with the head, and a head that moved stops the run; `done-work` refuses when the head is another before its gates and after its gate's read; and its merge request is pinned to the head, so a push in the last moment fails the merge, which `land-work` reports as a moved head.
+
+The exit code says what to do next, and the last line says why:
+
+| Exit | Meaning | Next |
+|---|---|---|
+| 0 | merged — or a PR that had merged completed — and the issue done | — |
+| 1 | needs a change: unpushed or diverged commits, a draft PR, a conflict with the base, a failed check, a `CHANGES_REQUESTED`, a refused answers step (front matter the change check cannot read in a file the change touches, a sentence that reads as a closing reference, a base whose commits since changed a file the answers' words are on or the friction settings the change alters), a merge with the base as it stands that the change check fails on, that conflicts or that requires a reviewer the head does not, a head the host reads as behind a base it merges only up to date, or a `done-work` refusal | hand the PR back with the last line |
+| 2 | nothing was changed: a usage error — `--yes` without `--expect-head` among them — an invocation refused (not a member, another repository), or something that could not be read — the change check's answers or the base it reads included, the verdicts the findings to judge come from, the accepted records the change alters, the change check on the merge with the base, which reviewers that merge requires, and the PR's author when a remote reviewer's verdict carries a `[person]` finding | fix the invocation, or run again — without `--yes` — once GitHub answers or the change check can be read |
+| 3 | the PR's head is not the one pinned, or not the one `--expect-head` authorised and not a later head that authorisation covers: a head nobody checked or authorised | report it; do not run again on your own |
+| 4 | accepted, not yet seen merged: queued, or the merge is unconfirmed (`done-work`'s 4) | run the same command again once it merges; when the last line says it reads neither merged nor queued, run it again now — it merges the PR if it has not merged |
+| 5 | the wait for the checks ran out | run again to keep waiting |
+| 6 | a reviewer could not be run, so the review is not complete | run again, without `--yes`, once it can run |
+| 7 | a step failed that running again completes: a request that failed, a list an earlier run left not removed from the description, a PR that merged meanwhile, or a step after the merge (the move to Done, a close) | run again, without `--yes` |
+| 8 | ready, not merged: everything passed, and no authorisation was given — no `--yes` off a terminal, or the prompt declined — or a verdict carrying a finding to judge came after this run's `--yes`, could not be read at its start, or does not stand for the head (the line names the review it waits for), or a later head the authorisation for an earlier one covers holds a finding to judge, an answer the change check did not ask for, something left out of date that the head authorised did not leave, or a list of the accepted records the change alters other than the one at the head authorised, or a `--yes` run met a sentence no reviewer checks or an updated document with no sentence | where the line names a review, have it run first, then run again without `--yes`; where it names a sentence, have the author remove it or write it; show the user the findings to judge above the `ready:` line, whole, and tell them what the lines just above it say changed and is left out of date, as information; on their authorisation, the `ready:` line's command |
+| 9 | a head from elsewhere needs a person: its change check needs a resolver the head holds, and nobody named the head, so nothing was merged | a person at a terminal runs `land-work <N>` and names the head; a second run off a terminal changes nothing |
+
+Outside `--dry-run`, a run that did not merge never exits 0, and 0 means everything after the merge ran too. With `--dry-run` nothing is reviewed or merged, and 0 means every step would go on.
+
+**How many proposals wait.** Just before its last line, whatever the outcome, a run prints how many of the fixers' proposals wait for the person, where any wait: `fixers: 2 proposals wait for you — pkit pm fix-drift gathered them in <folder>` ([project-management:DEC-056-drift-fixers] point 6; "Starting the fixers — `fix-drift`" above). A queue that cannot be read prints a `warn:` line there instead, and changes nothing else.
+
+Running `land-work` again resumes: green checks on the same head are not waited for, fresh verdicts are not re-run, and a PR that merged meanwhile is completed through `done-work`.
+
+**When the branch takes in its base** ([project-management:DEC-064-base-merge-named]). No command of this capability merges the base into the PR's branch, or tells you to, only because the base has moved on. `land-work` names the merge, and the command that makes it, in these cases:
+
+- **The PR conflicts with its base.** The `ci` step stops on it, and so does the merge check.
+- **The merge check fails.** The change check fails on the merge as it would land.
+- **The answers could change at the merge.** The base's commits since the head left it changed a file the answers' words are on, or the friction settings the change alters, or which of them they changed cannot be read (the `documents this change affects` step).
+- **The merge requires a reviewer the head does not.** The base brought the change's text under a rule whose reviewer the head does not require (the merge check).
+- **The host merges only a branch up to date with its base.** The `ci` step stops on a PR GitHub reads as behind it, and the `merge` step on a merge the host refuses for it, unless the base merges through a queue.
+
+The change check's report of an outdated base names no merge, since the merge check checks the change with the base as it stands. Nor does a merge the host refuses for another cause, which the run reports as a failed request. Where a check fails only on the host's merge or the queue's, judge whether taking in the base settles it. You may merge the base whenever you choose: a clean merge keeps every verdict, and the authorisation can cover the head it makes. In a project with a topology, a merge into a worker's Task branch goes through the build command ([project-management:DEC-063-task-builder] point 1). That route is a shortfall until #2287 builds the command: until then, the worker makes the merge in its own session. The record says why, and what leaving the base out leaves open.
+
+**What the command cannot date.** A run authorised up front that finds a finding's verdict already posted, standing for the head it was authorised for, merges, so the person must have been shown the finding first. That is the pm skill's landing text (`skills/pm/transition-state.md`), not something the command can hold. At that head the answers hold no run, beyond the author's sentences. At a later head the authorisation covers, the merge step above says what stops it. A run authorised up front prints what the person is told, and merges in the same run. The person is told what changed through the author's sentences in the description and through the printout, as information, whenever they read them.
+
+**Which backbone derives the answers.** The change check runs as the `pkit` first on the PATH the command runs with, with routing off (`PKIT_NO_ROUTE=1`): from the working directory, and — only when the backbone refuses to run an anchor's resolver away from the head (the CLI README, "Friction checks", `--head`), and only for a head that may start programs — again from a temporary checkout of the head, which is removed afterwards, on a termination signal too, and nothing else of the repository's with it. `show-pr --field answers` and `open-pr` make no such second run for any head ("Read-only diagnostics" below). Run through `pkit pm`, that `pkit` is the backbone serving the command: a source checkout's own environment, a project's pinned version, else the installed tool. Both runs are that one program, so the directory a run starts in, or the head's own pin, never gives the same head other answers.
+
+**Which heads may start programs** ([project-management:DEC-067-heads-that-start-programs]). A temporary checkout runs what that tree holds: each resolver, all it loads and any hook. They run under your account. So `land-work` and `review-work` start them only for a head that passes a test, or that a person named.
+
+- **The test.** The host says the head lies in the base's own repository, and the head holds none of a sandboxed build's commits. A reading that does not say is no pass, and neither are build records that cannot be read. A project with no seats has no builds, and a head that passes runs as any head always has.
+- **A head from elsewhere** is any other, a fork's above all. No temporary checkout is made, of it or of its merge. The change check reads each from git objects, so nothing it holds starts.
+  - **Where no anchor needs a resolver,** that is the whole check, and the run goes on. Its reviewers are told to start nothing of the head.
+  - **Where one does,** no answers come, in either friction mode, and a person at a terminal is asked. With nobody there, `land-work` stops (exit 9) and `review-work` stops (exit 2). A second run changes nothing.
+  - **`review-work --force`** moves on with its warning that the sentences went unchecked, and starts nothing.
+  - **No flag starts a program.** A run with `--yes` stops here, even at a terminal, and so does a dry run.
+- **Naming a head.** The question shows the commit and the repository it comes from, and what naming it starts. Reading the diff needs no checkout: `gh pr diff <PR>`. You answer by typing the commit's short id.
+  - **What your word covers.** That one run of that command: the commit, its merge with the base and the reviewers the run starts. Another run, or a later head, asks again.
+  - **What it leaves.** A comment on the PR names the commit, the command and who named it. It is posted before anything starts, and with no comment nothing starts.
+  - **What it leaves standing.** Every other stop, each reviewer's verdict and the authorisation to merge.
+  - **An agent** runs with no terminal, so the question stops it, and the person directing it runs the command themselves. A program that fakes a terminal could still answer, so this guards a routine run and is no boundary.
+- **The local branch.** `land-work` finds a PR through a local branch named `<type>/<N>-<slug>`, and only where that name is also the PR's head branch. For a fork's PR, make that branch with no checkout, under the fork's own branch name: `git fetch <base remote> refs/pull/<PR>/head:refs/heads/<head-branch>`. Where the fork's branch has another shape, such as `patch-1`, `land-work` finds no PR. Merge it on the host, then run `done-work`, which finds a merged PR from the issue's closing references.
+- **Your working tree.** Land such a head from a tree of your own. A tree that holds the head's files, an older commit of its branch included, runs the head's own copy of the command, before any test.
+- **The other merge commands.** A merge through `done-work` or `merge-pr` runs no change check and tells no answer. So they are no neutral way past the stop.
+
+**What you trust when you land a change** ([project-management:DEC-067-heads-that-start-programs] point 8).
+
+- **Whatever can push to the base's repository:** each person, bot and application the project granted. Their programs run under your account, which may reach far more than that repository. They run at the move to review, before any reviewer has read them, and at the landing, before you are told anything.
+- **A head you named,** for that run.
+- **The host,** for saying where a head lies.
+- **The reviewers' runs.** A head from elsewhere starts no program, but its words still reach an agent that runs unconfined. A steered reviewer can do what your account can.
+- **What lands.** Once merged, the change's programs run wherever the project is checked. An authorisation to merge gives that.
+
+A project with writers it does not trust this far confines the run where it runs it (COR-050 point 2). A container holding a token for that one repository is such a place.
+
+**What these commands print** ([project-management:DEC-067-heads-that-start-programs] point 7). `land-work`, `review-work`, `review-pr`, `show-pr`, `open-pr`, `done-work`, `merge-pr` and the documentation check print each control character, bidirectional override and zero-width character as its escape. So do `move-issue` and `close-issue`, which `review-work` and `done-work` run. So a head cannot rewrite what you read there. Lines keep their ends, and `--json` output keeps its bytes. The other commands' output waits for a sweep ([project-kit#2718](https://github.com/aleskalfas/project-kit/issues/2718)), so they print such text as it came.
+
+#### The answers a change wrote, in its pull request ([project-management:DEC-055-pr-lists-answers])
+
+An agent building a change may give the answers its own change owes — the revalidations and deferrals the change check (`pkit friction check`) asks of it — without asking first. A reviewer other than that agent checks them, the pull request says what changed in each `updated` document, and the person who authorises the merge is told what changed and what is left out of date, as information, not a gate (COR-050 point 3). Which reviewer checks the answers is the project's choice. The software-engineering capability's docs reviewer checks them wherever it reviews a pull request (that capability's README, "The reviewer of a change's answers"). The pull request's description carries no list of the answers ([project-management:DEC-065-answers-read-from-check]). Each reader derives them from the change check at the pull request's head: the reviewer, `review-work` and `land-work`. `show-pr <PR> --field answers` prints them for anyone else, within the limit its passage states. The author's sentences on what changed stay in the description, in the sentences' section:
+
+```
+## What changed in each updated document
+
+- `docs/install.md`: The install steps name the renamed flag.
+```
+
+- **What the description carries.** No command writes the list of the answers into it (DEC-065 point 1). A list an earlier run left is its region: both markers, what lies between them, and the heading directly above, `## Documentation this change affects` or the earlier `## Friction answers`. `open-pr` drops a region from the body it is given, and `edit-pr` one the description or the supplied body carries, each with a warning saying so. `land-work` removes one before it stops ready, asks or merges (the `documents this change affects` step above). The markers are `body-format.yaml`'s `friction_answers_marker`, and count only as whole lines. Nothing else is removed. A section under either heading with no markers is the author's. A start marker with no end marker draws a warning from each of the three, and the description stays as it is.
+- **Never input.** No reader of the description treats a region an earlier run left as input: not the closing references (`done-work`, `merge-pr`, `validate-pr`, `show-pr`, `show-tree`), not the mapping's override (`check-doc-mapping`), not the placeholder check, not the Doc impact requirement, not the author's sentences. Each strips it before it reads. The host's own parser cannot be told to skip it, so `land-work` removes it before it merges. A merge through `done-work` or `merge-pr` run directly keeps it, and the squash commit carries it as it carries the rest of the description.
+- **What the person is told.** `land-work` prints it from the answers at the head it merges, a line each, just above the `ready:` line and before `done-work` asks or merges (DEC-065 point 4). "What changed in `<document>`: "…"" gives the author's sentence, or says the pull request's author has not said. "Left out of date: `<document>`, for changes to `<anchor>`: "…"" gives each deferral the change wrote, and each a revalidation kept. For a revisit entry left `deferred`, the same line names the target and the source that names it through its fields (COR-050 point 16). "Not asked for by this change: `<document>`, `<outcome>`: "…"" gives each answer the change check did not ask for, and each reason for having no anchors, which a person or the delegate they named decided (COR-064). Each friction setting the change alters follows as it was where the head left its base and as it is at the head: "Checked locations: … → …", "Documents excluded from checking: … → …". The settings are read through the backbone's discovery at each commit (`pkit friction artefacts --json --at`), never from the configuration file. The mode decides whether the check fails, not what it asks, so a change to it is not told. "Files the change check could not read: `<n>`" counts them. No other answer is told, such as a document still accurate: it is the reviewer's to check, and so are the check's other flags on an answer, in its own list. `show-pr <PR> --field answers` prints the same lines for anyone not at `land-work`, within its limit (see "Read-only diagnostics"). Each answer reads in the words of the change check's own list (the CLI README, "Friction checks"): `updated` is "updated in this change", `unchanged` "still accurate", `deferred` "out of date, fixed later", a reason for having no anchors "not tied to anything", and a revalidation with no outcome "no decision recorded". An anchor is named in plain words: a path as written, "decision record `COR-050`", "document `<id>`", another kind as `kind:value`. Every text of an artefact's, and every sentence, is shown as the check's human view shows it, a character a terminal would act on written as its escape.
+- **Where the sentences live.** The PR's author writes them in the sentences' section, `## What changed in each updated document` (`body-format.yaml`'s `sentences_heading`). It holds one top-level list item per document the change revalidated as `updated`, bulleted or numbered and starting in the line's first column: the document in a code span, named as the change check names it — its path, or `path#id` for an entry of a collection — then a colon or a dash, then the sentence: ``- `path`: sentence``. An item may run on over the lines under it, up to a blank line, another list item, a heading, an HTML comment or a thematic break. Of two items for one document the first is read. An item in another form gives no sentence. Such an item names its document in bold (`- **path:** …`) or without a code span, sits in a list indented whole, or names its document with no words after it. An item nested under another is not read, and draws no warning. Nothing inside an HTML comment that opens a line is read or warned of, since it does not render. `open-pr`, `edit-pr` and `land-work` each warn of every item they cannot read, naming its line in the description and the form a sentence takes. In `edit-pr` the warning is a finding of its validation. The section lives in the description because the reviewer of the answers and the person who authorises the merge both read it, and the squash commit carries it. An artefact's block holds no such field.
+  - **The move to review refuses a missing sentence.** `review-work` derives the answers at the PR's head on every move, a draft's or a ready PR's, before it makes the PR ready, requests reviewers or moves the issue (DEC-065 point 3). It fetches that head where this clone lacks it, and reads only the answers, not the friction settings. It refuses each document the change check marks `updated` there that the description gives no sentence for. The refusal names each such document, the form a sentence takes and each item under the heading that is not read as one. It ends with the next steps: `edit-pr <PR> --body-file <file>`, then `review-work <N>` again. It is a `hard-reject`, as validate-at-ready's findings are. Where the change check cannot be run at the head, `review-work` stops (exit 2) and refuses nothing: run it again. On a head that starts no program, a second run changes nothing ("Which heads may start programs"). Under `--force` it goes on with a warning saying no sentence was checked. A description it cannot read stops it (exit 3), never read as one that gives every sentence. A head pushed after the move to Review is left to the reviewer, who blocks a missing sentence.
+  - **A sentence that reads as a closing reference is refused.** A sentence stays in the description and the squash commit, and the host's own parser reads both. So `review-work` refuses one, which `--force` overrides, and `land-work` refuses one with nothing to override it. The refusal reads as widely as the host: `fixed #12`, `Fixes: #12`, `owner/repo#12` and an issue's URL count, which this capability's own closing references leave out (DEC-065 point 5).
+  - **The other commands warn.** `open-pr` derives the answers at the pushed head and warns of each updated document with no sentence, naming it, and refuses none. Answers it cannot read draw a warning, never a refusal. `edit-pr` derives nothing, so it warns of no missing sentence. `review-work` refuses one before the review, and `land-work` holds a run authorised up front on one after it.
+  - **A sentence no reviewer checks.** `open-pr`, `review-work` and `land-work` each warn of every sentence under the heading on a document the change check they ran does not mark `updated`, since no reviewer checks it. Each names the edit that removes it, `land-work` before it stops ready, asks or merges, and none refuses. `land-work` holds a run authorised up front on it, at `ready:`, until the sentence is removed.
+- **What this does not verify.** That a person read what they were told, or that the reviewer checked every answer: the reviewer's verdict is the review's ([project-management:DEC-028-agent-as-approver-paths]), and the person's authorisation is the same as for any other change. A review bypassed or overridden ([project-management:DEC-050-per-reviewer-override]), or a project that chooses no reviewer of a change's answers, leaves the answers checked by their writer alone, a limit COR-050 point 3 accepts. So does a pull request that does not require the project's reviewer of the answers, a case COR-050 point 3 does not name: the reviewer's own capability says when it is required, and the software-engineering README says how to have `docs-reviewer` review such a pull request. A verdict covers the reasons at the head it reviewed. A reviewer whose approval stays fresh across a change to a file that carries an answer, or a sentence edited in the description after the verdict, leaves what changed since unchecked. `land-work` tells the person what the answers at the head it merges leave to them. `done-work` and `merge-pr` run directly tell nothing, and remove no list an earlier run left. A project that runs no checks on pull requests lands through them (the `ci` step above), so its merges tell nothing either, and nor does a merge made outside these commands. The person there runs `show-pr <PR> --field answers`, and nothing holds the merge until they do. On a project whose anchors need the head's programs, that prints nothing away from a clean checkout at the head. The person then reads the sentences, and the answer files in the change's diff, which falls short of what they are owed (DEC-065 point 6, [project-kit#2696](https://github.com/aleskalfas/project-kit/issues/2696)). Nothing keeps what a person was told: the answer files hold what was answered.
+
+#### Findings a person judges (per [project-management:DEC-028-agent-as-approver-paths] and [project-management:DEC-055-pr-lists-answers] point 3)
+
+Each finding in a reviewer's verdict is a top-level list item that begins with a tag saying what it does to the merge:
+
+- **`[block]`** — an objective failure the change owns. A reviewer requests changes exactly when it has one, and a fix round carries it.
+- **`[person]`** — a finding for the person who authorises the merge. It cites by id an accepted rule that binds on what the change alters, where judging the change needs a reading the rule does not settle. It withholds no approval and is not a blocking finding.
+- **`[advisory]`** — any other finding, a pre-existing defect written `[advisory] (pre-existing: <reason>)`. A finding with no tag counts as one.
+
+A reviewer writes any grade of its own after the tag: `pm-reviewer` writes `[block] (hard-reject)`, and its `[block]` findings are exactly those that make it request changes. Its former severity words written alone still count, for an adopter's older copy of it: `hard-reject` reads as `[block]`, `warning` as `[advisory]`, and `bypassable-with-audit` as `[block]` under a `CHANGES_REQUESTED` and `[advisory]` under an `APPROVED`, since that copy approved with it only once its audit comment was there. Bold, backticks, a trailing colon or another case still mark a tag; text in a fenced block carries none. `review-pr`'s brief tells every local reviewer the three tags, and that they widen no remit: a reviewer cites a rule only when its own instructions have it judge that rule. A remote reviewer gets no brief, so whoever sets it up has it write the tags; its untagged findings count as `[advisory]`, and none of them reaches the person.
+
+`land-work` prints each `[person]` finding whole, with its sub-items, beside what the person is told of the answers, before it stops ready or asks (the `findings to judge` step above). It reads them from each reviewer's latest verdict as the merge gate reads it — a marked verdict from a reviewer the PR requires — in either review mode, and marks stale, with why, one that no longer stands for the head ("When a verdict stays fresh" below). The hold: a `--yes` run merges only when it found, at its start, each verdict carrying a `[person]` finding, and each stands for the pinned head.
+
+- A verdict this run posted, or one posted while it ran — or any, when the run could not read the verdicts at its start — stops the run on `ready:`. Show the person the findings above it; on their authorisation, the identical command merges.
+- A verdict that does not stand for the head stops every `--yes` run on `ready:`, and the line names the review it waits for. In agent review mode the review step re-runs a local reviewer's stale verdict, so this is a remote reviewer's verdict, or any in human review mode, where `land-work` runs no reviewer: run `review-pr <N>`, or have the remote reviewer review the head again, then show the person the new findings and ask.
+
+A run whose verdicts carry no `[person]` finding lands as it did before the step. What the hold does not verify: that the person read a finding, or that its verdict was posted before the authorisation — a verdict replaced at the same head after the person was shown it, and before the run started, passes it, as does one posted after `land-work` read the verdicts, in the moments before the merge. It trusts a local verdict's reviewer name, written in the verdict's own first line, as the merge gate does. `done-work` and `merge-pr` run directly show no finding and hold nothing; on that path, show the person every `[person]` finding (`show-pr <N> --field review`) before asking.
+
+##### Accepted records a change alters (#2161)
+
+An edit to an accepted decision record that changes what the record decides is a decision of its own, which stays a person's (the decisions README, "Refining an accepted record"). So `land-work` shows the person who authorises the merge each record accepted where the head left the PR's base that the change alters or removes, among the findings to judge:
+
+```
+  [accepted record] PRJ-007, `.pkit/decisions/project/PRJ-007-releases.md`: point 2 (Who cuts a release) altered and point 5 (Hotfixes) added. Judge whether each edit changes what the record decides.
+findings to judge: 1, above
+```
+
+- **Where the list comes from.** The backbone's numbering check lists each point the change adds, alters or retires, each of the record's title, status and supersession fields that changed, and a change to the text its points stand on or to its other text (`pkit decisions check-diff --json --head <head>`, [the decisions README, "Checking a change's numbering"](../../decisions/README.md#checking-a-changes-numbering)). `land-work` derives it at the pinned head against the PR's base, fetched first, and never reads a record's points itself. A list that cannot be read stops the run with nothing merged (exit 2).
+- **What it holds.** The list stands for the pinned head and is there when the run starts. So a `--yes` for that head covers it, as it covers a `[person]` finding whose verdict the run found at its start, standing for the head ([project-management:DEC-055-pr-lists-answers] point 3). Unlike a verdict, the list is in no comment on the PR, only in `land-work`'s printout. So show the person the `ready:` stop's list before asking for that `--yes`.
+- **At a later head** an earlier head's authorisation covers, the list must be the one at the head authorised. A merge of the base moves where the head left it, so a record the base accepted meanwhile can join the list. Another list, or one that cannot be read at the head authorised, stops the run at `ready:`, as another change to the fixers' grant list does.
+- **What it does not see.** The list names what a change edits, not its words, so the person reads the edit in the PR's diff. `done-work` and `merge-pr` run directly show no list: on that path, run `pkit decisions check-diff` from a checkout at the PR's head, and show the person its list before asking.
+
+#### Issue titles — every rule `titles.yaml` declares runs
+
+Each title surface in `schemas/titles.yaml` (the four issue types, the Milestone, the PR) carries a `pattern` and a list of `validations`; each validation names the check that runs it (`check`), the finding label it is reported under (`name`) and its severity, and the schema refuses a validation with no check, so a rule cannot sit in the schema unenforced. `scripts/_lib/title_rules.py` is the one reader: `create-issue`, `edit-issue --title`, `validate-issue`, `validate-pr` and `create-milestone` all ask it.
+
+For issue titles: a Conventional Commits prefix after the bracket (`[Task] fix: …`, `[EPIC] feat(x): …`) is refused where a title is written — filing, retitling, `validate-issue --phase create` — and reported as a warning at a lifecycle transition, so an issue filed with one still moves. A lowercase `scope:` token right after the bracket (`[EPIC] sandbox: …`) is a warning: it reads like a commit scope, but inbound reports and component-scoped titles carry it, so filing goes on. A colon or a dash after a territory named in words (`[EPIC] Permission model: …`, `[EPIC] PR review fidelity — …`) is not flagged. A Task title, under any kind-driven prefix, draws a warning below 30 characters after the prefix; an EPIC, Feature or Umbrella names a territory, which is short by nature, and has no length floor. A PR summary draws a warning past 72 characters; aim for about 50. The house style per type is in each entry's `description` and `examples_good`: an EPIC, Feature or Umbrella names a territory; a Task says what is true once the work is done, or the work in the imperative for a decision, a document or an exploration.
+
+#### PR-title conv-types — the standard set, and why decision-record PRs land as `docs`
+
+PR titles are Conventional Commits and are restricted to the **standard type set** — `feat | fix | docs | test | refactor | chore | ci` — for changelog and tooling compatibility (`schemas/titles.yaml`, the `pr` format entry). Merges are squash-merges (one commit, head branch deleted on merge), so the **PR title becomes the landed commit subject** on `main` (`schemas/git-conventions.yaml`, the `merge` entry); keeping PR titles to the standard set keeps `git log` history parseable by standard CC tooling.
+
+This is intentionally narrower than the **branch** conv-type set. The branch pattern additionally permits `decision` (`schemas/git-conventions.yaml`, the `branch-name` entry) per COR-008, so a decision-record branch may be named `decision/<n>-…`. But `decision` is **not** a PR-title type: a decision-record PR is deliberately titled **`docs(<scope>): …`** — e.g. `docs(decisions): …` or `docs(pm): …`. So a `decision/236-…` branch is fine, and its squashed PR/commit subject lands as `docs(…)`. Authors filing a decision-record PR should title it `docs`, not `decision`, up front — the `pr`-title validator hard-rejects a `decision(…)` title.
+
+#### Batch substrate primitives — `check-criterion` / `uncheck-criterion` / `set-field` (per [project-management:DEC-038-criterion-addressing])
+
+Three narrow, batch-capable verbs replace the whole-body fetch-edit-resend that `edit-issue` forces for a single checkbox flip or field change. Each takes narrow input, validates the **whole batch up front**, refuses before any mutation on a hard inconsistency, and applies **idempotently** so a half-applied batch recovers by re-running. Output is a single clean line per result — nothing to pipe through `grep`.
+
+`edit-issue` itself **scopes validation to the field(s) being edited** (per [project-management:DEC-014-validation-severity-model]; #583): a title-only edit validates the new title but not the untouched body, and a body-only edit validates the new body but not the untouched title. This lets an issue whose body predates the current body schema take a clean title edit without a full body rewrite (and without reaching for `--force`); a body edit still validates the new body in full.
+
+| Command | What it does |
+|---|---|
+| `check-criterion <issue> [--section doc-impact] <index> [text] [<index> [text]] ...` | Tick one or more acceptance-criterion checkboxes, addressed by **1-based index** (matching `show-issue --field criteria`'s numbering) with an optional **expected-text guard**. `--section doc-impact` addresses the `## Doc impact` section's checkboxes the same way, numbered as `show-issue --field doc-impact` lists them. |
+| `uncheck-criterion <issue> [--section doc-impact] <index> [text] ...` | Untick — the symmetric counterpart; identical addressing and failure model. |
+| `set-field <issue> [--kind K] [--priority X] [--workstream Y] [--parent N]` | Declaratively set classification field(s) in one call. Kind/priority/workstream resolve through the same seam `create-issue` uses (substrate-map-aware); `--kind` applies to **kind-driven (Task) issues** — it swaps the `type:*` label and realigns the title prefix per `title_prefix_by_value` (e.g. `[Chore] → [Bug]`). On an epic/feature/umbrella a non-`feature` kind is **refused up front** (those structural types carry kind `feature` by definition — DEC-011 / `classification.yaml` `structural_restriction`); re-file as a Task if it's genuinely bug/docs/test work. `--parent` writes the parent-ref as the body's first line **and moves the native sub-issue link to the same parent** (native containment; see "An issue has one native parent" above). A first line that is a parent-ref and nothing else is replaced; one that names an issue and says more (`Feature: #12 — auth`, a sentence opening `Note: #45 …`) is kept, and the new parent-ref is written above it — readers read only the first line, and nothing an author wrote is lost — and the plan line says which was done. The line names the parent by its own type, read from its title as `create-issue` reads it — `Umbrella: #N` under an Umbrella — and by the first form the issue's type allows where the parent's type cannot be told, or, with a warning, where its own is not one of them. An EPIC's container is a milestone, never an issue, so for an EPIC the number is a milestone's: the line is `Milestone: #N`, no native link is written, and a warning says the line names milestone N, not issue #N. The `type:*` axis is always a label, so `--kind` labels regardless of board. For priority and workstream, `set-field` asks where the axis actually lives and writes there: your own label where your map binds one, the kit's label in greenfield, and the Projects-v2 field where a board carries it. A degrade note is reported only where nothing carries the axis at all — not, as before, wherever a board exists. |
+
+**Addressing a criterion** (`check`/`uncheck`): the **index** is the primary address; the optional **expected-text** is both a wording-based double-check and a guard that the box has not moved between read and write. The guard rule is **equality on the trimmed, checkbox-marker-stripped text** — copy it verbatim from `show-issue --field criteria` output. Each guard follows the index it guards (`check-criterion 239 1 "docs updated" 3`). A `## Doc impact` section written as checkboxes is addressed the same way with `--section doc-impact`: its items are numbered within that section, as `show-issue --field doc-impact` prints them, and one call addresses one section.
+
+**Failure + recovery** (DEC-038 D4) for all three:
+
+- **Index out of range** → refuse the whole batch; report the criterion count. Never create a checkbox.
+- **Expected-text mismatch** (criteria reordered between read and write) → refuse; report the actual line so the caller re-reads. Never tick blind.
+- **Ambiguous guard** (text matches more than one criterion) → refuse and list the matches; ambiguity never silently resolves.
+- **Unknown field value** (`set-field`, including an unknown `--kind`) → refuse before any mutation, listing the adopter's declared values, or for a workstream the active ones.
+- **Kind/structural mismatch** (`set-field --kind` with a non-`feature` kind on an epic/feature/umbrella) → refuse before any mutation, naming the rule (DEC-011 / `structural_restriction`). `--kind feature` on those types is permitted (it's the kind they already carry) and lands as a no-op.
+- **Parent link cannot follow the first line** (`set-field --parent`) → an issue whose native parent cannot be read is refused before any mutation (exit 1); a native move GitHub refuses stops the call before the first line is rewritten, naming the parent the issue stays under (exit 3).
+- **Already in the requested state** → no-op success. Ticking a ticked box, or setting a field to its current value, is not an error.
+- **Half-batch faults mid-apply** → re-run is safe: applied targets no-op, the rest complete.
+
+```
+pkit pm check-criterion 239 1 3 5            # tick criteria 1, 3, 5 in one call
+pkit pm check-criterion 239 2 "docs updated" # tick #2 only if it still reads "docs updated"
+pkit pm check-criterion 239 --section doc-impact 1   # tick the first `## Doc impact` box
+pkit pm uncheck-criterion 239 2              # untick #2 (idempotent)
+pkit pm set-field 239 --priority High --workstream cli   # set both, idempotently
+pkit pm set-field 239 --kind bug             # Task: swap type:* label + realign prefix ([Chore] → [Bug])
+pkit pm set-field 239 --kind bug --priority High         # kind + priority in one batch
+# (on an [EPIC]/[Feature]/[Umbrella], --kind bug is refused — re-file as a Task)
+pkit pm set-field 239 --parent 42            # rewrite the parent-ref line to Feature: #42 and move the native link to #42
+```
+
+All three accept `--dry-run` (validate + show the plan, write nothing) and `--yes` (skip the confirmation prompt), and run the DEC-021 membership gate at startup.
+
+#### Clone-local instance identity — `set-instance` (per [project-management:DEC-035-instance-ownership])
+
+`set-instance` records **which of your clones this is** — the opt-in, per-clone activation gate for instance ownership in a project with no topology of seats. One person running several clones of the repo gives each a numeric instance id; the id is written to a **git-ignored** runtime file under the capability's `project/instance/` directory (declared in `package.yaml`'s `runtime_ignore:`), so it never commits and never leaves the clone. Outside a topology of seats, a clone with **no id set** marks nothing and runs no clash guard or signed listing (the presence of the id is the sole activation gate). The one exception is the move back from In Progress: on an issue that has an owner, such a clone cannot release the owner, so the move refuses and names the owner (DEC-035 point 4).
+
+| Command | What it does |
+|---|---|
+| `set-instance <N>` | Set this clone's instance id to `N` (a positive integer). |
+| `set-instance --show` | Print the current id, or `unset`, and the seat the clone took, where it took one. |
+| `set-instance --clear` | Unset — revert to the non-participating no-op default. |
+
+Setting the id touches no issue. The lifecycle commands read it and write each issue's ownership *marker*, as the next section says.
+
+**In a project with a topology of seats,** a clone's number is its seat's place in the topology, and nobody types it ([project-management:DEC-059-topology-of-seats] point 6). So `set-instance <N>` refuses a number where the default branch holds a topology. The command refuses one too where the default branch cannot be resolved, since whether it holds one cannot then be told. A clone there takes a seat with `take-seat` (below).
+
+The same runtime file keeps the clone's **key**. The clone generates it the first time it claims on a state issue (below), and keeps it whatever its number. Setting or clearing the id keeps the key, and so does taking or releasing a seat. Whoever copies a clone clears its runtime file, since two clones that share a key cannot be told apart.
+
+**How an ownership event reads.** The audit-log facility ([project-management:DEC-044-audit-log-facility], `scripts/_lib/audit_log.py`) builds each ownership event's comment. Its hidden stamp, `<!-- pkit:audit v=1 event=claim ... -->`, names the instance and carries an id made once for the act. In a project with a topology it also names the seat, the seat's number and the clone's key. The stamps written before the facility, `<!-- pkit:instance-owner v=1 ... -->`, still read as the same events, so an issue claimed under them keeps its owner. `schemas/audit-log.yaml` declares the stamp and every event type.
+
+#### What the lifecycle commands write for an instance (per [project-management:DEC-035-instance-ownership] and [project-management:DEC-043-ownership-substrate-selection])
+
+Outside a topology of seats, the instance id switches instance ownership on: with one set, four commands write the ownership marker and six are guarded. With none, they write and print what they did before, but `move-issue` refuses to move back an issue that has an owner (see `set-instance` above).
+
+| Command | Ownership side effect |
+|---|---|
+| `create-issue` | Claims each issue it files for this clone, so the clone owns the arc it files from birth. An issue filed for another person with `--assignee` is not claimed. |
+| `start-work` | Claims an issue no instance owns, once it has set the assignee and before the move to In Progress. An issue another instance owns is refused by the clash guard below, and `--bypass` starts it unclaimed. |
+| `close-issue` | Releases every owner of the issue once the issue is closed, by the command or by a merge, in each mode, except a comment marker another account's clone wrote, which only that account's clone can release. `done-work` releases through the `close-issue --mode=pr-merge` it runs for each issue its merge closed. |
+| `move-issue` | Releases the owner of an issue a person moves back from In Progress: see **The owner** under "Moving an issue back from In Progress" below. |
+
+The owner is the assignee paired with an instance number. So a clone claims only an issue assigned to its own account. A claim or a release that fails is a warning, and the command's own work stands. `handoff-issue` does not move the marker between clones yet.
+
+**The clash guard refuses an ordinary command on another instance's issue.** `start-work`, `review-work`, `done-work`, `promote-issue`, `edit-issue` and `move-issue` read the issue's owner before they write anything. Where another instance owns it, or the issue cannot be read, they refuse at `bypassable-with-audit` ([project-management:DEC-014-validation-severity-model]). The guard catches a clash, and is no lock.
+
+**A bypass posts its reason first.** `start-work --bypass "<reason>"` acts anyway, and so does `--bypass-owner "<reason>"` on the other five. The reason is posted on the issue as an audit comment before the command writes. A command hands its reason to the move it composes, which finds the comment posted and posts no second one.
+
+**The marker is a comment unless you choose the label.** Each claim, withdrawal and release is then an event comment, and the issue's description shows the current owner. That owner line is derived from the comments, rewritten after each event, and kept above the provenance footer. Where your repository can create labels, `substrate: label` in the capability's `project/instance-ownership.yaml` selects the `instance:N` label instead, created on first use.
+
+**Two clones can claim one issue in the same instant.** GitHub has no atomic claim, so a claim reads the issue again after writing. Where a lower-numbered instance claimed too, the higher one withdraws its claim. `start-work` then stops before the move with exit code 2, as it does where its claim finds another instance's claim made after the clash guard passed. This catches a clash rather than preventing it: a clone whose re-read came first keeps its claim, and both claims stay on the issue.
+
+**In a project with a topology of seats** ([project-management:DEC-059-topology-of-seats]), a clone takes part by holding a seat, and its instance number is the seat's. A clone in a planner's seat files with no owner, so its work enters the shared pool, and every other seat claims what it files.
+
+**A claim counts only after the current take of the seat its stamp names,** and only while the clone the stamp names holds that seat. A clone's take of a seat is the claim, on the seat's state issue, that made the clone the seat's holder. GitHub numbers the comments of every issue from one sequence, so a claim made after the take has the higher id. A seat's release thus frees its clone's work for good, with no write to the issues, even where the same clone takes the seat again.
+
+The guard does not refuse on a claim that no longer counts, and refuses on one whose seat it could not read. Each command reads a seat's holder from the seat's state issue the first time a claim names that seat, and keeps it for the rest of its run.
+
+**In a project with a topology, every command this section names confirms the clone's seat before it writes** (DEC-059 point 6). It reads the topology from the default branch, then the state issue of the seat the clone took, by the clone's key. The runtime file names that seat only as a hint of where to look. Where the confirmation fails, every such command but `close-issue` refuses and writes nothing:
+
+- the state issue shows the seat free, or held by another clone, such as after a release by force
+- the state issue cannot be read
+- the topology no longer holds the seat
+- the default branch cannot be resolved
+
+`close-issue` closes the issue all the same, and releases no owner, with a warning. A seat retired while the clone holds it is released at the clone's next command, and the clone then acts as no instance. A clone that took no seat takes no part, whatever number was typed into it, and a note says so.
+
+**A project with no topology behaves as before.** A clone that took no seat and set no id reads nothing more. One with an id set reads the topology from the default branch, finds none, and acts as that instance. Where the default branch cannot be resolved, it still acts as that instance, with a note, since no topology was read to refuse the number.
+
+#### State issues — shared state that changes while agents work (per [project-management:DEC-058-state-issues])
+
+A **state issue** holds one piece of shared state that changes while agents work, such as which clone holds a seat ([project-management:DEC-059-topology-of-seats]). It sits outside the work hierarchy: it has no type, no parent, no label, no assignee and no milestone. A hidden marker, `<!-- pkit:state-issue v=1 kind=<kind> key=<key> -->`, says which kind of state it holds and for which key. The marker sits in its first comment and in its description.
+
+- **The comments are the record.** Each change is one comment, built by the audit-log facility: a claim, a release, or a release by force with its reason
+- **The description shows the state.** A region of the description shows who holds the state, rewritten whole after each change. A stray edit to the region is rebuilt, and nothing is lost
+- **The first claim on a free state holds.** Another clone's claim on a held state counts for nothing, and stays void after the holder releases
+- **A comment counts only from an author who may write:** a member where the membership gate is closed, and otherwise an account GitHub records as having write access or more. The access is read once for each author in a run
+- **Its conversation is locked** when it is created, so GitHub lets fewer accounts comment on it, such as those with write access. A member who takes or releases a seat may need write access. A lock that fails is named, and a person locks that state issue on GitHub. A claim on a state issue is no security boundary ([project-management:DEC-058-state-issues] point 5), and neither the lock nor the check of each author makes it one
+- **No command of the lifecycle acts on a state issue.** The read of a single issue refuses one, and the board's reads leave its card out. Every listing of issues runs through the one read of issues, which leaves state issues out
+
+`scripts/_lib/state_issues.py` is the one module that reads and writes a state issue ([pkit:ADR-071]), and `schemas/state-issues.yaml` holds the marker, the region and the kinds of state. `create-seats` creates the state issues of a topology's seats, and `take-seat`, `release-seat` and `seats` take, release and list the seats (below).
+
+Two things no code enforces, for a person to watch once seats are in use:
+
+- **After an account loses its access or is deleted,** its comments stop counting. A seat's holder may then change, since a void claim may hold, or an earlier holder return. Check the listing of seats, and release by force each seat whose holder changed
+- **A Task that a board's automation moves back to In Progress** renews no claim, since only an ownership event renews one, and a board's automation posts none. Once claims lapse ([project-management:DEC-059-topology-of-seats] point 9), such a Task's claim may lapse at once
+
+#### Topologies of seats — `create-seats` / `check-topology` / `take-seat` / `release-seat` / `seats` (per [project-management:DEC-059-topology-of-seats])
+
+A project that runs several agents at once, each in a clone of its own, declares a **topology**: a list of seats in `project/topology.yaml`. Every clone reads the topology from the default branch, at the commit the backbone resolves it to, and never from its own branch. So a change to the topology binds once it merges. Where the default branch cannot be resolved, no clone takes a seat.
+
+```yaml
+# project/topology.yaml
+schema_version: 1
+settings:
+  release_mode: tolerant      # the only mode built
+pools: [alpha, bravo]         # optional pools of workers
+seats:
+  - name: planner             # unique, and never renamed
+    role: planner             # planner, worker or lead; a planner names no pool
+    organizer: true           # at most one seat
+    state_issue: 2210         # written by create-seats
+  - name: tester
+    role: worker
+    agent: project-manager    # the default
+    pools: [alpha]            # the pools a seat that builds serves
+    scope:
+      types: [test]           # workstreams, types of the type axis, or both
+    state_issue: 2211
+  - name: old-worker
+    role: worker
+    retired: true             # stays in its place
+    state_issue: 2190
+```
+
+- **A seat's number is its place in the list,** counted from one. New seats go at the end, and a seat that leaves stays in its place, marked `retired: true`, so no number moves. Renaming a seat retires it and adds a new seat at the end
+- **A scope narrows the work of its own seat,** and reserves nothing for that seat. It names workstreams that `project/workstreams.yaml` declares, values of the type axis, or both
+- **The organizer seat's clone** may release another seat by force. At most one seat is the organizer seat
+- **Each seat names its state issue,** which says who holds the seat. The topology never says who holds a seat
+- **Pools of workers are optional.** Where the topology declares `pools`, each seat that builds names the pools it serves, and takes its work only from them. A planner names no pool ("Pools of workers" below)
+
+**Adding seats.** Add the seats at the end of the file on a branch, and run `pkit pm create-seats` there. The command creates a state issue for each seat that names none and is not retired. It writes each issue's number into that seat's entry. Commit the file with the change, so the change lands with its state issues.
+
+- **A second run repeats nothing.** A seat that names its state issue is left alone. A state issue that an earlier run created is found by its marker among the open issues, and one left half done is finished. An issue opened by an account that may not write is never finished, and the run names it
+- **Each number is written as soon as its state issue exists,** so a run that stops keeps what it wrote
+- **Who may write on a state issue** comes from the members the default branch holds. A run that cannot resolve the default branch creates nothing, and a state issue that does not read back as the seat's gets no number
+- **The run stops on any other problem in the file,** such as a seat name used twice, before it creates anything
+
+**Checking a change.** `pkit pm check-topology` checks the file against the topology of the default branch, or of the base `--base` names, and says which commit it read. Each of these fails the check:
+
+- a shape that `schemas/topology.schema.json` refuses
+- a seat name used twice, or more than one organizer seat
+- a seat that is not retired and names no state issue, or two seats that name one
+- a scope that names a workstream or a type the project does not declare
+- a seat that names a pool the topology does not declare, a seat that names pools where none are declared, or a planner's seat that names a pool
+- the `label` substrate in `project/instance-ownership.yaml`, since a label cannot carry what a claim names
+- a seat of the base deleted or moved rather than retired
+- a base that cannot be resolved, while the working tree holds a topology
+
+The check compares a change with a base, so it is no member of `pkit validate`, which takes no base. Run it among the checks of a pull request. It reads no GitHub.
+
+**Taking a seat.** `pkit pm take-seat [<name>] [--role planner|worker|lead] --agent <definition>` takes the seat named for this clone. Without a name it takes the first free seat in the topology's order, or the first free one of the role. It says which commit of the default branch it read, and then the seat's name, its number, its role and the agent definition it names. From then on the clone acts as that seat's instance.
+
+- **Only a seat of the session's agent definition.** The session says which definition it follows, with `--agent`, or with `PKIT_AGENT` in its environment, which a platform that starts sessions may set. The command reads no harness's files, and takes no seat where neither names a definition
+- **A claim on the seat's state issue.** The claim names the account, the clone's key and where the clone lies, its machine and folder. The first claim on a free seat holds. A clone that loses the seat to a claim made in the same instant holds no seat, and its agent takes another, or stops
+- **One seat for each clone.** A clone that holds a seat takes it up again, as a new session in the clone does, since the key outlives every session. It takes no second seat, and releases a retired seat it holds first
+- **No seat is taken** where the default branch cannot be resolved, where a seat names no state issue or its state issue cannot be read, or where another clone holds the seat
+- **Code that cannot read the topology in full takes no seat.** It exits 2, and says what it did not understand ("Code that cannot read the topology in full" below)
+
+**Releasing a seat.** A seat stays taken until it is released: the tolerant mode is the only one built, so no seat is freed for its clone's silence. `pkit pm release-seat` releases the seat this clone holds, and the clone then forgets it. `pkit pm release-seat <name> --force --reason "<why>"` releases a seat whoever holds it, and the seat's state issue logs the reason.
+
+- **Who may release by force:** the clone of the organizer seat, or a person in any clone. A person authorises it at a terminal, or with `--yes`, as a held move. An agent never passes `--yes` for itself, and off a terminal with no `--yes` the command refuses
+- **What a release frees:** every claim that the seat's clone made as that seat stops counting, with no write to those issues. A dead clone's Tasks in Backlog and In Progress are then free for another clone to take. A clone that takes the seat again, the same clone included, revives none of those claims
+- **What a release leaves in Review:** a Task in Review waits on its reviewers and a person, so no worker takes it up ([project-management:DEC-059-topology-of-seats] point 9). `seats` names each such Task with its pull request, and the person lands it or hands it over to a worker
+
+**Listing the seats.** `pkit pm seats` lists each seat, read from the default branch, with its number, its role, its agent definition, its scope and its pools. It also shows whether the seat is the organizer seat or retired, its state issue and its holder, and marks the seat this clone holds. It then names each open state issue of a seat that no seat names, such as one a change closed unmerged left, for a person to close on GitHub. Where the topology declares pools, it shows each pool's open milestones too ("Pools of workers" below).
+
+**The Tasks in Review a released seat left.** Last, `seats` names each Task in Review whose claim stopped counting because its seat was released, by its clone or by force. It lists them under the seat and the clone that made the claim, each with the open pull request from the Task's branch, `<type>/<N>-<slug>`:
+
+```
+Tasks in Review that a released seat left, each for a person to land or to hand over to a worker (DEC-059 points 5 and 9):
+  seat worker-1, clone 9f3c2a7d41be6c08e5d1f2a3b4c5d6e7 of @agent-bot:
+    #2201 Add the dispatcher: pull request #2210
+```
+
+- **How the clone is told:** a Task's claim names the seat and the clone's key. That clone builds the Task and opens its pull request. `review-work` refuses another seat's clone, unless a bypass posts its reason on the Task
+- **Not listed:** a Task in Review that a claim still holds, or whose claim cannot be judged since its seat's state issue could not be read. A Task In Progress whose seat was released is not listed either, since `next-task` offers it
+- **What it reads:** the comments of each Task in Review, once some seat's state issue logs a release, and the open pull requests in one listing, once a Task is found. It writes nothing to them
+- **Exit 3** where a Task's comments or the open pull requests could not be read, as where a seat's state issue or the open issues could not be. The listing says which
+
+**The commit read.** Each command that reads the topology names the commit of the default branch that the command read. A clone that has not fetched the default branch thus shows which commit the clone last fetched.
+
+- `take-seat`, `release-seat` and `seats` name the commit in their output
+- each command that confirms the seat before it writes, and `next-task`, names the commit in a note
+- a command that another command runs, such as the `move-issue` that `start-work` runs, repeats no commit the run named already
+- in a project with no topology, no note names a commit
+
+`scripts/_lib/topology.py` is the one reader of the topology. Every command that acts as a seat reads the topology through it, from the default branch. It also builds each run's snapshot: the topology, the members who may write on a state issue, and the clone's account, key and place. `schemas/topology.schema.json` holds the file's shape.
+
+**Code that cannot read the topology in full.** The parse marks a topology with a key this code does not know, at any depth ([project-management:DEC-061-pools-of-workers] point 9). It marks too a value it cannot read, such as an unknown role, release mode or schema version, or a list written as a string. On the mark, `next-task`, `start-work`, `take-seat` and `release-seat --force` refuse with exit 2, and say what was not understood. `seats` warns and lists the rest, and work in flight goes on, such as `review-work` and `done-work`.
+
+**The order of work.** The guard protects only the commands run from a checkout that holds it. So a project adds pools, or any later key, to its topology only once every clone that may take a seat runs this code. No check enforces this order yet: it is the operator's discipline.
+
+#### Pools of workers — the `Pool:` line and `set-pool` (per [project-management:DEC-061-pools-of-workers])
+
+A topology may declare **pools of workers**, and each seat that builds, a worker or a lead, names the pools it serves. A person puts a line of work into a pool by marking its Milestone with a `Pool: <name>` line. Each Task in that Milestone goes with it. So a line of work starts and finishes with no change to the topology.
+
+- **The `Pool:` line** is read as a whole line, wherever it stands in the Milestone's description, and the `Close trigger:` line stays first. Two such lines, a malformed one, or an undeclared pool put the Milestone in no pool, with a warning. `schemas/time-containers.yaml` declares its grammar
+- **A Task's pool** is the pool of its native Milestone field, never of the `Milestone:` line of its body. A Task in no Milestone, in a closed one or in one of no pool is in no pool
+- **Marking a Milestone is the person's act.** `create-milestone --pool <name>` files a Milestone into a pool, and `set-pool <milestone> <pool>` or `set-pool <milestone> --clear` changes or clears it. Each asks at a terminal, or takes `--yes` on the person's word, and refuses off a terminal without it. Each replaces the line, never adds a second, and logs the change and the consent in the description
+- **Bringing a Task into a pool asks the same way:** `create-issue --milestone`, `edit-issue --milestone`, `promote-issue --milestone`, and the milestone an `assign-milestone` hook sets. The Task's audit comment records the consent. Taking a Task out of a pool, or moving it within one, asks nothing
+- **A plan's approval** gives the person's word for the pools of the Tasks a planner files, where the plan names each Task's milestone and that milestone's pool
+- **What the listings show.** `seats` and `take-seat` show each pool's open milestones. They warn of a pool no seat serves, a pool with no open milestone, and a seat that builds and names no pool. They warn too of a milestone that names an undeclared pool. `seats` also counts the Tasks in Backlog in no pool, and those each seat owns outside its pools
+- **Retiring a pool.** Remove it from each seat's pools, then its name from the list, and its open Milestones fall into no pool, with a warning. Removing `pools` from the topology and from every seat brings back the one shared pool
+
+A worker takes only from its pools (`next-task`, below), and a close rolls its open Tasks forward within its pool (`close-milestone`, below). `scripts/_lib/pools.py` joins the topology's pools to the open milestones for each command that needs both. `scripts/_lib/milestone.py` holds the one parser of the line.
+
+#### Taking the next ready Task — `next-task` (per [project-management:DEC-059-topology-of-seats] point 7)
+
+`pkit pm next-task` takes this clone's own Task, else the next ready Task: from the one pool every seat shares where no pools are declared, otherwise only from the pools its seat serves. It starts the Task, claimed, through `start-work`. It reads the open issues of work once, through the one read of issues. It ranks this clone's own Tasks, and then the pool's, by priority, the highest first ([project-management:DEC-012-classification-axes]), and then by number, the lowest first.
+
+A ready Task is one of two kinds:
+
+- **An open Task in Backlog with no owner,** whose `## Dependencies` section names no open issue
+- **A Task In Progress whose claim no longer counts,** in a project with a topology, since the seat that claimed it was released. No claim lapses yet
+
+**This clone's own Tasks.** A Task in Backlog that this clone's instance owns is this clone's own work, outside the pool, as a lead owns what it files. Such a Task comes first where its `## Dependencies` section names no open issue and it falls in the seat's scope.
+
+**The pools.** Where the topology declares pools of workers, `next-task` reads the open milestones once and maps each `Pool:` line to its pool. It keeps only a Task whose native milestone is an open milestone of a pool the seat serves, this clone's own Tasks among them. The seat's scope then narrows what its pools hold, and a seat that names no pool takes nothing. Where no pool is declared, it reads no milestone ([project-management:DEC-061-pools-of-workers] points 5 and 8).
+
+- **Milestones that cannot be read:** the seat takes nothing, never the whole Backlog, and the command exits 3
+- **Nothing ready:** the command exits 5 and says why in terms of the seat's pools, such as `pool alpha has no open milestone`
+- **A Task outside the seat's pools:** a person may direct a seat to it with `start-work`, and the seat takes it. `start-work` warns of it, as a warning and never a gate
+
+What else holds a Task back:
+
+- **An assignee of another account,** since `start-work` refuses such a Task and points to `handoff-issue`
+- **Another instance's claim,** folded as the clash guard folds it, and an owner that cannot be read
+- **The scope of the seat,** in a project with a topology. A Task falls in the scope where it matches each part the scope names: its workstream and its type
+- **Priority or workstream, where the map binds it to the board,** which is not read. A Task whose priority only a board holds ranks last, and a scope's part on such an axis takes no Task
+
+**Where the board carries the state.** Where the substrate map binds `state` to the board, each Task's state is its card's Status ([project-management:DEC-062-axes-chosen-in-the-map] point 5). A Task with no card, a card with no Status, or a Status naming no open state is skipped with a warning naming which. A board that cannot be read takes nothing and exits 3, as milestones that cannot be read do ([project-management:DEC-051-axis-carriage-activation] point 6).
+
+**How dependencies are read.** Dependencies are prose ([project-management:DEC-005-linking-and-containment]), so `next-task` reads each `#N` that the `## Dependencies` section names. It skips what an HTML comment, a fenced code block or a code span holds. It skips a reference to another repository's issue (`owner/repo#N`), an issue named only by its address, and the Task itself. A number that is no open issue holds nothing back, whether it is closed, a pull request or not there.
+
+**Two clones at once never both start one Task.** Where `start-work` fails and the Task is now another instance's, the first claim held. This clone then takes the next ready Task. Any other failure of `start-work` stops the run, with its exit code.
+
+**Who takes.** Outside a topology, a clone takes with no scope, and a clone with no instance id reads no owner. In a project with a topology, a clone that holds no seat takes nothing, and nor does a planner's seat, which builds none of the work. The seat's scope is the one the topology on the default branch gives the seat. A clone whose seat cannot be confirmed on its state issue takes nothing either.
+
+`--dry-run` says which Task it would start, and runs `start-work --dry-run` on it. The command asks before it starts a Task, unless `--yes` is given. A listing that reaches `--limit`, 1000 open issues by default, refuses, since a dependency it did not return could be open.
+
+| Exit | Meaning |
+|---|---|
+| 0 | A Task was started, a dry run said which it would start, or the person declined the `Start #N?` prompt, and the command printed `aborted.` |
+| 1 | Membership refused, or the foreign-repo guard did |
+| 2 | A clone that holds no seat, a planner's seat or a seat that cannot be confirmed, a listing that reached `--limit`, or code that cannot read the topology in full |
+| 3 | The open issues could not be read, or where pools are declared the open milestones, or where the board carries the state its Status, or a ready Task's owner could not be read and no other Task was free |
+| 5 | No Task is ready for this clone, so nothing was started. Where pools are declared, the line says why in terms of the seat's pools |
+| other | `start-work`'s own exit code, where it failed for a cause other than a lost claim |
+
+`scripts/_lib/task_pool.py` reckons which Tasks are ready, once for every command that needs it ([project-management:DEC-025-parallelization-primitive]).
+
+#### A seat's agent and its loop — the pm skill's `work-loop` (per [project-management:DEC-059-topology-of-seats] point 8)
+
+At the start of each session, the project-manager agent lists the seats with `seats`, and takes one with `take-seat` where the session was started for one, or its clone holds one already. The seat's role then sets its direction, and it runs the role's loop from the pm skill's `work-loop` sub-procedure. A session that holds no seat, as in a project with no topology, infers its direction from the request as before.
+
+- **A planner** plans each intent through batch planning, and files the work with no owner. Its Tasks enter the pool once scheduled into Backlog, a move the plan's gate lists and the person's approval authorises. Where the topology declares pools, it files into the milestones the person gives it, and its plan names each Task's milestone and that milestone's pool. It builds nothing, and closes a container only on the person's authorisation
+- **A worker** first goes on with what its clone has in flight: a Task In Progress, a pull request of its own that conflicts with the default branch, or a fix round on one whose verdict asks for changes. It mends a conflict by merging the default branch in, and never rebases or force-pushes. Then it takes the next ready Task with `next-task --yes`, builds it in its own clone, and opens its pull request with `open-pr --draft` and `review-work`. Each round starts by reading its pull requests in Review again, with `show-pr <branch>`
+- **A pull request that a released seat left in Review** is the person's to land, or to hand over to a worker, since its Task waits on its reviewers and a person ([project-management:DEC-059-topology-of-seats] point 9). `next-task` never offers its Task. The worker the person hands it to fetches its branch, and mends it from then on
+- **No role authorises a merge,** or anything else a person authorises. The person lands each pull request through the merge gate
+- **A comment that reports the person's decision** names the seat or the session the person gave it in. The comment verbs name only the seat that posts, and the person may have given the decision in another session ("Freeform comments" below)
+- **A lead's loop,** with helpers of its own, is not in the sub-procedure yet
+
+Where the Tasks of new work would share a choice that nothing settles yet, batch planning plans in two stages ([project-management:DEC-060-foundation-before-slices]). The first plan files the EPIC, with the intent and an outline of the slices, and only the Feature of the work's foundation: a Task for the records of the shared choices, then a walking skeleton built on them. The slices are planned in a second plan, once the person closes that Feature. The agent's storyboard walks one round of each role's loop, and a worker's later round that meets each of these situations.
+
+#### Closing, reopening and editing an issue — `close-issue` / `reopen-issue` / `edit-issue`
+
+**`close-issue`** is *not* in the seven-command palette — it handles closure outside forward-progress flow. **`reopen-issue`** undoes a closure, and **`edit-issue`** changes an issue's title, body or milestone without moving it in the lifecycle.
+
+| Command | What it does |
+|---|---|
+| `close-issue <N> --reason "<R>"` | Won't-do / abandonment (`--mode=wont-do`, the default): the DEC-007 checkbox close-gate, a closing comment with the reason, closed as not planned. |
+| `close-issue <N> --mode=pr-merge` | The post-merge hook after GitHub's own `Closes #N` close: reconciles the state label to done and runs the closure cascade. It closes nothing itself, and refuses an open issue, writing nothing. |
+| `close-issue <N> --mode=pr-merge --pr <M>` | Closes an open **leaf** whose work landed in merged PR `M` where GitHub did not close the leaf, then runs the closure cascade. PR `M` is verified merged and related to the leaf, and the relation found is named (see below). The checkbox close-gate runs, and the reference is posted as a comment that a retry does not repeat. A container, an unmerged or unrelated PR and an unticked box are refused. |
+| `close-issue <N> --mode=completed --result "<where>"` | Closes a **Task** whose work was not a pull request as completed, naming where the work's result lives, once every checkbox is ticked (see "A Task whose work was not a pull request closes as completed" below). |
+| `close-issue <N> --mode=cascade-eligibility-close` | Closes a container (epic/feature/umbrella) once all its children are closed and its own checkboxes are ticked (a non-skippable DEC-007 gate). Whether every child has closed is the process engine's fold (`pkit process cascade`). A container the fold holds is refused, with what the refusal's own read of the children found: open children, each named with what releases the container; a read that failed, with the engine's reason and what the predicate it could not evaluate said on standard error, under `the predicate said:`; both, each with its remedy (see "What holds a container open" below). |
+| `reopen-issue <N> [--reason "<R>"]` | Reopens a closed issue and puts it back into the lifecycle: its state label is removed, so it reads as `backlog` when it has a milestone and `todo` otherwise, and `start-work` (or `promote-issue`) takes it on from there. An open issue still labelled done is repaired the same way. |
+| `edit-issue <N> [--title T] [--body B \| --body-file F \| --append A] [--milestone <M> \| --clear-milestone --reason "<R>"] [--bypass-owner "<R>"]` | Title / body edit, validated against the title and body rules for the fields edited (see above). `--milestone` attaches the issue to an OPEN milestone or moves it to another — its number or exact title, validated as `create-issue --milestone` validates it, for an issue whose type may carry one; `--clear-milestone` detaches it. A milestone change needs `--reason` and posts an audit comment. See "Attaching an issue to a Milestone" below. |
+
+**A won't-do close, a container's close, a close through `--pr` and a completed close are the person's.** [project-management:DEC-006-state-machine-and-cascade] makes each a move the person authorises, a hard reject where that authorisation is missing. `close-issue` holds them as `move-issue` holds such a move: `--yes` authorises the close, and at a terminal the person is asked. With neither, `close-issue` refuses with exit code 1 and writes nothing. A dry run writes nothing, so it needs no authorisation.
+
+**A pr-merge close needs a merged PR that relates to the issue.** `--mode=pr-merge` moves an open issue to Done only through a merged PR that relates to it, named with `--pr <M>` ([project-management:DEC-006-state-machine-and-cascade]). Without `--pr` it refuses an open issue, and on one GitHub closed it reconciles the labels and runs the cascade. PR `M` relates to the issue where its body closes the issue, or where its head branch is named for the issue, `<type>/<N>-<slug>` ([project-management:DEC-013-branch-and-pr-conventions]). A PR with neither is refused, and the refusal names what to do instead: `edit-pr <M> --closes <N>` and a re-run, a completed close where the work was not a pull request, or a won't-do close.
+
+**A Task whose work was not a pull request closes as completed** ([project-management:DEC-006-state-machine-and-cascade], the `manual-completed` closure trigger). An audit, an investigation or a decision walked with the user ends with nothing to merge, so no merged PR can close its Task: `close-issue <N> --mode=completed --result "<where the result lives>"` closes it instead. GitHub records it as completed, not as not planned, and `history` shows the move as `completed close: <where>`.
+
+- **What it names.** `--result` is required, and no other mode takes it: where the work's result lives, such as an issue, a record or a comment. It is posted as the close comment before the Task closes, so a close that fails after it leaves the result named, and a retry posts no second comment.
+- **When it closes.** Every checkbox must be ticked, since every checkbox ticked is what says the work is done. The checkbox gate takes no override here, as on a container's close: `--skip-checkbox-gate` is ignored. A Task in Todo, Backlog or In Progress closes. A Task in Review has a pull request open, so its work is that pull request: it is refused (exit 1), naming `done-work <N>`.
+- **What it refuses.** Anything but a Task is refused (exit 2), a container naming `--mode=cascade-eligibility-close`, and so is a run with no `--result` or a blank one. Nothing is written on a refusal.
+- **Where the board carries the state.** Where the substrate map binds `state` to the board, the Task's card says where it was. A card that does not place it cannot tell a Task in Review, so the close is refused, naming which of the four outcomes it is: exit 3 where the board cannot be read, else exit 1. Every other close goes on, and its move is not journaled from a guessed origin, with a warning.
+- **What follows the close.** As every close does, it releases the owner. Completed work is progress, so the forward cascade then brings each ancestor behind up to In Progress, from Todo or Backlog as from In Progress, and the closure cascade runs after it. The forward cascade is `move-issue <N> --to done` run on the closed Task: where `move-issue` exits non-zero, a warning names that command to run again, and the close stands. `--no-cascade` skips both cascades.
+
+**The closure cascade reports; it never closes.** Every `close-issue` mode ends with the closure cascade (skip it with `--no-cascade`): each parent issue the close gate counts the closed issue under is checked for close eligibility — its native parent and the parent its first line names, as the containment seam resolves them (see "Reading an issue's parent" above), so the report and the gate cannot disagree — and so is each Milestone the issue sits in — see "The closure cascade says when a Milestone became closeable" under the Milestone lifecycle below. A container closes through `--mode=cascade-eligibility-close`, a Milestone through `close-milestone`. Where the two records of the closed issue's parent do not agree, the cascade says so after the checks:
+
+- a native parent no first line names is checked, with a note and the `set-field` line that writes the first line;
+- two parents that disagree are both checked, with a warning and that line;
+- a first line in a form the issue's type does not allow is quoted in a warning, with the allowed forms, and the parent it names is checked all the same;
+- a native parent in another repository is named and not checked;
+- where the issue's record cannot be read, the first line's parent is checked, with a warning that the native one was not compared.
+
+**A parent is eligible to close only once its last open child closes** ([project-management:DEC-006-state-machine-and-cascade], [project-management:DEC-034-cascade-slot-binding]). Whether a parent has an open child left is the process engine's fold over its children (`pkit process cascade`), as `--mode=cascade-eligibility-close` reads it. A parent with no open child left and every box ticked is reported eligible, with the command that closes it:
+
+```
+[cascade] parents to check for eligibility: #10
+  · parent #10 open; no open child left and checkboxes complete — eligible to close: run `pkit pm close-issue 10 --mode=cascade-eligibility-close`
+```
+
+A parent with an open child is not eligible, and each open child is named: `· parent #10 open; not eligible — open child(ren): #12`. The open children are found by the read of the children the `--mode=cascade-eligibility-close` refusal makes. The report makes that read once more for each parent the fold holds, unless the fold stopped on a read. A parent with no open child left but an unticked box is not eligible either.
+
+Where the process engine could not fold the children, the report says that whether a child is open is not known. The report says the same, with the process engine's reason, where the fold stopped on a read, or held with no open child found. Such a parent is never reported eligible.
+
+What holds a container open:
+
+- A child linked natively under a container counts as its child whatever the child's first line says — a sub-issue linked in GitHub's UI, or one filed with `create-issue --parent <N> --milestone <M>`, whose first line is the `Milestone:` ref — so it holds the container until it closes, and its own close reports on that container.
+- A native child in another repository holds its container like any other child. It is named `owner/repo#<n>`, and never taken for this repository's issue of the same number. Its state is read in its own repository, by the tracker's own open/closed alone, since that repository need not follow this lifecycle's labels: closed counts as done, and open holds the container. One the container's sub-issue list names that cannot be read there — no access, not found, a failed read — leaves the fold indeterminate, so the container holds. Nothing is ever written in that repository: the child is not moved, labelled, commented on or cascaded into.
+- The gate sees a child elsewhere only through the container's sub-issue list. What it guarantees: a child that list names holds the container, read or not. What it cannot: GitHub may leave out of the list a sub-issue in a repository the reader cannot see, nothing in the answer marks the omission, and a child left out is not seen at all — the container can close over it. Close such a container as someone who can read every repository its children live in.
+- What a child elsewhere costs: one read of its record, in its own repository, per evaluation of the fold — and a `pkit process status` render evaluates the fold more than once; the `--mode=cascade-eligibility-close` refusal reads each one once more, to say what holds the container. Where the sub-issue list names each entry's repository but carries no `parent_issue_url` (GitHub carries it), placing the entries costs one read of the container's own record per list read.
+- The `--mode=cascade-eligibility-close` refusal says what holds the container, from its own read of the children — the engine's reason names whichever member the fold stopped at, so it cannot tell the causes apart when more than one is present — and from the engine's word that its fold stopped on a read before it counted a member that holds it (a members list or a candidate's membership it could not read), which no read of the children can see. Open children and a failed read found together are both said, each with its own remedy; neither found, the engine's reason is given under a header that claims no cause. Held by open children, it names each — one in another repository with its repository — and says what releases the container: each child closing, a child in another repository closing there or losing its sub-issue link — removed in this repository by the command the refusal prints, `gh api -X DELETE repos/{owner}/{repo}/issues/<N>/sub_issue -F sub_issue_id=<id>` with the child's id filled in, which pm never runs itself. Held because a read failed, it gives the engine's reason (left out where open children were found too and the engine did not stop on a read, since it may then name one of them), what the predicate said, the child set if it could not be read in full, and each child that could not be read: one in another repository with its two ways out — made readable to the account `gh` uses, or its link removed by that command — since running again under the same access fails the same way; any other failed read with the advice to re-run once `gh` is reachable, which appears only then.
+
+**The forward cascade brings every ancestor level; it authorises nothing.** When `move-issue` — and so `promote-issue`, `start-work`, `review-work`, `done-work` and a completed close, which move through it — moves an issue forward, it walks from the issue to the top of its hierarchy: the issue's parent, that parent's parent, and so on, each resolved by the containment seam from one read of the issue (see "Reading an issue's parent" above). It follows a parent only where the issue's native parent and its first line name the same issue, or where a first line in a form its type allows is the only record, each line read against the forms its issue's type allows (an issue whose type cannot be told is read as any `<Label>: #<N>`, a milestone ref ending the walk). Each ancestor that is behind is brought up to the issue's state, capped at In Progress — containers never enter Review or Done this way — and only through transitions `workflow.yaml` declares: an ancestor in Todo goes to Backlog and then to In Progress, two writes of its state (two labels, or, where the board carries the state, two writes of its card's Status), each journaled where a journal is kept with the issue's move as its reason (`forward cascade from #12: backlog → in-progress`), which `pkit pm history` shows. An ancestor at or past the target is left alone and the walk goes on above it, so the next move under a chain left behind brings it level. The cascade is not an authorisation and asks for none ([project-management:DEC-006-state-machine-and-cascade]): the authorisation gates govern a move asked for directly, on that issue, and a container's progress follows the work under it — so a container is taken to Backlog without `promote-issue`'s milestone or reason, no override's audit comment is posted for a cascaded move, and no `after_move_issue` hook fires for one (both are the moved issue's only). At the `full` audit projection a cascaded move gets the provenance comment a governed move gets, naming the move that caused it on a line of its own: one comment on each ancestor moved, covering the steps that landed in that run (`todo → backlog → in-progress`), so a re-run, which moves only what is still behind, never repeats one. At `audit` and `off` a cascaded move posts nothing. A comment that fails to post is one `[warn]` line, and the move stands. The preview, and `--dry-run`, print each ancestor's steps before anything is written; the engine is asked where an ancestor is only when the cascade is about to move it, so a sibling starting under ancestors already In Progress costs one read of each ancestor and no engine call. Where the board carries the state, each step writes the ancestor's Status, and an ancestor its Status does not place stops the walk, with one line naming why (see "A board's Status, source or projection" below). Where the kit writes the state neither as a label nor as the board's Status — a derivation, the title, nothing, or a label binding has no value for Backlog or In Progress — the cascade does not run, and one line says why; a `workflow.yaml` whose `cascade.forward.applies_to_levels` is missing or empty is a schema error, and the cascade says so instead of running. Skip it with `--no-cascade`.
+
+- **Where the walk stops.** The walk stops, with a warning, at an ancestor it cannot read (quoting what `gh` said), at one that is not a container, at one it has passed already, at one whose first line names itself (which names no parent), at one whose only record of a parent is a first line its type does not allow (`Epic: #5`, `Feature: #12 — auth`, an untyped issue's `Epic:#5`: the line and the forms the type allows are quoted), and at one whose native parent is not the parent its first line names, or whose first line names none — that ancestor is moved, and nothing above it. A first line its type does not allow, under a native parent naming the same issue, is followed, with a note saying so. An ancestor the engine answers it cannot place is not written, and the walk stops there: the closing block says why under it — each cause the engine gives (`pkit process status --json`, `position.unevaluated` and `position.placed_nowhere`) and what the predicate behind it said on standard error; where the engine cannot be reached at all (`pkit` missing, or exiting non-zero), the plan read from the labels is written. The moved issue's own native parent is held to its first line the same way, read once and only where a cascade is set to run: where the two disagree, where only the native one names a parent, where its first line is a parent-ref its type does not allow with no native parent naming the same issue, or where its record cannot be read to compare, the cascade walks nothing. On a disagreement the native parent wins and the first line is rewritten to name it ([project-management:DEC-005-linking-and-containment]) — `set-field <N> --parent <P>` rewrites it — and the move made again brings the chain level; a native parent in another repository cannot be named on a first line, and the cascade does not walk into it. The check needs the tracker to report a native parent, and is inert where it reports none.
+- **Finishing a cascade cut short.** The cascade ends with one block naming what became of each ancestor; an incomplete one — a label write that failed, an ancestor the engine cannot place — is a `[warn]` block, the issue's own move stands, and the exit code stays 0. **Run the same `move-issue` again to finish it**: an issue already at its target still brings its ancestors level, with no prompt — the cascade asks for none — and the cascade is idempotent.
+- **Moves to Done.** A move to Done brings ancestors up only when the issue finished work: closed as completed, from any state, or moved from In Progress or Review. A won't-do close from Todo or Backlog moves no ancestor, and a completed close from there brings them level, since completed work is progress. When a Task finishes, `done-work` moves it to Done after the merge: if GitHub has not closed the issue yet, that is the move Review → Done and it cascades; if the merge closed it already, the move finds it at Done, rewrites the Review label the close left and cascades from that Review all the same. An issue whose label already reads Done is told apart by its close reason, and so is a closed issue carrying neither a state label nor a milestone, which reads as Todo only because nothing records where it was: closed as completed — as a merged pull request's `Closes #N` closes it — it cascades as from Review, so `move-issue <N> --to done` run again finishes a cascade cut short (on an issue moved to Done while open, once it has closed); closed as not planned (a won't-do) or as a duplicate, it moves no ancestor; still open, or closed where the tracker reports no reason, completion cannot be told from won't-do, it moves no ancestor, and the next forward move under those ancestors brings them level.
+
+**Moving an issue back from In Progress** ([project-management:DEC-006-state-machine-and-cascade], "Moving back from In Progress"). An issue In Progress that nobody is working on moves back, so In Progress means work is moving: `move-issue <N> --to backlog --reason "<why the work stopped>"`, or `--to todo`. The move is the person's, at hard-reject: `--yes` authorises it, and at a terminal the person is asked. With neither, it is refused and nothing is written.
+
+- **Where it lands.** Backlog where the issue is in a milestone, and Todo where it is in none, so an issue scheduled with an audited reason and no milestone returns to Todo. A move to Backlog keeps the scheduling, and a move to Todo withdraws it. A container in no milestone lands in Backlog where one of its children is in Backlog. The other target is refused (exit 2), naming the right one.
+- **The reason.** `--reason` is required, and no other move of `move-issue` takes it. It is posted as the move's audit comment before the label changes, at every `audit.projection` but `off`, and journaled with the move as `move back: <reason>`, which `history` shows.
+- **The owner.** After the move, every owner of the issue is released the way `close-issue` releases one (see "What the lifecycle commands write for an instance" above), and a release that fails is a warning. Where this clone cannot release an owner, the move is refused (exit 1) before anything is written, naming the owner: any owner where the clone takes no part in instance ownership, and a claim another account made on the comment log. The owner's clone then moves the issue back, or the owner releases the claim first. The clash guard still runs, so another instance's issue of your own account needs `--bypass-owner`.
+- **A container.** It is refused (exit 1) while a child of it is In Progress or in Review, each such child named. It is refused too where its children cannot all be told: where its children cannot all be listed, where a child is not among the issues the issue list returned, or where a child cannot be read. A child in another repository is read there only as open or closed, so an open one holds the container until it closes, and running the move again does not help.
+
+No other issue moves with it: the forward cascade runs on forward moves only, and a container may stand ahead of the work under it. A Task's branch and draft pull request stay as they are, for the next taker to continue or to replace. Where a Projects v2 board is configured and the map carries the state off it, the card's Status follows the move, as for every move. Where the map binds the state to the board, the move back is refused and writes nothing, as DEC-006 says.
+
+**Each close is journaled.** A close is a governed move to Done ([project-management:DEC-049-audit-journal-model]), so every `close-issue` mode records it with the process engine the way `move-issue` records a move (`pkit process move --from`): after the close and its label reconcile, from the state the issue held before the close, with the close mode as the reason `history` shows (`wont-do close: <reason>`, `cascade-eligibility close: …`, `completed close: <where>`, `pr-merge close: closed by merged PR #<M>`). That state is the issue's state label, else its milestone, read as if the issue were open, so an issue GitHub closed when a PR merged reads where the merge found it; an issue still open with neither reads Todo. Where the substrate map binds the state to the board, an open issue's state is its card's Status instead. There, the card of an issue a merge closed still says where the work stood until it is set to Done, so `close-issue --mode=pr-merge` records that close from its card's Status. A card that places the issue nowhere records no move, with a warning naming which of the four outcomes it is: the board could not be read, no card, no Status, or a Status naming no open state, such as a card already at Done. An issue GitHub already closed with neither a state label nor a milestone carries nothing of where it was, and its close is not recorded from a guessed Todo. An issue whose label already says Done is not recorded again — whoever wrote the label recorded the move — so a re-run adds nothing. `move-issue <N> --to done` on an issue GitHub closed, the move `done-work` makes on its own issue after a merge, finds the issue at Done and only rewrites its stale label; it records the close as it does. Where the board carries the state, it sets the card to Done instead, and records the close from the card's Status, read before that write ("Where the Status is the source", below). So `done-work` records each close once, whichever of the two records it. `done-work` names the merged PR to `move-issue` (`--merged-pr <PR>`), so that entry carries the reason `close-issue` gives every other issue the PR closed — `pr-merge close: closed by merged PR #<PR>`, or `completed by merged PR #<PR>` where the move finds the issue still open and makes the move Review → Done itself, as on a base GitHub does not close issues on — and `history` reads the same for each. A move the workflow does not declare for the issue's type (a container whose label was set to Review by hand) is not recorded, and neither is one the engine refuses (a gate that does not pass): each is a warning, worded as a refused move's is, naming the gap `history --check-drift` will show, and the close stands. Where the engine refused for a predicate it could not evaluate, the lines after the warning carry its causes and what the predicate said, as the engine laid them out. Whether a move is recorded at all is the engine's, by the project's journal setting (see "Lifecycle history" below), so a close asks the engine once whether or not a journal is kept.
+
+**A PR that closes several issues is closed issue by issue.** GitHub's `Closes #N` closes every issue the PR body names, so `done-work <N>` gates and closes each of them, not only `N`. It reads the closing references with the reader `open-pr` and `validate-pr` use. Before the merge, the checkbox close-gate runs on each, `N` first, and refuses at the first issue that fails, naming it and its unticked boxes. After the merge, each is run through `close-issue <M> --mode=pr-merge --pr <PR>`, `N` first: closed as completed if the merge left it open (a base branch other than the default one, where GitHub does not auto-close), its state label reconciled to done, and its closure cascade run. An issue that was already closed before the merge is skipped with a note, not an error: the merge does not close it, so it is neither gated nor closed again. A close that fails after the merge is a warning naming the `close-issue` re-run; the others still run.
+
+**Why a reopen removes the state label instead of transitioning out of done.** `done` is the workflow's terminal state (`schemas/workflow.yaml`), and the closure cascade folds children against it; a transition out of it would make it an end state that is not one. A reopened issue re-enters the lifecycle where any open issue without a state label sits — the detectors read `backlog` with a milestone and `todo` without — which is where a freshly filed or freshly scheduled issue sits too. No state label is *added*, so the reset does not show as an ungoverned state change (`history --check-drift` counts added state labels). Where the state is derived from open/closed, nothing is removed. Where the map binds it to the board, set the card's Status by hand: a reopened issue's card still says where it was when it closed. Where the board's Status is a projection of the state, see "A board's Status, source or projection" below.
+
+**A milestone edit is not a state change.** The native Milestone field is written through the substrate-write seam, and a first body line naming the old milestone as the parent (`Milestone: [#<N>](../milestone/<N>)`, or the older plain form) is rewritten to the new one, so the textual record and the native field keep agreeing — `close-milestone` counts a milestone's children by both. An issue with no state label has its position read from its milestone, so a milestone edit that would move it is refused: attaching one to a Todo issue is the Todo → Backlog transition (`promote-issue --milestone`), and the workflow has no way from Backlog back to Todo. Clearing the milestone an issue's first line names as its required parent is refused as well — re-parent it first with `set-field <N> --parent <P>`; on an EPIC, whose parent-ref is optional, the line is removed instead.
+
+#### A board's Status, source or projection — `sync-board` (per [project-management:DEC-006-state-machine-and-cascade])
+
+Where a Projects v2 board is configured and the map carries the state off it, its Status is a projection of each issue's state, which the agent maintains. That is with no map, or where the map binds `state` to another substrate. The issue's own state stays the source: every reader reads it, and where the card and the issue disagree, the issue wins. Where the map binds `state` to the board, its Status is the source instead, and where a present map leaves `state` out, no Status is written ([project-management:DEC-062-axes-chosen-in-the-map] point 5).
+
+**Where the Status is the source.** The same writers write it, and each write is the move. So a move whose write fails is not made, nothing is journaled, and it exits 3.
+
+- **`move-issue`** reads an open issue's position from its card, and refuses a move the Status does not place. It exits 3 where the board cannot be read, and 1 for no card, no Status, or a Status naming no open state
+- **The forward cascade** writes each ancestor's Status step by step, and stops at an ancestor its Status does not place
+- **A closed issue's card** says where its work stood before the close. Where the issue did not close as completed, that tells finished work from a won't-do close. A card that then places the issue nowhere is named, with what the board said, and no ancestor moves
+- **`start-work` and `review-work`** refuse at their early check in the same cases
+- **`create-issue`** gives the new card its first Status: Todo, or Backlog for an issue filed with a milestone
+- **A closed issue is Done whatever its card says,** so a close that leaves the card as it was needs nothing more. `sync-board` refuses here, so after `reopen-issue`, set the card's Status by hand
+
+**Where the Status is a projection.** The same writers write it after each move, and the issue's own state stays the source.
+
+- **A move writes the Status.** `move-issue`, and so `promote-issue`, `start-work`, `review-work` and `done-work`, set the card's Status to the issue's new state. A move that finds the issue already there writes it too, so the move to Done that `done-work` makes after a merge brings the card to Done. The forward cascade sets each ancestor's once, to the state the ancestor reached. `--dry-run` names the write and reads nothing.
+- **Filing writes the first one.** `create-issue` sets the Status of the card it adds: Todo, or Backlog for an issue filed with a milestone.
+- **A write that fails is one line, and the move stands.** The line says why, such as a board that could not be read, an issue with no card, or a state with no option. `sync-board` sets the card later.
+- **The option a state takes is its display name** in `workflow.yaml`: Todo, Backlog, In Progress, Review and Done. It is matched exactly first, then without regard to case. `pre-check` warns, with the remedy, for each state the board's Status has no option for.
+- **`close-issue` and `reopen-issue` leave the card as it was.** They do not move an issue through `move-issue`, and neither do the closes `done-work` makes of the other issues a pull request closes. Run `sync-board` after them.
+
+**Bringing a whole board level.** A card dragged by hand, a write that failed or a board set up after its issues were filed leaves cards out of step. `pkit pm sync-board` reads every issue's state as the lifecycle does: closed is Done, and an open issue is read from its state label, its milestone or neither. It writes the Status only on the cards that differ, adds a card for each open issue that has none, and names each card whose Status disagreed. Cards of other repositories, pull requests and drafts are left alone, and so is a card whose state has no option.
+
+`--dry-run` prints the plan and writes nothing. Otherwise `sync-board` asks before its first write, and `--yes` runs it with nobody at a terminal. The membership gate and the foreign-repo guard run as in the other writers. Where no board is configured, the map binds the state to the board, or a present map leaves the state out, it refuses, saying which, and reads nothing.
+
+#### Opening and editing a PR — `open-pr` / `edit-pr`
+
+| Command | What it does |
+|---|---|
+| `open-pr [<N>] [--closes <N> ...] [--type T] [--scope S] [--summary "<s>"] [--body-file F] [--draft] [--doc-impact-from-friction]` | Opens the PR for the current branch. The closing issue is the positional `<N>`, as `review-work` and `done-work` take it, or `--closes <N>`, its explicit form; without either it comes from the branch name (`<type>/<N>-<slug>`). **`--closes` repeats**, so one PR that lands several Tasks closes each of them on merge. The first closing issue is the primary one: it supplies the title's Conventional-Commits type, the default summary and the base branch. The body carries a `Closes #N` line for every closing issue — the template gets one each, and a `--body-file` gains any it does not already name — and no list of the answers the change wrote: a supplied body's is dropped with a warning (see "The answers a change wrote, in its pull request"). The plan's `documents this change affects:` line counts the documents the answers are on, from the change check at the pushed head, and the run warns of each updated document with no sentence. Answers it cannot read draw a warning, never a refusal. **`--doc-impact-from-friction`** (opt-in) fills an unwritten `## Doc impact` with one line counting the documents those answers are on — see "Connections". |
+| `edit-pr <PR> [--title T] [--body B \| --body-file F \| --append A] [--closes <N> ...]` | Title / body edit, validated against the PR rules. `--closes` (repeatable) adds a `Closes #N` line beside the existing ones for each named issue the body does not already close. No command carries a list of the answers. A list an earlier run left, in the description or a supplied body, is dropped with a warning. That list is a region: both its markers, what lies between them and the heading directly above. A section under such a heading with no markers is the author's, and stays. A start marker with no end marker draws a warning, and the text stays as it is. The author's `## What changed in each updated document` is kept as written. |
+
+**The PR title is composed, not given whole:** `<type>(<scope>): <summary>`. `--type` overrides the type derived from the primary issue's `type:*` label, `--scope` adds the scope (the title has none without it), and `--summary` is only the description part after the colon, defaulting to the issue title without its `[Type]` prefix, lowercased:
+
+```
+pkit pm open-pr 1017 --scope pm --summary "take the issue number positionally" --body-file body.md
+# → fix(pm): take the issue number positionally   (closes #1017; fix from its type:bug label)
+```
+
+`validate-pr` reads every closing reference: a PR closing several issues is valid, and its title type is cross-checked against each closing issue's type (a mix of types is a warning). `done-work <N>` reads them the same way and gates and closes every closing issue, not only `N` (see "A PR that closes several issues is closed issue by issue" above).
+
+#### Milestone lifecycle — `create-milestone` / `close-milestone` (per [project-management:DEC-016-time-bound-containers])
+
+| Command | What it does |
+|---|---|
+| `create-milestone <category> --name "<name>" [--close-trigger T] [--due-on YYYY-MM-DD] [--pool NAME]` | File a new Milestone in a declared `milestone_categories:` category. Computes the next number, composes the title from the category's `title_format`, and writes the `Close trigger:` first body line. `--pool` puts it into a pool of workers, with the person's consent. |
+| `set-pool <milestone> <pool>` or `set-pool <milestone> --clear` | Set or clear the pool of workers an open Milestone is in, by its `Pool:` line, with the person's consent, logged in its description. |
+| `close-milestone <n> [--target <M>] [--force]` | Close an open Milestone (by number or exact title) through the validated path. A date-triggered close rolls its open children forward to the next Milestone. |
+
+Both run the DEC-021 membership gate and the COR-039 foreign-repo guard at startup, route every `gh` call through the shared host/owner seam (DEC-023), and accept `--dry-run` (preview, write nothing) and `--yes` (skip the confirmation prompt).
+
+**The close is the person's** (#2015). At a terminal `close-milestone` asks before it closes, and `--yes` authorises the close. Off a terminal, without `--yes`, it refuses with exit 1 before anything is written, and names the command to run with `--yes`. A re-run that finishes a rollforward goes on without `--yes`, since the close it finishes authorised the moves.
+
+`close-milestone` respects the Milestone's **close-trigger**, read from the `Close trigger:` first line of the description (inferred for an inherited Milestone with no marker: a native due date ⇒ `date-based`, none ⇒ `content-based`, per `time-containers.yaml`):
+
+- **content-based** — closes only when every child issue is closed. An open child **holds** the close (refused) unless you pass `--force`, which closes it with the open children left on it.
+- **date-based** — the date is the trigger, so the Milestone closes even with open children, and they **roll forward** to the next Milestone (below). Closing before the due date is the manual form of the same close.
+- **either** — closes on whichever fires first. From its due date on, its close is date-triggered and rolls forward like a date-based one; before it, open children hold the close as they hold a content-based one (refused unless `--force`).
+
+A Milestone's children are resolved the same way the rest of the capability resolves membership: the union of issues carrying the **native GitHub Milestone field** for it and issues whose body carries the textual `Milestone: [#<n>](../milestone/<n>)` ref. The issues are read through the containment seam, which says whether it saw all of them; a read that reached its ceiling is refused rather than answered from, since a child past it may be open. Because a Milestone has no comment thread, the audit note is **appended to the description** in the same PATCH that flips `state=closed` (idempotent on re-run), rather than posted as a comment the way `close-issue` does.
+
+**The closure cascade says when a Milestone became closeable.** When an issue closes — through `close-issue` in any mode, and so after every `done-work` merge — the closure cascade checks each Milestone the issue sits in (its native Milestone field, or its `Milestone:` body ref) the way it checks each parent issue. A content-based or `either` Milestone whose every child issue is now closed is reported with the command that closes it:
+
+```
+[cascade] milestones to check for eligibility: #6
+  · milestone #6 open; content-based, all 3 child issue(s) closed — eligible to close: run `pkit pm close-milestone 6`
+```
+
+A Milestone with an open child is reported as not eligible, with the count of open children, and a date-based Milestone as closing on its date — its children closing makes nothing eligible. The check reads the close-trigger and the children exactly as `close-milestone` does, so a Milestone reported eligible is one `close-milestone` closes without `--force`. The cascade **reports and never closes**: closing the Milestone stays your gesture, as closing a parent issue does.
+
+**A date-triggered close rolls the open children forward** (the schema's `rollforward_behaviour`). Once the Milestone is closed, `close-milestone` moves each open child to the rollforward target with `edit-issue <N> --milestone <target> --reason "<the close>"` — the move you would make by hand, so the child keeps its lifecycle state, its native Milestone field and its first-line `Milestone:` ref move together, and it gets one audit comment naming the old Milestone, the new one and the close. Closed children stay on the closed Milestone as the record of what shipped. A parent (Feature, Umbrella, EPIC) assigned to the closing Milestone is itself an open child while its work goes on, so it moves with its open children, and its closed children stay. An open child whose native field names another Milestone, with only its first line still naming this one, sits in that other Milestone and is left alone. A move closes nothing, so a rolled-forward child never counts as closed for the closure cascade.
+
+The **rollforward target** is, first to last: `--target <M>`, an open Milestone by number or exact title; the Milestone's `Rollforward target: <M>` line, which DEC-016 puts under the `Close trigger:` line and which takes a number, `#<N>`, the `[#<N>](../milestone/<N>)` link or an exact title; else the next-numbered open Milestone of its category — the declared category whose `title_format` its title fits, and in it the lowest number above its own. With no candidate, or more than one, the command refuses before it writes anything and asks you to name the target with `--target`. `--dry-run` lists every move the close would make.
+
+**Within the pool.** Where the topology declares pools of workers, the next-numbered is sought only among the open milestones of the closing one's pool ([project-management:DEC-061-pools-of-workers] point 7). A milestone in no pool rolls only into one in no pool. A target that `--target` or the `Rollforward target:` line names in another pool is named, with its pool, in the close's consent prompt. A forced close names each Task in Backlog or In Progress it leaves in no pool.
+
+Where this code cannot read the topology of the default branch in full, the close reads no pool. It takes each milestone's `Pool:` line to stand, as `edit-issue --milestone` does, so no Task enters another pool's milestone without the consent prompt naming it ([project-management:DEC-061-pools-of-workers] point 6). The next-numbered open milestone of its category, sought among every open milestone, is the target only where its `Pool:` line names the closing one's pool, or neither names one, since it is then the next of that pool whatever the topology declares. Otherwise the close refuses before it writes anything and asks you to name the target with `--target`. Where the milestone that `--target` or the `Rollforward target:` line names is in another pool by its `Pool:` line, the consent prompt names that pool and says the pools could not be read.
+
+Where the substrate map binds the state to the board, that forced close reads the open Tasks' cards, and no others, in one listing read. A Task its card does not place is named as one whose position cannot be told, with why ([project-management:DEC-051-axis-carriage-activation] point 6). Where the board cannot be read, the close says so in place of the list.
+
+The audit line counts the children rolled forward and names the target — `…; 1 child issue(s) closed; 2 rolled forward to #7 Sprint 7: Polish).` The close is written before the moves, so when a move fails the command exits 4 and the closed Milestone still records where its open children go: re-run `close-milestone <n>` and it moves the children still on the Milestone to that target. A child already moved is no longer its child and is not moved again, and `edit-issue` finds the audit comment a failed attempt posted and does not post it again (the comment carries its day, so a re-run on a later day posts a dated one of its own). A closed Milestone without that record — closed by hand, or before rollforward existed — is left as it is.
+
+A content close moves no child. When `--force` closes a content-based Milestone, or an `either` one before its due date, the open children stay on it, and the audit line counts them as still open, not rolled forward. Move one with `edit-issue <N> --milestone <next> --reason "<R>"`: the issue's current milestone may be closed (only the target must be open), and a first-line `Milestone:` ref moves with the native field. A raw `gh issue edit --milestone` changes only the native field, so the closed Milestone would go on counting the child through its first line.
+
+##### Attaching an issue to a Milestone
+
+Which verb depends on where the issue is in the lifecycle:
+
+- **At filing** — `create-issue --milestone <M>`.
+- **A Todo issue being scheduled** — `promote-issue <N> --milestone <M> --reason "<R>"`. Scheduling *is* the Todo → Backlog transition, so it goes through the verb that owns it, and `move-issue` records the audit comment.
+- **Any other issue — attaching, moving, detaching** — `edit-issue <N> --milestone <M> --reason "<R>"` (or `--clear-milestone --reason "<R>"`). No state transition happens. The milestone must be OPEN (number or exact title), and the issue's type must be one `issue-types.yaml` lets sit under a milestone (its parents include `milestone`, or its parent-ref form offers a `Milestone:` line — true of all four shipped types, an EPIC included). Before writing, it posts an audit comment naming the old and new milestone and the reason; a retry does not post it twice. The first body line follows the move, and a change that would move the issue in the lifecycle is refused (see "A milestone edit is not a state change" above).
+
+```
+pkit pm edit-issue 885 --milestone 5 --reason "EPIC scheduled into Milestone 5"
+pkit pm edit-issue 1044 --milestone "Milestone 6: …" --reason "filed into the wrong milestone"
+```
+
+`promote-issue` without `--milestone` leaves the milestone as it is and says so (`milestone: unchanged`). On an issue already past Todo, `promote-issue --milestone` still attaches the milestone but has no transition to carry an audit comment, so it points at `edit-issue` instead.
+
+**Into a pool of workers.** Where the milestone carries a `Pool:` line, filing, scheduling or moving a Task into it is the person's act ([project-management:DEC-061-pools-of-workers] point 6). Each of these verbs asks at a terminal, or takes `--yes` on the person's word, and refuses off a terminal without it. The Task's audit comment records the consent ("Pools of workers" above).
+
+**Review-mode resolution** is settled in [project-management:DEC-027-review-modes] (mode lookup) and [project-management:DEC-028-agent-as-approver-paths] (agent gate).
+
+#### Workstream lifecycle — `add-workstream` to `remove-workstream` (per [project-management:DEC-018-workstream-taxonomy-and-lifecycle])
+
+`project/workstreams.yaml` is the source of truth, and the substrate that carries the workstream axis follows it. That substrate is the kit's `workstream:<slug>` label, or the board's `Workstream` single-select field where the substrate map binds the workstream to the board.
+
+| Command | What it does |
+|---|---|
+| `add-workstream <slug> [--name N] [--description D] [--status S] [--deprecated-reason R]` | Checks the slug and each attribute. It creates the label, or adds the option `<slug>` to the board's field, then adds the entry. |
+| `edit-workstream <slug> [--name N] [--description D] [--status S] [--deprecated-reason R]` | Checks each value given, then edits the entry. A status flip asks first. |
+| `rename-workstream <old> <new>` | Checks the new slug, and the old and the new label or option, before it changes anything. It renames the label or the option, then the entry. |
+| `merge-workstream --survivor <S> <L>...` | Moves each loser's issues to the survivor, deletes the loser's label or option, and drops the loser from the file. It rewrites the references to each loser. |
+| `split-workstream --source <S> --into <A> --into <B>...` | Asks of each issue of the source which new workstream it moves to, then moves it. |
+| `remove-workstream <slug>` | Refuses while any issue carries the workstream, then asks you to type the slug. |
+
+**Each change is the person's**, since a workstream is the project's own configuration, which DEC-018 gives the PM to change (#2015). At a terminal each command asks before it changes anything, and `--yes` authorises the change. Off a terminal, without `--yes`, it shows the plan, then refuses with exit 1 and names the command to run with `--yes`. `edit-workstream` asks only before a status flip, so its other edits go on as before.
+
+**The checks.** A slug has 2 to 40 characters, matches `^[a-z][a-z0-9-]*[a-z0-9]$` and holds no consecutive hyphens. A name is one line of at most 64 characters. A description or a deprecation reason is one line of at most 200. Each command refuses a value outside these rules before it writes anything.
+
+**Filing.** `create-issue` and `set-field` take only a workstream that `project/workstreams.yaml` holds as active. They refuse any other, a deprecated one included, and name the active ones. An active workstream that `add-workstream` adds is taken at the next filing.
+
+Where the file is absent, the two commands read the legacy `workstreams:` key of `config.yaml`, and check nothing where that key is empty. Where a substrate map binds no workstream axis, or marks it unsupported, `create-issue` writes no workstream and checks none.
+
+**The substrate before the file.** A command that changes a label or the board does so before it writes the file. When that change fails, the file keeps what the change did not finish, and the command exits 3. Running it again finishes the change. Where the board has no single-select `Workstream` field, the command refuses.
+
+**Renaming.** `rename-workstream` refuses where both the old and the new label exist, since the issues would sit under two labels. Consolidate two such labels with `merge-workstream`. Where only the new label exists, there is nothing to rename. The board's options follow the same rule, and a renamed option keeps each card's value.
+
+**References.** Once the file is written, a merge rewrites each typed reference to a loser, `workstream:<loser>` and `[workstream:<loser>]`, by default. It rewrites them in the files git tracks, and in the bodies of issues, pull requests and comments. It asks before each file and each body, and `--yes` confirms every file and body at once. `--skip-references` leaves every reference.
+
+Without an interactive shell, a merge that would rewrite references refuses before any change unless `--yes` is given. A comment by someone else is left, with a warning, unless you hold admin rights on the repository. The `.pkit/` tree, the changelog and the pending changesets are left too, and a bare slug is never rewritten.
+
+**Triage.** `split-workstream` asks of each issue which new workstream it moves to. `--assign <issue>=<slug>` answers for one issue up front, and `--default <slug>` answers for the rest. Without an interactive shell, or with `--yes`, the command takes those answers alone, and refuses before any change while an issue has none.
+
+`--include-github-bodies` opts into rewriting the references to the source, as a merge rewrites them. A reference on a triaged issue takes that issue's answer. Any other reference is asked about, takes `--default`, or is left with a warning.
+
+**Removing.** `remove-workstream` counts the issues that carry the workstream, on the kit's label, your own label or title prefix, or the board's field. It counts with `--skip-label` too, and refuses when it cannot count. `--force` removes the workstream anyway (DEC-046).
+
+#### Read-only diagnostics — `show-issue` / `show-pr`
+
+Both surface the methodology-relevant view of an existing issue / PR. Three output modes:
+
+- **Default** — a terse, human-readable summary with banner and labels.
+- **`--json`** — the full summary structure as machine-readable JSON.
+- **`--field <name>`** — print just one field's value with **no surrounding chrome** (no banner, no label, no heading), so an agent can capture a single value as a *bare* command instead of piping the full view through `grep`/`tail`. Scalars print bare; lists print one item per line; `sections` prints one `present`/`absent` line per required section; `body` prints verbatim from `show-issue`, and from `show-pr` with control characters escaped ("What these commands print" above). An absent field (e.g. a missing milestone) prints nothing and still exits 0.
+
+`--field` and `--json` are mutually exclusive — passing both is a usage error (non-zero exit). An unknown field name fails to stderr listing the valid field set (non-zero exit); the same set is shown in `--help`.
+
+Addressable fields:
+
+- **`show-issue`**: `title`, `type`, `state`, `assignees`, `milestone`, `parent`, `priority`, `workstream`, `labels`, `criteria`, `doc-impact`, `sections`, `body`, `url`. `doc-impact` lists the `## Doc impact` items in the order `check-criterion --section doc-impact` numbers them.
+- **`show-pr`**: `title`, `state`, `draft`, `mergeable`, `base`, `head`, `merged-at`, `cc-type`, `cc-summary`, `closes`, `reviewers`, `review`, `review-history`, `answers`, `doc-impact`, `body`, `url`. It takes the PR's number, or its head branch, and for a branch it reads the branch's open PR first. `mergeable` is GitHub's word on whether the PR merges into its base: `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` while GitHub works it out. The `review` field surfaces the **latest DEC-028 reviewer verdict(s)** — the verdict **token** (`APPROVED`/`CHANGES_REQUESTED`) and the **reasons** (the verdict comment body) — one entry per reviewer (latest-per-reviewer). It shows each reviewer's latest verdict, unfiltered (every round is in `review-history`); `done-work`'s merge gate acts on a *filtered subset* of these (the gate additionally drops stale verdicts and verdicts from non-required reviewers). A verdict the gate will not count is flagged **stale** with the reason (`… (stale — reviewed 1a2b3c4; changed since: README.md; the merge gate will not count it)`), judged by the gate's own rule (see "When a verdict stays fresh" below), so an APPROVED the gate would refuse is not mistaken for gate-agreement; in `--json` each verdict carries that reason as `freshness`. It reads the verdict comments through the same governed `gh` path the rest of the view uses, so it works for the `project-manager` agent whose raw `gh pr view --comments` is denied; a PR with no verdict comment prints `no reviewer verdict posted`. The `review-history` field is the full sequence behind that reduction: **every** verdict each reviewer posted, oldest first — rounds a later verdict superseded included — each with its token, timestamp, the full body, and whether it is the reviewer's **current** verdict (the one `review` shows) or **stale**. It is built on the same verdict recogniser with the same permissive scope as `review`, so it shows exactly the verdicts `review` reduces; in `--json` it is the `review_history` key. Use it to read earlier review rounds on a PR reviewed several times. The `answers` field derives the answers at the PR's head against its base, a line each, and prints what `land-work` tells the person who authorises the merge ([project-management:DEC-065-answers-read-from-check] point 2). It is the route to those lines for anyone not at `land-work`: a person who approves in `human` review mode, or merges through `done-work`, `merge-pr` or the host's button. It changes no branch, fetches the base and any head this clone lacks, and runs only for this field. Answers it cannot derive print why on stderr, print nothing else and exit 2. Away from a checkout at the head, it starts no program the head holds. Where an anchor needs its resolver, the change check refuses, and the view stops there. `land-work` and `review-work` make a temporary checkout there only for a head that passes the test or that a person named ("Which heads may start programs" above). The view makes none, for any head. The view says why, and that a checkout at the head can read the answers. At such a checkout the command is the head's own, and it starts the head's programs. That run is under your account, so make it only on a head you trust.
+
+```
+pkit pm show-issue 318 --field state          # -> in progress's state, e.g. `open`
+pkit pm show-issue 318 --field criteria       # -> one acceptance-criterion per line
+pkit pm show-pr 320 --field cc-type            # -> e.g. `feat(pm)`
+pkit pm show-pr feat/42-add-dispatcher --field mergeable   # -> e.g. `CONFLICTING`
+pkit pm show-pr 320 --field review             # -> latest verdict token + reasons per reviewer
+pkit pm show-pr 320 --field review-history     # -> every verdict per reviewer, oldest first
+pkit pm show-pr 320 --field answers            # -> what land-work tells, derived at the PR's head
+```
+
+#### Lifecycle history — `history` (per [project-management:DEC-049-audit-journal-model])
+
+`pkit pm history <N>` renders issue `#N`'s engine journal — each pkit-governed move with its time, actor, transition and pkit version, for a move the forward cascade made the child's move that caused it, for a close the mode it closed through, and for a bypassed move the justification its gate was overridden with (`bypass: <reason>` — `promote-issue --reason`, `move-issue --bypass-reason`), recorded at every `audit.projection` — and `--check-drift` diffs it against the GitHub timeline's state-label events, flagging each state change the journal has no entry for (exit 3): an out-of-band edit, or a governed move that failed to journal. Both read the journal through the backbone's process engine (`pkit process status --json`), so what they can show depends on the project's journal setting — `process.journal` in `.pkit/project/config.yaml`, off by default (the process README, "The journal — optional audit"):
+
+| Setting | `history` | `--check-drift` | The canonical audit trail |
+|---|---|---|---|
+| Off (default) | "journal logging is not enabled for this project", where the audit trail is instead, and the command that turns logging on — never an empty history | **skipped** with the same reason, exit 0 — never a clean verdict | the tracker: the timeline plus pkit's audit comments (`audit.projection`; at `full` every governed move carries a provenance comment) |
+| `enabled: true`, `committed: false` | the moves governed from this clone | compares the timeline against this clone's moves only, so a move governed from another clone reads as drift — sound for a single-clone workflow | this clone's journal |
+| `enabled: true`, `committed: true` | every governed move, from any clone | compares against the shared record | the committed journal |
+
+Turn logging on with `pkit config set process.journal.enabled true --yes` (add `process.journal.committed true` to commit the journals). The drift check also needs a label to carry `state`; where the board or a derivation carries it, the check is skipped in every mode ([project-management:DEC-051-axis-carriage-activation]).
+
+#### Report-context read verb — `context-workstream` (per pkit ADR-050)
+
+`pkit pm context-workstream` prints the **current workstream** — resolved
+from the current branch (`<type>/<N>-<slug>` → issue #N → its workstream
+label, read through the ADR-026 axis-label read seam: the kit's `workstream:*`
+label, or the adopter's own label where the substrate map remaps the axis) —
+as one bare value on
+stdout, or **nothing** when it cannot be derived (branch not issue-shaped,
+`gh` unavailable, issue unlabelled, board-substrate adopter). Every such miss
+**exits 0**: the caller treats empty output as "omit workstream", so context
+enrichment never becomes a gate. The one refusal is an un-bootstrapped project
+(exit 2, the prerequisite gate every non-exempt pm verb calls): a workstream
+read off assumed kit labels there could be confidently wrong, and the caller
+omits the workstream there too — but, a non-zero exit being a failure rather
+than a miss, it warns, showing the refusal's own hint. This is the pm-provided half of the report
+context seam — the backbone's `pkit report` compose invokes it by subprocess
+through the capability dispatcher (COR-021) rather than reading
+`workstreams.yaml` or issue labels itself, keeping workstream vocabulary
+inside the capability. Read-only and deliberately not membership-gated (a
+passive context accessor over the invoker's own branch).
+
+#### Filing fixes from a report — `create-issue --from-report <N>` (per [project-management:DEC-048-from-report-auto-link])
+
+When a maintainer files fix work for a feedback/change-request report #N
+(pkit PRJ-008), `create-issue --from-report N` closes the forgettable manual
+step: after a successful create, the new issue is auto-linked into #N's
+`## Tracked by` list. The link-back is performed by **invoking the backbone's
+canonical editor** — `pkit report link N <new>` as a subprocess — never by a
+second Tracked-by implementation (DEC-048's one-linker rule), so `--from-report`
+and a manual `report link` can never drift. The batch-plan skill's filing loop
+passes the same flag per filed issue when the plan originated from a report.
+Maintainer-side, same-repo: the backbone verb refuses outside the report-target
+repo and the refusal is surfaced verbatim. A link failure after a successful
+create warns loudly with the exact remediation command (`pkit report link N
+<new>`) and exits 4 — the created issue is never rolled back. It needs a
+backbone that ships `report link`, as every backbone in the range the
+capability's [`package.yaml`](package.yaml) declares under `requires_backbone`
+does.
+
+Configure the review mode in `project/config.yaml`:
+
+```yaml
+review:
+  mode: agent                             # agent (default) | human
+  human_review:
+    reviewer_role: Implementer            # role to auto-assign as reviewer (when mode=human)
+  agents:
+    remote_registered:                    # bot identity for the autonomous path
+      - github_login: claude-bot
+    local_registered:                     # local Claude Code agents the developer invokes
+      - name: pm-reviewer                 # kit-shipped default (this capability's `agents/pm-reviewer.md`)
+    start_after_checks:                   # optional: the checks that start the review, such as all but your test suite
+      - lint                              # see "Landing a pull request in one command", the `ci` step
+```
+
+Both `remote_registered:` and `local_registered:` are optional lists, capped at one entry each at v1 (per DEC-028). Each entry contributes a path to the agent gate's OR composition.
+
+The capability ships a default **`pm-reviewer`** agent for the local path (per COR-026 — discipline-implying agents live in the capability that ships the discipline). It applies the conventions defined by this capability's schemas and DECs (Conventional Commits PR titles, branch/type alignment per DEC-013, classification axes complete per DEC-012, surface-change/migration discipline per COR-010, no-shared-files per COR-001) and emits the [project-management:DEC-028]-format verdict comment that `done-work`'s gate-checker consumes. Adopters who want the default register it as above; adopters with project-specific review needs author their own agent under `.claude/agents/` and register that name instead (subject to v1's singleton-per-path constraint). Note: the kit's universal `critic` agent (per COR-024) is **not** suitable for this slot — its role is adversarial review of *unbaked* proposals, not gating *shipped* PR diffs.
+
+Mode is resolved per-PR by three layers (highest wins):
+
+1. Project default (`review.mode:`).
+2. Per-issue label (`review:human` or `review:agent`).
+3. Per-invocation `review-work --require-human` flag.
+
+`done-work`'s gate evaluates the resolved mode:
+- **human mode** — three-way OR (APPROVED review / `Approved`-prefix comment from non-author / `--bypass`).
+- **agent mode** — DEC-028's gate-checker: at least one configured path (remote-bot OR local-agent) has a fresh APPROVED verdict (see "When a verdict stays fresh" below), plus `--bypass`. The gate counts a verdict only when its comment carries the `<!-- pkit-verdict -->` marker the reviewer path stamps (#593) — a bare `Reviewer agent … APPROVED` line posted by any other path (hand-typed, or a freeform note) does not gate. The read surface (`show-pr --field review`) still displays every verdict-shaped comment, marked or not. Under a reviewer panel (DEC-032's resolved required set), a reviewer's slot is *also* satisfiable by an audited **per-reviewer override** (`--bypass-reviewer`, see below) — a `satisfied-by-override` state distinct from an APPROVED, leaving every other required reviewer gating.
+
+**The gate works out the required reviewers before it judges whether any is required** (#1979). So a reviewer a capability contributes satisfies the gate in a project that registers no remote or local reviewer of its own (DEC-032 D3). Where the required set holds no reviewer, the gate refuses the merge, and never passes. The refusal says whether nothing is registered, or whether your entries under `review.agents.*` name no reviewer, such as a `local_registered:` entry with no `name`.
+
+**An author the gate cannot read stops the approvals that rest on excluding it** (#1485). The gate tells a remote reviewer or a commenter from the PR's author by the author `gh pr view` returns. When that names nobody — no author, no login, a blank login, or `app/` with nothing after it, which is how `gh` writes an author GitHub returns as null — none of them is known to be someone else, so the gate counts none of the approvals author exclusion guards, and says why:
+
+- **A remote reviewer's verdict does not count.** Where a required reviewer is registered only on the remote path, agent mode refuses with a line naming the unread author and that reviewer. It refuses the same way where a per-reviewer override names a reviewer on the remote path, since the override's audit could not record the remote verdict it waives; the whole-gate `--bypass` gets past both. A reviewer registered on both paths can still be satisfied by its local verdict, and a refusal names it as one whose remote verdict did not count.
+- **A local reviewer's verdict counts as before.** DEC-028 checks it with no author exclusion: the developer attests they ran the agent. Where every required reviewer is registered only locally, the gate decides as it does with the author read.
+- **In human mode no `Approved` comment counts**, and the refusal says why. An APPROVED review still counts, since GitHub does not let a PR's author approve it.
+- **`land-work` stops at its findings step** when a remote reviewer's verdict carries a `[person]` finding, before it writes or merges anything; a local reviewer's finding is shown and held as before (see "Landing a pull request in one command").
+
+For the local-agent path, run `pkit project-management review-pr <N>` after `review-work`. `review-pr` invokes every local reviewer the PR requires against the PR diff: each you register under `local_registered:`, and each an installed capability contributes (DEC-032). Each agent posts a `Reviewer agent (local, <name>): APPROVED|CHANGES_REQUESTED` comment. `land-work <N>` runs this review for you once the checks on the PR's head have passed, or those you name to start it (see "Landing a pull request in one command" above).
+
+**A contributed reviewer needs no local reviewer of your own** (#1934). `review-pr` works out the required set before it runs anyone, so it runs a contributed reviewer where `local_registered:` names none, as in a project that registers only a remote reviewer. Where the PR requires no local reviewer at all, it says so, runs nothing and exits 0.
+
+`review-pr` skips a required reviewer whose latest verdict is **fresh** (see "When a verdict stays fresh" below). It decides this the same way `done-work`'s gate reads verdicts, so a skipped reviewer is one the gate counts as it stands: a fresh `APPROVED` satisfies it, and a fresh `CHANGES_REQUESTED` blocks it until you push a change. For each skipped reviewer it prints `[<name>] fresh verdict <APPROVED|CHANGES_REQUESTED> — not re-run`. After a push, the next run invokes exactly the reviewers whose verdicts the push made stale, and says why for each: `[<name>] stale verdict <APPROVED|CHANGES_REQUESTED> (<reason>) — re-run`. Pass `--force` to re-run fresh reviewers too — to have a reviewer re-review a PR it rejected without a further push, or after changing a reviewer agent; `done-work`'s refusal names `review-pr <N> --force` when a fresh `CHANGES_REQUESTED` is what blocks. If the PR's verdicts cannot be read, `review-pr` runs every required reviewer and says so.
+
+
+**How a reviewer runs** ([ADR-066](../../../tech-docs/architecture/decisions/ADR-066-unattended-agent-runner.md) point 10). `review-pr` calls no harness. For each reviewer it asks the backbone's run command, `pkit agents run`, through `scripts/_lib/agent_runs.py`. The backbone starts the runner the project's adapter registers, and the runner starts the harness: for Claude Code, `claude -p --agent <name>`, with `--effort` where one is set ([the Claude Code adapter's README, "The agent runner"](../../adapters/claude-code/README.md#the-agent-runner-run-agentpy)). A reviewer runs as it ran before: in your checkout, under your settings and the project's, in the mode they or the harness choose. It starts in the project's root, whichever folder of the project you run `review-pr` in (#2255). What changes around it:
+
+- **No runner, no review.** Where no registered adapter registers a runner, no reviewer runs. Each reviewer's line says why (`[<name>] invocation refused: …`), and `review-pr` exits 3, as it did when `claude` was not on `PATH`.
+- **Another harness.** A project with another harness answers through its own adapter's runner, not by editing `review-pr`.
+- **A head from elsewhere.** `review-pr` runs the change check from git objects, and each reviewer's brief tells it to start nothing of the head and check it out nowhere, unless a person named the head ("Which heads may start programs" above). That is an instruction to an agent, not a boundary.
+- **The backbone.** The run command is new in the backbone, so project-management needs a backbone that has it. With an older one, each reviewer's line says the backbone is older than project-management needs, and names the upgrade.
+
+**The reviewers run at the same time** (#1594). `review-pr` starts every required reviewer whose verdict is not fresh at once. A run waits for the slowest reviewer, not for all of them in a row:
+
+- **One head.** It reads the PR's head once, before the reviewers start, and shows each of them that head.
+- **The verdicts.** Once the reviews end, it reads the head again. It posts each verdict against the head its reviewer saw, in the order of the required set.
+- **The output.** It prints `reviewing <head>: <names>` as the reviewers start. Each reviewer's lines print together once the reviews end, in the order of the required set.
+- **A failure.** A reviewer that fails or times out does not stop the others. Their verdicts are posted, and the run exits 3, as it does for any failed reviewer.
+- **The cap.** A setting limits how many reviewers run at once: the `--parallel <n>` flag > the `PKIT_REVIEW_PARALLEL` env var > the default, the whole set at once. `1` runs them in turn, in the order of the required set. A non-integer, zero or negative value is a usage error, and an empty variable counts as unset.
+
+Each reviewer's run is capped by a wall-clock **timeout** (seconds). It is a single uniform knob applied to every reviewer — deliberately not a per-agent map (COR-007). Resolution precedence: the `--timeout <seconds>` flag > the `PKIT_REVIEW_AGENT_TIMEOUT` env var > the default **1200**. The default is a *generous ceiling*, not a typical wait: reviewer agent runs are slow and variable (observed 300s to >600s on the same reviewer), so 1200s is meant to be hit only by a genuinely hung agent. (It was raised twice as the ceiling kept getting hit: 300s originally killed heavier reviewers out of the box — e.g. `code-reviewer` needs ~323s — and 600s still timed `code-reviewer` out on a real panel review.) A non-integer, zero, or negative value, or one above 604800 seconds (a week), is a usage error (fail fast) rather than a silent fall-back (an empty or unset `PKIT_REVIEW_AGENT_TIMEOUT` is treated as absent and falls through to the default). When a timeout fires, the runner ends the reviewer's run (what it ends is in [the adapters README, "The agent runner"](../../adapters/README.md#the-agent-runner)), no verdict is posted, and `review-pr` exits 3 — so the DEC-028 approval gate stays unsatisfied for that reviewer until a re-run. Raise it further for an unusually slow reviewer with `pkit project-management review-pr <N> --timeout 1800`, or set `PKIT_REVIEW_AGENT_TIMEOUT` once in your environment.
+
+Each reviewer's run also reasons at one uniform **effort** level (#1046). A headless reviewer would otherwise inherit the operator's own interactive effort from their user settings, which a review pass rarely needs — and the only way to lower it was to lower the operator's own sessions with it. Resolution precedence: the `--effort <level>` flag > the `PKIT_REVIEW_AGENT_EFFORT` env var > `review.agents.effort` in the project config > unset, in which case nothing is passed and the harness default applies. Levels are the harness's own: `low`, `medium`, `high`, `xhigh`, `max`; anything else is a usage error naming its source, never a silent fall-back. Like the timeout, it is one value for every reviewer, not a per-agent map (COR-007) — per-agent model and effort policy belongs to agent front matter and its overlay override (#1047; the agents README, "Model and effort"). The two compose with one precedence: a value this knob resolves **wins** over a reviewer's front-matter or overlay effort — a run-time knob over a declaration, passed as the reviewer session's `--effort`; when the knob resolves nothing, nothing is passed and the reviewer's own effective effort applies (the harness default when that is unset too). Set it once in `review.agents.effort:`; raise it for one run with `pkit project-management review-pr <N> --effort high`.
+
+**A PR's changed files are read whatever its size** (#1188). A contributed reviewer can be required by what a PR's diff touches rather than by how its issue is classified — `software-engineering`'s reviewers whenever a PR changes code, for instance (DEC-032's diff floor). To evaluate that, `review-pr` and `done-work` read the PR's changed files from every page of GitHub's pull-request files API (`gh api --paginate repos/{owner}/{repo}/pulls/<N>/files`), a renamed file counting under its old path as well as its new one — not from `gh pr diff`, which GitHub refuses for a PR changing more than 300 files. The files API lists at most 3000 files; a read that reaches that ceiling, fails, or comes back empty leaves the set unknown, so both refuse rather than drop a reviewer the diff might require (fail closed, DEC-032 D5). The refusal names its cause, and only a failed read is worth a retry: a PR past 3000 files has to be split, or merged with `done-work --bypass "<reason>"`. The reviewers themselves read the diff with `gh pr diff <N>`; for a PR past 300 files, `review-pr`'s brief points each of them at the same diff in the local checkout, `git diff origin/<base>...<head commit>`, and each shipped reviewer's body carries the same fallback for a reviewer started any other way — a reviewer requests changes for a diff it cannot read only when neither source yields it.
+
+#### When a verdict stays fresh (per [project-management:DEC-028-agent-as-approver-paths])
+
+A reviewer's verdict stays valid until you change something that reviewer checks. A clean merge of the base branch, a changeset, or a wording fix after a documentation finding does not cost a round from reviewers it does not concern.
+
+- **Only the latest verdict counts.** Each reviewer's latest verdict is its current one, and only that one is judged. If a reviewer approved, then asked for changes, its approval does not come back when the rejection goes stale — the reviewer needs a new `APPROVED`.
+- **What the marker carries.** `review-pr` reads the PR's head commit and its base branch's head before the reviewers start, names the head in each reviewer's brief, and stamps both into the verdict comment's marker: `<!-- pkit-verdict sha=<full commit id> base=<full commit id> -->`. Before posting, it reads the head again. If you pushed while the reviewers ran, it says so and still posts each verdict against the head its reviewer saw. Your push then counts as a change since, like any later one. It skips the native GitHub reviews, which GitHub would attach to a head the reviewers never saw. The bare `<!-- pkit-verdict -->` marker still counts: a remote reviewer's verdict, a hand-posted one, or one whose head could not be read names no head, and is fresh only when it was posted after the PR's head arrived on GitHub. GitHub's record of pushes to the PR's branch says when that was, never the commit's own dates, which a rebase or an amend keeps. Where that record cannot be read, the verdict is stale, and the reason says why.
+- **What counts as your change.** Every commit after the reviewed head, along the branch's own line of commits. A merge of the base branch counts only for what you did inside it — a resolved conflict, an edit made while merging — so a clean merge counts for nothing. Any other commit counts for its whole diff, including a merge of some other branch.
+- **Which approvals it stales.** An `APPROVED` from a reviewer whose rules are all diff floors — `software-engineering`'s `code-reviewer` and `security-reviewer`, required because the PR touches code — stands while your changes since satisfy none of its floors. The code floor reads your changes through your `review.floors.not_code` list. The ruled-artefact floor asks whether they alter a document an accepted rule binds on, or bring one under a rule (see "Documents the rules govern" below). Every other approval goes stale on any change: your baseline's (`pm-reviewer`), and that of a reviewer with any classification rule — `docs-reviewer` rides the code floor but also every typed issue, and the documentation is its job, so a Markdown fix re-runs it even on an unclassified PR. A Markdown-only fix after a review leaves `code-reviewer` and `security-reviewer` fresh and re-runs `pm-reviewer` and `docs-reviewer`; a code fix re-runs them all.
+- **A rejection goes stale on any change.** A `CHANGES_REQUESTED` is what you are answering, and the fix may well be a changeset or a README, so any change since stales it, from any reviewer. While nothing has changed, it stays fresh: `review-pr` skips the reviewer, and `done-work`'s refusal names `review-pr <N> --force` for a re-review of the PR as it stands.
+- **Retargeting stales the verdict.** A verdict's base must be in the base branch's history. When you retarget a PR — say a stacked PR moved onto `main` after its parent branch was abandoned — its diff over the new base carries commits no reviewer saw, so its verdicts go stale even though you pushed nothing. A base that simply moved forward keeps them. A marker that names no base is not checked.
+- **`review.floors.not_code` does two jobs, for the code floor alone.** It decides who is required (a path it matches pulls in no code-floor reviewer) and whose approval survives a change (a change it matches reaches no code floor). Adding a path to it has both effects. It never narrows the ruled-artefact floor.
+- **When it cannot tell, the verdict is stale.** Your changes and the base's history are read from the local repository, which needs git 2.38 or later. A commit your checkout lacks — the reviewed head or base, the PR's head, the base branch's head — is fetched from origin first. If it still cannot tell, the verdict is stale and the reason says why: a commit that could not be fetched, a shallow checkout (`git fetch --unshallow origin` fixes it), a rebase or force-push that removed the reviewed head from the branch, or an older git. For the ruled-artefact floor, a shallow checkout, a failing `pkit rule-sets altered` or a backbone without it makes the verdict stale too. Missing local state only ever costs a re-review, never an unreviewed merge.
+- **What a rule change re-opens.** A push that changes only rules, such as accepting a rule or widening a set's scope, alters no document, and neither does one that changes only a place's type. Each stales a ruled-artefact reviewer's approval when it brings a document under a rule, since the reviewer has not judged that document under it. A clean merge keeps the approval, whatever rule or place it brings in. So text the reviewer approved may not be judged under a rule the base brings. Run `review-pr <N> --force` to have it judge the PR as it stands.
+- **The merge is pinned.** `done-work` merges only the head its gate checked (`gh pr merge --match-head-commit`); a push between the gate and the merge fails the merge, and you re-run `done-work`.
+- **Where you see it.** `done-work`'s refusal names each stale verdict with the head it reviewed and what changed since (`(stale APPROVED — reviewed 1a2b3c4; changed since: README.md)`); `show-pr --field review` marks it the same way; `review-pr` re-runs only the stale ones and names the reason for each. All three apply one rule: they resolve the PR's required reviewers and build the rule through one shared function (`scripts/_lib/pr_review.py`).
+- **What it does not catch.** A clean merge of the base keeps every verdict, so a semantic conflict the base introduces — changes that merge cleanly but no longer work together — is not re-reviewed. CI on the merged result is the backstop.
+
+#### Opting out of a contributed reviewer (per [project-management:DEC-032-conditional-reviewer-requirements])
+
+An installed capability can contribute a required reviewer to the agent-mode gate — `software-engineering`, for instance, requires `code-reviewer`, `security-reviewer` and `docs-reviewer` on a code-carrying PR. Installing the capability is what turns its contributions on; there is no enable switch. When you want a capability's other content but not one of its gates, opt out of that one contribution in `project/config.yaml`:
+
+```yaml
+review:
+  agents:
+    local_registered:
+      - name: pm-reviewer
+    contributed_opt_out:
+      - capability: software-engineering    # the installed capability contributing it
+        reviewer: docs-reviewer             # the reviewer to stop requiring
+        reason: "Docs are reviewed by the tech-writing team."   # required
+```
+
+- **What it withdraws.** Every rule the named capability contributes for the named reviewer, diff-floor and classification alike. `review-pr` no longer invokes that reviewer and `done-work` no longer requires its APPROVED — no `--bypass` needed. The capability stays installed and its other contributions still apply (here `code-reviewer` and `security-reviewer`). An opted-out reviewer need not be deployed.
+- **What it never withdraws.** A reviewer you register yourself in `local_registered`, and the same reviewer contributed by another capability. The opt-out removes one capability's contribution, not the reviewer.
+- **Where it shows.** `pkit project-management pre-check` lists each opt-out as a `[skip]` line naming the reviewer, the capability and your reason. `review-pr` prints ``opted out: <reviewer> (capability `<capability>`) — <reason>`` under the reviewers it invokes, and a `done-work` refusal names it after the required set.
+- **Validation.** Each entry carries exactly `capability`, `reviewer` and a non-empty `reason`, and names a pair once; the config schema checks this at `pkit validate`. An entry naming a capability that is not installed, or a reviewer that capability does not contribute — a typo, or an entry left behind when you uninstall the capability — is an error: `pre-check` fails on it, and `review-pr` and `done-work` refuse until you fix or remove it, so an opt-out you meant never silently fails to apply.
+- **Yours to keep.** The opt-out lives in your `project/config.yaml`. `pkit sync` never changes that file. `pkit upgrade` changes it only through the migration scripts a new release ships, which run without `pkit project-management migrate`. These scripts keep your opt-outs.
+
+#### Paths that are never code — `review.floors.not_code` (per [project-management:DEC-032-conditional-reviewer-requirements])
+
+A contributed reviewer can ride a diff-property **floor**. `software-engineering`'s code-review panel rides `touches-code`, which requires the panel whenever a PR changes any file that is not documentation. Configuration and schema files (`.yaml`, `.json`, …) count as code. So does a changeset under `.changes/`, because it is a YAML file, and every PR that declares a surface change carries one. Without an exclusion, a wording-only PR with its changeset would draw the whole panel.
+
+`review.floors.not_code` lists paths that never count as code. A changed path it matches satisfies no code floor, so it never pulls in a code-floor reviewer. A change to it after a review reaches no code floor, so such a reviewer's approval stands (see "When a verdict stays fresh" above). The list narrows the code floor alone: a page under `docs/**` you list here still draws the reviewer of the rules that govern it. Every other path the list leaves is judged as before, save an answer file (below). So a PR that changes a `.py` or a schema alongside its changeset still requires the panel. Reviewers that match the closing issue's classification (like `docs-reviewer` on any typed issue) are not affected.
+
+```yaml
+review:
+  floors:
+    not_code:              # gitignore-style patterns, relative to the repository root
+      - ".changes/**"      # the default when the key is absent
+      - "docs/examples/**" # add your own; the list replaces the default
+```
+
+- **Default.** When the key is absent or has no value, the list is `[".changes/**"]`. If you set the key, your list replaces the default, so keep `.changes/**` in it if you still want changesets excluded. An empty list (`not_code: []`) excludes nothing.
+- **Matching.** Patterns are gitignore-style, the same matching `code_path_to_doc_mapping` uses, and are read against each changed path from the repository root.
+- **Answer files are never code.** A path in the folder where the backbone keeps a change's answers to friction satisfies no code floor either, whether or not your list names it ([project-management:DEC-032-conditional-reviewer-requirements] D1). So a change that only answers draws no code review, and a push that only answers leaves a code-floor reviewer's approval standing. The folder is the backbone's to give. `review-pr`, `done-work` and `show-pr` read it from `pkit friction check --all --json` (`answers.folder`), only where the paths your list leaves touch code. Where the backbone gives no folder, every path is judged as before.
+- **The commands agree.** `review-pr`, `done-work` and `show-pr` read the list from the same config through one resolver, so the reviewers `review-pr` invokes are the ones the gate requires, and `show-pr` judges a verdict's freshness as the gate does.
+- **Validation.** The value must be a list of non-empty strings; the config schema checks this at `pkit validate`. If the value is malformed, `review-pr` and `done-work` refuse and name the problem rather than guess which paths you meant.
+
+#### Documents the rules govern — the `touches-ruled-artefact` floor (per [project-management:DEC-032-conditional-reviewer-requirements])
+
+A capability can contribute a reviewer on a second floor, `touches-ruled-artefact`. It requires that reviewer when a PR alters a document an accepted rule binds on, or brings a document under an accepted rule: a page, an analysis artefact, any artefact your rule sets reach. The closing issue's classification does not matter.
+
+```yaml
+# a capability's review-contributions.yaml
+contributions:
+  - floor: touches-ruled-artefact
+    reviewer: rule-set-reviewer
+```
+
+- **When it fires.** The PR adds a ruled document, removes one, or changes its content. A rule binds on it at the base or at the head. It fires too when the PR brings a document under a rule without changing it (below). The backbone answers these questions, through `pkit rule-sets altered`.
+- **A change to the declared places fires it too.** A new place, or a wider one, in the backbone configuration or a component's package metadata brings documents in. The backbone counts each as added, so the PR answers for the ruled documents it brings in, though it touches none of their files. Narrowing a place, or taking one away, removes them, and fires it the same way.
+- **A change that brings documents under a rule fires it too.** Widening a set's scope, accepting a rule, raising a pin behind its set, or typing a place can make a rule bind on documents the PR does not edit. A move into a set's paths can too. The backbone lists each such document apart from the altered ones, and the PR answers for it: the reviewer judges the whole document under the rule it comes under (COR-057). A file the widened scope leaves out with `exclude` is not brought under it, so you can widen a scope a folder at a time.
+- **What does not fire it.**
+  - A change that only writes a revalidation, since the friction block is not content.
+  - A move that keeps the content, where the backbone pairs the old and new file, and no new rule reaches the new path.
+  - A change that only takes documents out from under a rule, such as narrowing a set's scope or retiring a rule.
+  - A document no accepted rule binds on: one outside every scope, under rules still proposed, or reached only through a pin behind its set.
+- **What it costs.** pm asks the backbone for every PR it resolves while a contribution you have not opted out of names the floor. No changed path tells it the answer is empty, since a change to the places alters documents whose files it does not touch, and a change to the rules brings such documents under a rule.
+- **Your not-code list does not narrow it.** Listing `docs/**` as not code keeps your pages out of code review, not out of rules review.
+- **What it needs locally.** `review-pr`, `done-work`, `show-pr` and `land-work` read the PR's base and head commits. A commit your checkout lacks is fetched from origin by its object name. A shallow checkout, a failing command, or a backbone without `pkit rule-sets altered` or too old to list the documents a change brings under a rule, refuses with the reason. `git fetch --unshallow origin`, or an upgrade of pkit, fixes those. A base whose configuration cannot be read blocks the PR that repairs it: merge that one with `done-work --bypass "<reason>"`, or opt out of the contribution meanwhile.
+- **Freshness.** The reviewer's approval stands after a later push that alters no ruled document and brings none under a rule, such as a code fix or a revalidation. A push that edits a ruled document, brings one into the declared places, or brings one under a rule, stales it. A clean merge of the base keeps it, whatever the merge brings: an edit, a rule or a place. pm asks the backbone what your commits since the review altered, a run of them at a time between merges of the base. So an edit you undo within a run is no change, and an edit a later commit of the run brings under a rule counts. It asks about a merge of the base only when you changed something inside it, and then about all that merge altered, the base's changes included. A document counts when a rule binds on it at the start or the end of the run that alters it, or when the run brings it under a rule. A stale approval's reason names the ruled documents altered or brought under a rule, which may lie outside the files you changed. See "When a verdict stays fresh" above.
+- **A floor this pm does not know.** A contribution can name a floor a newer pm defines. This pm then requires its reviewer on every PR rather than refusing every PR. `pre-check` warns about each such floor, so a misspelt one is seen.
+- **A reviewer that core ships.** A capability may contribute a reviewer that core ships, rather than one of its own, such as the core `rule-set-reviewer` with the one rule above (COR-057). Where several capabilities contribute it, it is required once. Your opt-out withdraws one capability's contribution, so list each of them to stop requiring it ("Opting out of a contributed reviewer" above). If its agent file is missing, the refusal tells you to run `pkit sync`.
+- **Its contributors' dependency on pm.** A contributor declares project-management in `requires_capabilities`, as a required dependency, or as an optional one where it works without project-management (COR-030). Either way, install and upgrade hold an installed project-management to its range, which starts at a release that knows the floors it names.
+
+#### Freeform comments — `comment-issue` / `comment-pr` (per [project-management:DEC-047-freeform-comment-verb])
+
+The `project-manager` agent is denied direct `gh` writes, so it posts a **freeform** comment — evidence, analysis, a triage rationale — through a validated verb rather than raw `gh`. (The *structured* comments the methodology emits — audit notes, DEC-028 verdicts, filing provenance — stay side-effects of their own verbs.)
+
+| Command | What it does |
+|---|---|
+| `comment-issue <n> --body "…"` | Post a freeform comment on an issue. |
+| `comment-pr <n> --body "…"` | Post a freeform comment on a PR. |
+
+Both run the membership gate (DEC-021) and the foreign-repo session interlock (COR-039), print the context header, and honour `--dry-run` / `--yes` — the same guards as every mutating verb. A comment **mutates no lifecycle state**, so it carries **no** validation-severity gate; the only failure is an empty body. The verb refuses a body that would be mistaken for a **structured** comment — a first line matching the DEC-028 reviewer-verdict grammar or the DEC-014 audit-comment template — so a freeform note can never be mis-parsed by `done-work`'s gate-checker (see DEC-047).
+
+**Each comment names the clone that posts it.** Every clone posts under the same account, so GitHub's author line does not tell a planner's comment from a worker's or the person's own. Both verbs end the comment with a line that names the seat and instance of the clone that runs them, such as `🪑 Posted by seat planner, instance 1`. The person's words stay as they are, above the line.
+
+- **A clone that holds no seat** says so: `🪑 Posted by a clone that holds no seat`. In a project with no topology, a clone with a typed instance id names it: `instance 2, which holds no seat`
+- **A hidden stamp** carries the same for tooling, and the clone's key: `<!-- pkit:posted-by v=1 instance=1 seat=planner seat_number=1 clone=<key> -->`. Its fields are named as a claim's are (DEC-059 point 9), and a stamp of a clone with no seat names no seat
+- **The seat is confirmed first.** A clone that took a seat confirms it on the seat's state issue before it posts (DEC-059 point 6). Every command that acts as an instance does the same. Where the seat cannot be confirmed, the verb refuses with exit 1 and posts nothing
+
+`scripts/_lib/comment.py` builds the line and the stamp, and reads the stamp back.
+
+#### The checkbox close-gate on the merge path (per [project-management:DEC-007-checkbox-validation]; #734)
+
+Checkboxes are lifecycle-gating: an issue with an unticked `- [ ]` cannot reach Done. On the **PR-merge** closure path that check has to run **before the squash-merge is authorised**, because GitHub's `Closes #N` auto-closes the issue *on* merge — a check afterwards could only report a gate it had already let through. So `done-work` runs it as a **pre-flight**: it reads the body of every issue the PR closes, and on any unticked box refuses (exit 1) at the first issue that fails, naming it and listing each unticked line before naming the remedy (an issue already closed is skipped; see "A PR that closes several issues is closed issue by issue" above). An issue with **no checkboxes at all** is unaffected (the rule applies only when boxes exist); a body that could not be read — an issue's, or the PR's that names them — **fails closed**, since an unverifiable gate is not a satisfied one and the merge it guards is irreversible.
+
+**Every box counts, and each has a verb.** The gate counts the boxes of every section, `## Doc impact` included, so a Task whose Doc impact section uses the checkbox shape needs those ticked too. Tick them with `check-criterion <N> --section doc-impact <index>` — the same index and guard grammar as the criteria (see the batch primitives above) — rather than rewriting the body. `done-work`'s refusal prints, under each unticked box, the command that ticks it: `check-criterion <N> <index>` for a criterion, `check-criterion <N> --section doc-impact <index>` for a Doc impact box, and a body edit (`edit-issue <N> --body-file`) for a box in any other section, which no narrow verb addresses.
+
+`--skip-checkbox-gate` overrides it — **discouraged**, and deliberately the same flag name and semantics `close-issue` carries on a won't-do close and a close through `--pr`, so those closure paths behave alike. A container's close and a completed close take no override. (Whether `done-work` and `close-issue` should instead take an audited `--bypass "<reason>"` is an open question, not settled by #734.)
+
+This is a pre-flight rather than a declared `gate:` on the `review → done` transition because the substrate's `gate:` is single-valued and that slot holds `gate-pr-merged` (the cross-authority authorisation artifact). The **rule** is nonetheless shared: `_lib/checkbox_gate.py` is its one implementation, read by `close-issue`, `done-work`, `merge-pr`, and the engine's `gate-checkboxes-ticked` predicate alike, so the merge path and the won't-do path cannot drift on what counts as an unticked box. The same single-definition discipline covers the audit line: `_lib/audit.py` holds the one canonical renderer (template, `<!-- pkit-audit -->` marker, projection knob) that `move-issue` and `done-work` both read, so a new audited mutation appends its own prose below that line rather than forking the format. Structural-type inference joins that list: `_lib/structural_type.py` is the one reader of the title-prefix vocabularies (adopter prefixes under a substrate map, the kit's own structural prefixes, `classification.yaml`'s kind prefixes, and the `type:*` label fallback), so `show-issue`, `show-tree`, `move-issue`, and the rest cannot disagree about what an issue *is* — which they did, across seven divergent copies, until #793.
+
+#### The CI-status gate (in front of the merge)
+
+The approval gate answers *did a reviewer approve?* — not *did CI pass?* A reviewer's APPROVED verdict is not evidence the PR's checks are green (the #498 hole: PR #496 merged with a red check on an APPROVED PR). So **both** merge paths — `done-work` and the lower-level `merge-pr` — run a **CI-status gate in front of the merge**, mirroring the release-merge gate (#475): they fetch the PR's `statusCheckRollup` and **refuse to merge when any check is failing or still pending**, naming the offending checks. An empty rollup passes only where the PR's base branch requires no check (below). This is additive — the reviewer-verdict and checkbox close-gates are unchanged; the CI gate sits ahead of them at the merge itself.
+
+A rollup either merge path cannot read is no answer, never an answer of no checks (#1946, #1952). That is a call to GitHub that fails, an answer that is not JSON, or one whose `statusCheckRollup` is missing or null. Each path then refuses the merge with exit 2, `done-work` as unreadable, naming the cause and writing nothing. `--bypass-ci` does not clear the refusal, since that flag overrides checks that were read and named.
+
+An empty rollup is what GitHub answers in a project that runs no checks, and also for a head just pushed, before its checks start (#1965). So, given an empty rollup, each merge path reads the checks the PR's base branch requires, by its branch protection and its rulesets. Where the base requires none, the rollup passes, and the run prints `ci-status: green (no check reported, and <base> requires none)`. A project that runs checks, but requires none on its base, gets the same pass for a head whose checks have not reported yet.
+
+Where the base requires checks, the gate refuses an empty rollup as it refuses a pending check. It names each required check as `EXPECTED`, GitHub's word for a required check not yet reported. Where the required checks cannot be read, it refuses the same way and names why, since it cannot tell that the base requires none. Both paths exit 1 and write nothing, and `--bypass-ci` overrides the refusal with its audit comment, as for any pending check.
+
+A failing check is **bypassable-with-audit** (`schemas/validation-severity.yaml`), but only through a **dedicated `--bypass-ci "<reason>"`** flag — distinct from any general `--bypass` — so overriding another gate never silently lands a red CI (the #498 footgun). Pass `--bypass-ci "<reason>"` to override the CI gate deliberately — e.g. an advisory changeset guard failing on a decision-only PR. It posts the schema's audit-comment (`Bypassed by <name> <<email>>: <reason>`, naming the overridden checks) to the PR **before** merging, so the trail survives even if the merge later fails; it is posted at most once per bypass (see the audit-comment idempotence notes above). A non-green check with **no** `--bypass-ci` is a hard refuse — and the general `--bypass` (approval gate) does **not** clear it. On `done-work` the two overrides are independent deliberate acts: `--bypass` clears the approval gate, `--bypass-ci` clears the CI gate, and a merge blocked on both needs **both** flags. Both merge paths (`done-work`, `merge-pr`) take `--bypass-ci` as the CI override — except where the base merges through a merge queue, where both refuse it: the queue runs the checks the base requires and merges only once they pass, so a PR held by a red one would wait in it indefinitely while the audit comment said the check was bypassed ([project-management:DEC-026-work-ownership-lifecycle]).
+
+The current gate treats **any** non-green check as bypass-required — it does not yet distinguish GitHub-required from advisory checks (that distinction is not exposed cleanly in `statusCheckRollup`). When required-vs-advisory becomes distinguishable, the intended refinement is: block a required check outright, allow an advisory check only via `--bypass`.
+
+#### Per-reviewer override — `--bypass-reviewer` (agent mode, per [project-management:DEC-050-per-reviewer-override])
+
+Under a reviewer **panel** (a resolved required set with more than one reviewer, per [project-management:DEC-032-conditional-reviewer-requirements]), the whole-gate `--bypass` is a blunt instrument: one over-eager reviewer blocking the merge forces you to discard *all* review to land. `done-work --bypass-reviewer <name> --bypass-reviewer-reason "<reason>"` is the surgical alternative — it satisfies **one** named required reviewer's slot as a first-class **`satisfied-by-override`** state (distinct from a real APPROVED), while **every other required reviewer still gates**. Repeat the flag to waive several named reviewers; the single `--bypass-reviewer-reason` applies to all of them. (The reason flag is suffixed with its own flag's name because `done-work` carries four bypass-family flags; on `move-issue` the bare `--bypass-reason` is the reason for the *whole-gate* `--bypass`, which `promote-issue` passes from its own `--reason`. **`done-work` still accepts the bare `--bypass-reason` as a deprecated alias**, because that spelling shipped in project-management 0.54.0 and renaming a released flag outright would be a breaking CLI signature change owing a migration (COR-010). It writes the same destination — one code path, not a second implementation — warns when used, refuses if both spellings are supplied in one invocation, and is **scheduled for removal at the next major**. Prefer `--bypass-reviewer-reason` in anything new.)
+
+How it differs from the whole-gate `--bypass`:
+
+| | `--bypass "<reason>"` | `--bypass-reviewer <name> --bypass-reviewer-reason "<reason>"` |
+|---|---|---|
+| Scope | Discards the **entire** approval gate | Satisfies **one** named reviewer's slot; the rest still gate |
+| Mode | Any mode | **Agent mode** only (human mode has no named reviewer set — refused) |
+| Target | The gate as a whole | A reviewer in the **freshly-resolved required set** (an unknown name is a hard error naming the set) |
+| Audit | One "Approved by bypass" comment on the issue | One **prose, verdict-distinct** comment **per overridden reviewer** on the PR — who / which / why + the reviewer's **state at override time** (`none` / a fresh `CHANGES_REQUESTED` / a stale `APPROVED`) and a link to the block comment when one exists |
+
+Key properties:
+
+- **Ephemeral, merge-time.** The override is evaluated once, at this invocation, against the currently-resolved set and current HEAD — exactly like `--bypass`. It is **not** persisted: a later `done-work` run without the flag re-resolves and re-gates. A new commit / reclassification / diff change simply re-resolves; re-supply the override if still intended.
+- **Not a synthetic verdict.** `satisfied-by-override` is a **separate gate-checker input**, never a fabricated APPROVED — so it never corrupts the DEC-028 verdict record or the `show-pr --field review` / ADR-042 read surface. The audit comment is deliberately **not** verdict-shaped (no `Reviewer agent:` first line, no `<!-- pkit-verdict -->` marker), so the gate's verdict reader never mistakes it for a verdict.
+- **Not combinable with the whole-gate `--bypass`.** Supplying both is **refused**: `--bypass` discards the entire gate, which already subsumes waiving one slot. (Validating the reviewer names under `--bypass` would mean resolving the very set `--bypass` exists to escape, so refusing is what keeps the whole-gate escape unconditional — and it cannot leave a typo'd name silently accepted.)
+- **Idempotent per reviewer + reason + HEAD.** The audit stamp is keyed by the reviewer, the reason *and* the HEAD the override was evaluated against: re-running the identical override on an unchanged HEAD is a no-op, while a different reviewer, a different reason, or **new commits** each post their own audit against the freshly-computed state. (New commits must re-audit: the override is scoped to the current HEAD, so a record made against a superseded one could deny the block it waived.)
+- **Every surface reports the same thing.** The gate resolves each required reviewer's standing once, and the `passed_via` label, the refusal listing and the audit comment all read that one record. So a reviewer with a genuine fresh APPROVED that is *also* named in `--bypass-reviewer` reads **APPROVED (override redundant)** everywhere — you are never told review was waived when it was not. The audit comment likewise states what the override actually did: redundant, one-of-several with the others named, or (on an all-slots override) that no reviewer gated at all.
+- **Canonical audit format.** The comment renders [project-management:DEC-049-audit-journal-model]'s single `audit_comment_template` behind the uniform `<!-- pkit-audit -->` marker, with the per-reviewer detail as additive prose below it. It is posted irrespective of `audit.projection`: that knob governs how much of the *engine journal* is projected onto GitHub, and the journal records moves, not this override. A bypassed *transition* carries its justification on its move's entry (`bypass: <reason>`); `--bypass-reviewer` overrides one slot of the merge's approval gate, which is not a transition, and the move to Done that follows the merge is journaled with the pull-request-merge reason (`pr-merge close: …`). So this comment is the record, not a projection of one.
+- **All-slots nudge.** Overriding *every* slot equals a whole-gate bypass by other means. It is allowed (it is audited), but the command **warns** and steers you to `--bypass` (one honest audit rather than N per-reviewer bypasses).
+- **Unresolvable set.** When the required set cannot be resolved at all (a broken contribution / an undeployed contributed agent), a per-reviewer override cannot help — it operates *within* a resolved set. The refusal points you at the whole-gate `--bypass`.
+
+It is a member of the `--bypass` family (audited, reason-required), not a new override verb — a *parameterised, repeatable* target, per [project-management:DEC-046-override-flag-convention] point 1.
+
+#### Override flags — `--bypass[-<gate>]` vs `--force` (per [project-management:DEC-046-override-flag-convention])
+
+Two override families run across the mutating commands, and which a command exposes is fixed by the stop it overrides — one question: **is it a `bypassable-with-audit` gate?**
+
+- **`--bypass[-<gate>]`** overrides a gate the severity model *designed* to be bypassable ([project-management:DEC-014-validation-severity-model]'s `bypassable-with-audit`): a **required reason**, and the DEC-014 audit comment posted *before* the mutation. A command with one bypassable gate spells it `--bypass` (`start-work`, for the clash guard); a command with several qualifies each — `done-work` carries `--bypass` (approval), `--bypass-ci` (CI) **and** `--bypass-owner` (the clash guard), `move-issue` carries `--bypass` (its move) and `--bypass-owner`, `promote-issue` carries `--reason` (its move's gate) and `--bypass-owner`, and `merge-pr` carries `--bypass-ci`. `edit-issue` and `review-work` carry `--bypass-owner` (the clash guard) for the same reason: the validation stop of each is a second gate, since that stop refuses a finding declared `bypassable-with-audit` as it refuses a `hard-reject` one, and `--force`, not a `--bypass`, writes past the stop (next bullet). `--bypass` never clears a red CI, and vice-versa. A **parameterised, repeatable** family member also lives on `done-work`: `--bypass-reviewer <name> --bypass-reviewer-reason "<r>"` overrides *one* reviewer's slot on the agent-mode approval gate (see the per-reviewer override section above), per DEC-046 point 1 and [project-management:DEC-050-per-reviewer-override].
+- **`--force`** overrides a **`hard-reject` finding** *or* a **hard script precondition** — a stop the methodology treats as firm. Boolean, no reason. Sites: `edit-issue` / `edit-pr` (body-validation findings, and on `edit-issue` a finding declared `bypassable-with-audit` too, though no rule `edit-issue` checks is declared at that severity today), `open-pr` / `review-work` (validate-at-ready, a finding declared `bypassable-with-audit` among them, though no rule they check is declared at that severity today), `close-milestone` (open-children), `remove-workstream` (non-zero-issues), `review-pr` (the fresh-verdict skip; a forced re-run leaves its record as the new verdict comment), `done-work` / `merge-pr` (enqueue a head the merge queue dropped; GitHub's timeline records who enqueued it). It audits **where the substrate can carry it** — an issue/PR comment, a milestone description-append; a bare label (`remove-workstream`) has no annotation surface, so the override shows in output only. `open-pr` posts its audit note on the PR (mirrors `edit-issue --force`). `review-work` posts one audit comment on the PR for a run that overrides a refusal, from `audit_comment_template`. It names who gave the override and each refusal passed, a change check that could not run at the PR's head among them. What it quotes from the head is escaped, so a path or a description's words can do nothing there or in a terminal. The comment lands before the PR is made ready, reviewers are requested or the issue moves. On a PR the run opens, it follows the opening. A retry of the same override at the same head posts no second one. Where the comment cannot be posted, the run stops at exit 3. At `audit.projection: off` it posts none, and the override shows in output only.
+- **Hard-reject is force-overridable.** DEC-014's `hard-reject` keeps `bypassable: false` (no in-band `--bypass`) but carries an out-of-band operator `--force` layer — recorded as `force_overridable: true` on its schema entry. `--force` is *not* the `--bypass` mechanism; it is a blunter, last-resort override.
+- **Known exception:** `--skip-checkbox-gate` (on `close-issue` and, since #734, on `done-work`) predates this convention and fits neither family — a plain reasonless skip of a `hard-reject` gate. It is documented as discouraged, and both closure paths spell it identically so they cannot diverge. Whether it should become an audited `--bypass "<reason>"` is an open question (#734's deferred follow-up), not a settled shape.
+- **No flag starts a head's programs.** The stop on a head from elsewhere has no flag in either family ("Which heads may start programs" above).
+- **Out of scope:** `merge-pr --admin` is a `gh pr merge --admin` branch-protection passthrough, not a methodology override. Neither it nor `done-work --admin` goes around a merge queue: both are refused where the base merges through one.
+- **New commands** pick the flag by the same question; a second bypassable gate takes a `--bypass-<gate>` name.
+
+#### Exit 4 — accepted, a re-run completes it
+
+A verb exits **4** when the act it exists for was accepted and stands — it is never rolled back — but what follows it has not run yet, and running again what its output names completes it, repeating nothing already done. `done-work` and `merge-pr` exit 4 while a merge queue holds the PR, and when gh accepted a merge that GitHub could not then be read to confirm, or a merge or an enqueue got no answer and whether it was made is not known — GitHub could not be read since, or, with no answer from the backbone at all, one reading found the PR neither merged nor queued: the output says which, names the reading that tells (`pkit pull-request read <PR>`), and never calls an unconfirmed merge queued or not made: the same verb run again once the PR has merged runs what follows the merge (`merge-pr` from the same clone, whose record says the steps are owed), and on a PR that did not merge it merges it, on the same authorisation. `land-work` passes `done-work`'s 4 through, its last line saying `queued` or `unconfirmed`, and `land-work` run again completes it. `create-issue --from-report` exits 4 when the issue was created but its link into the report failed: `pkit report link` completes it. Exit 0 always means the whole act is done, so a caller never mistakes an accepted act for a finished one.
+
+#### Corpus back-fill — seeding (and repairing) a value across every issue (per [project-management:DEC-037-adoption-ceremony] §2)
+
+`back-fill` is the auditable **propose-and-cite** ceremony for a one-time bulk transform over your existing issues. It **enumerates** the proposed per-issue change, **cites** why each is proposed, and **presents the report as the gate** — nothing is written until you apply. Applying re-reads each issue immediately before writing (a value that drifted since the report is skipped, not overwritten), and is idempotent by value-equality, so a re-run after an interrupted apply completes only the rest.
+
+```
+pkit pm back-fill                     # the report — mutates nothing; this IS the gate
+pkit pm back-fill --json              # the same plan, machine-readable
+pkit pm back-fill --apply             # drive the reviewed plan (confirmation-gated; --yes for CI)
+pkit pm back-fill --emit-script       # draft-not-apply: a script you run yourself; pm writes nothing
+```
+
+**Change kinds, and where each one's intent is declared.** The declaration point differs by substrate, because the substrate-map cannot carry a board field-id or a milestone title (DEC-037 §3):
+
+| Kind | Writes | Declared in |
+|---|---|---|
+| `set-board-field` | a Projects v2 single-select / text **field value** | a `set-board-field` hook on `after_create_issue` in `project/hooks.yaml` |
+| `assign-milestone` | the issue's **milestone** | an `assign-milestone` hook on the same event |
+| `set-axis-label` | a classification axis's **label** | a per-axis `default:` on a **label-carried** axis in `project/substrate-map.yaml` |
+
+Each kind applies corpus-wide exactly what its declaration already seeds on a newly-filed issue — so declaring a go-forward default also enrols the historical corpus, which the report states in its header.
+
+**`set-axis-label` is the corpus-repair path.** It exists for the damage described in [project-management:DEC-051-axis-carriage-activation]: if you have a Projects v2 board configured *and* your map binds `priority` (or `workstream`) to your own labels, issues filed during the affected window got the value written to **neither** substrate. Four things about it are worth knowing before you run it:
+
+- **It writes *your* label, not ours.** The value resolves through the write seam under your `remap` — your `P0`, never the kit's `priority:High`. If your declared `default:` has no `remap` entry, the intent is reported **UNRESOLVABLE** and *nothing is written for that axis*: the kit will not substitute a label you do not manage. Add the `remap` entry and re-run.
+- **It fills gaps; it never overwrites.** An issue that already carries a value on the axis is not proposed at all — whether that value is the target or a different one somebody chose. A small proposed set means few gaps, not an arbitrary subset. This is also where its idempotency comes from: re-run it over a repaired corpus and it plans nothing.
+- **It only applies to a label-carried axis.** Which substrate carries an axis is resolved once, centrally: an axis bound `board: true` is `set-board-field`'s job, and a `title-prefix` / `derive` / unsupported axis has no label to write. `state` is excluded outright — it is derived from your tracker's own lifecycle, so seeding it would contradict the substrate rather than repair it.
+- **It needs a value to write, from one of two places.** The lost per-issue values are not recoverable, so a corpus repair can only write one declared value across the affected issues. Either supply it for the run — `pkit pm back-fill --set priority=High`, repeatable per axis — or declare it in the map as the axis's `default:`, which is also what new issues get seeded with. The `--set` value is the methodology value (`High`), not your substrate's label (`P1`): it resolves through your remap exactly as a declared default does, so the kit never writes a label you do not manage. An axis named with `--set` is never silently skipped — an unknown axis, a value your remap has no entry for, or an axis a board rather than a label carries is refused by name and the run exits non-zero; on `--apply` or `--emit-script` the whole run is refused before the confirmation prompt, so nothing is written until every `--set` value can be applied.
+
+  To declare it in the map instead:
+
+```yaml
+schema_version: 1
+axes:
+  priority:
+    label:
+      remap: { High: P0, Medium: P1, Low: P2 }
+    default: Medium        # ← what back-fill seeds onto issues with no priority
+```
+
+**Note on `--emit-script`.** The emitted script re-checks each value before writing, and **every guard fails closed**: a re-read that does not positively confirm the current value never writes against it. What follows the failure differs by substrate, deliberately:
+
+- **board field** — the run **stops** with an error naming the issue and the field. A board that will not answer is a broken tool, not an unset field; fix the cause (a rate limit, a network drop, a token without the `project` scope) and re-run the script, which is idempotent and completes only what is left. A board that *answers* "no value" is a genuine missing value and is still written.
+- **milestone and label** — that one write is skipped and reported, and the run continues, matching `--apply`'s audited skip. A project with no board never emits a board read at all, so a milestone-only back-fill has no way to reach the error above.
+
+`--apply` remains the stronger path either way: it also re-validates each write against the value the plan enumerated, which a standalone script cannot do.
+
+### 5. (Optional) Declare lifecycle hooks
+
+Per [project-management:DEC-024-lifecycle-hooks], adopters can declare **post-action steps** the engine fires after each pm lifecycle event — set a board field after `create-issue`, post a templated comment after `close-issue`, assign a default milestone, or run a custom script. Hooks live in `project/hooks.yaml`:
+
+```yaml
+schema_version: 1
+hooks:
+  after_create_issue:
+    - kind: set-board-field
+      field_id: PVTSSF_lAHO...
+      single_select_option_id: f78a3c2e
+  after_close_issue:
+    - kind: post-comment
+      template_path: project/hook-templates/close-thanks.md
+```
+
+**Lifecycle events at v1**: `after_create_issue`, `after_close_issue`, `after_open_pr`, `after_merge_pr`, `after_move_issue`. Each event's value is an ordered list; hooks fire serially in declared order after the primary operation succeeds.
+
+**Hook kinds at v1**:
+
+- **`set-board-field`** — set a Projects v2 single-select or text field on the just-created/moved item.
+- **`post-comment`** — post a comment from a template file under `project/hook-templates/`. The template renders `{{ issue.number }}`, `{{ issue.title }}`, `{{ repo }}` placeholders. It posts **one comment per firing**. The comment opens with a `<!-- pkit-hook: <stamp>:<firing> -->` line, where `<firing>` is a digest of the hook's stamp, the event, the issue or PR it fired on, and, for an event an issue can go through more than once, which occurrence it is. On `after_move_issue` that is the transition's from and to states and the issue's count of landed moves — the count the transition audit key uses: the journal's length where the project keeps a journal, its state-label events on the GitHub timeline where it does not. On `after_close_issue` it is the time GitHub reports the issue closed. A retry of the same firing finds that comment and posts nothing: `close-issue --mode=pr-merge` run again on the same close reads the same close time. A different event, issue, PR, transition or occurrence posts its own, so a transition an issue makes a second time (in-progress → review, closed, reopened, then in-progress → review again) and a second close after a reopen each post a comment. Where the occurrence cannot be read — the engine, the timeline or the close time unreadable, or, without a journal, no label carrying the state — the firing is told by the other parts alone, and a repeat of it posts nothing new. Only a comment written by the account `gh` posts as, and not edited since, holds a post back. The same line in anyone else's comment does not, and neither does an edited comment or one whose author cannot be read. Comments that cannot be read hold nothing back: the hook posts, and a `[warn] #<index> post-comment:` line says it could not check. The comments are read once per run, and only when a `post-comment` hook is about to post, however many fire. The occurrence costs no read where the project keeps a journal, or for an issue already closed when `close-issue` starts; otherwise it costs one — the timeline, or the close time of an issue the run closed itself. Comments from earlier versions open with a bare `<!-- pkit-hook: <stamp> -->`, which names no firing, so a hook can post once more on an issue or PR that already has one.
+- **`assign-milestone`** — set the issue's milestone by title. Idempotent.
+- **`custom-script`** — escape hatch. Runs an adopter-supplied script at the declared path with a fixed env-var envelope: `PKIT_HOOK_EVENT`, `PKIT_ISSUE_NUMBER` (or `PKIT_PR_NUMBER`), `PKIT_REPO`, `PKIT_HOOK_REPLAY`, `PKIT_DRY_RUN`. Idempotency is the script's responsibility — short-circuit when `PKIT_HOOK_REPLAY=true`.
+
+**Failure semantics**: report-and-continue. A hook failure does **not** propagate to the primary script's exit code — the primary operation already succeeded on GitHub; deleting the issue because a follow-up comment failed produces worse partial states. Hook failures are reported to stderr with `[failed] #<index> <kind>: <error>` lines; the script exits 0.
+
+**Distinction from GitHub Actions**: hooks fire **synchronously** within the CLI invocation, atomic with the primary command. GitHub Actions react asynchronously to GitHub-side events. Use a hook for "after I file this, the board's Workstream field should be set"; use an Action for "every external-contributor PR gets labeled."
+
+The file is optional — absence means zero declared hooks. The schema for each kind lives at `.pkit/capabilities/project-management/schemas/hook-kinds/<kind>.schema.json`; pre-check validates the file's shape and per-kind required fields.
+
+### 6. (Optional) Enable project-manager as the default Claude Code agent
+
+Per [project-management:DEC-030-capability-contributed-adapter-overlays], this capability ships an opt-in **adapter overlay** that makes the `project-manager` agent the default for `claude` sessions in the adopter project. Off by default — installation alone has no effect on `.claude/settings.json`. Adopters who want PM-as-default flip it on:
+
+```
+pkit project-management enable-default-agent
+```
+
+This copies the capability's overlay template (`adapters/claude-code/overlay.template.json`) to the adopter-owned activation file (`project/adapter-overlays/claude-code.json`), then re-runs the claude-code adapter's `merge-settings.sh`. The resulting `.claude/settings.json` includes `"agent": "project-manager"`; running plain `claude` from that point boots as `project-manager`.
+
+Reverse with:
+
+```
+pkit project-management disable-default-agent
+```
+
+Disable strips the `agent` key from `.claude/settings.json`, removes the live overlay file, and re-runs the merge. Both subcommands are idempotent.
+
+Preconditions: the claude-code adapter must be installed in the project (`enable` refuses with a clear message if not). The overlay does not interact with permissions or skill grants — it only sets the top-level `agent` key.
+
+Rationale for the opt-in default: PM-as-default is a substantial behavioural shift (every `claude` session starts as the project-manager agent, not the general-purpose assistant). Adopters should opt in deliberately once they've decided the trade-off works for their workflow.
+
+### 7. (For capability authors) Contribute a required label
+
+Per [project-management:DEC-042-label-contributions] + [ADR-038](../../../tech-docs/architecture/decisions/ADR-038-contribution-collector.md), another installed capability can declare a **custom label it needs** — e.g. a design capability's `needs-design` marker on UI Features — and pm **provisions it at bootstrap** and **advises at pre-check** if it is missing. This is the label-tier sibling of the reviewer contribution ([project-management:DEC-032-conditional-reviewer-requirements]): the same orphan-safe manifest-walked collection shape, one tier down (labels, not reviewers) and **softer** (advise, not hard-gate).
+
+**Declaration shape.** The contributing capability ships a `label-contributions.yaml` at its own root (`.pkit/capabilities/<cap>/label-contributions.yaml`), carrying a top-level `schema_version` and a `labels:` list of `{id, default_name, color, description}` entries (validated by `schemas/label-contributions.schema.json`):
+
+```yaml
+schema_version: 1
+labels:
+  - id: needs-design
+    default_name: needs-design
+    color: d4c5f9
+    description: Requires design input.
+```
+
+pm collects a declaration purely on its presence in a **manifest-registered** component — no `requires_capabilities: project-management` edge is required (DEC-042 D2); a half-removed capability directory absent from `.pkit/manifest.yaml`'s `components:` is never walked (orphan-safe). The declaration's `schema_version` is validated at read time.
+
+**Bootstrap provisioning.** `bootstrap` creates any missing contributed label through a **per-label create path** carrying that contribution's own `color`/`description`, reusing bootstrap's existing missing-vs-present idempotency diff. A contributed label is **not** a classification-axis label — it does not route through the axis-label sole-constructor (ADR-026); re-running bootstrap once the label exists is a clean no-op.
+
+**The pre-check warn gate.** `pre-check` reports a missing contributed label as a non-blocking **warning** with a "run bootstrap" remediation — never a hard failure. This is a deliberate severity divergence from the reviewer gate: a missing label is self-healing (bootstrap re-provisions it) and its downstream consumer fail-closes on its own predicate, so the stakes are lower. A pm-only adopter (or one whose installed capabilities declare no labels) sees nothing. A malformed / version-mismatched declaration is **skipped and warned**, not fatal — one capability's broken file never blocks pm's whole pre-check (DEC-042 Lifecycle).
+
+**The resolution seam.** A consuming capability resolves a label's name through pm's `resolve_contributed_label(id)` accessor rather than hard-coding the text (DEC-042 D5). It ships **inert** in v1 (returns the declared `default_name`); introducing the seam before any consumer can bypass it means a future adopter override (keyed by the contribution `id`) can relocate the name without touching the contributor. Uninstalling the contributing capability stops the pre-check warning (its declaration leaves the manifest walk); the label itself is not deleted (additive).
+
+### 8. (Optional) Grant the fixers your capabilities declare
+
+A *fixer* is the agent that keeps one type of artefact true. When the default branch leaves such an artefact out of date, the fixer proposes its answer, and you decide it ([project-management:DEC-056-drift-fixers]). A capability declares its fixers in the `pkit::work-tracking:fixers` point (see "Connections" below). A fixer starts on its own only where you granted it. Nothing is granted by default.
+
+**The question.** `pkit pm ask-fixers` asks one question for each fixer nobody asked you about. Its words come from the declaration, for example:
+
+```
+living-docs can keep your pages true on its own. After each merge, its agent living-docs proposes a fix for each one that went out of date, and nothing is applied until you approve it. Turn this on? [Y/n]
+```
+
+- **At a terminal,** each answer is recorded as you give it. A yes is a grant, and a no is a refusal, so nothing asks about those types again.
+- **With nobody at a terminal,** such as in CI, nothing is granted or recorded. Each question is printed with the one command that grants its fixer.
+- **Running the command is never the consent.** Only your answer is, or your running the grant command.
+
+**Where it is asked.** The fixers point names `ask-fixers` as its question, so install and upgrade ask it, where a person can answer, after installing or upgrading a capability whose fixers reach the point (COR-061). The drift command asks it too, at a terminal, before it starts anything ("Starting the fixers" below). You can run `pkit pm ask-fixers` at any time.
+
+**The grant list.** Each answer goes into `project/config.yaml`, under `fixers`, keyed by the agent:
+
+```yaml
+fixers:
+  living-docs:
+    granted:
+      - living-docs:page
+```
+
+The commands write only that block, and keep every other byte of the file. Each change shows in your diff. A grant counts once its change merges into the default branch.
+
+**Commands for advanced use:**
+
+- `pkit pm list-fixers [--json]` lists each declared fixer, its types and your answer for each: granted, refused or not asked. It also says why an entry starts no agent, and lists each grant that no entry names.
+- `pkit pm grant-fixer <agent> [--type <type>]...` grants the agent every type the point gives it, or only the types named. It refuses an agent or a type that no entry names.
+- `pkit pm revoke-fixer <agent> [--type <type>]...` records a refusal for the agent's types. It works on the grant list alone while the point does not resolve, so a grant that validation reports can always be revoked.
+
+Both write commands take `--dry-run`, which writes nothing and, as a real run does, refuses where the configuration does not exist. All five fixer commands are exempt from the bootstrap gate, since they read and write nothing a bootstrap provides.
+
+**What validation checks.** The `project-management:fixers` member of `pkit validate` (`check-fixers`) reads the point and the grant list:
+
+- **An error:** your own entry names an agent that is not deployed, or the grant list cannot be read.
+- **A warning:** your own entry names an agent that does more than propose, or a grant names what no entry gives. A warning about a grant names the command that revokes it.
+- **A report:** a capability's entry is bad. It may name a type that is not the capability's own, or an agent the capability does not ship or has not deployed. It may come through a command filler, or name an agent that does more than propose. You cannot mend such an entry, so it fails nothing. No agent starts for it.
+- **A report too:** a refusal in the grant list for a type no entry gives that agent. It asks nothing and starts nothing, and the finding says how to remove it by hand.
+
+An agent does more than propose when its deployed definition does one of these:
+
+- claims paths (`owns`)
+- holds a tool that changes existing files or starts agents
+- lists no tools, since the harness then grants it every tool
+
+A tool that writes new files is allowed, for its workspace.
+
+#### Starting the fixers — `fix-drift`
+
+`pkit pm fix-drift` starts each fixer you granted on what the default branch left out of date, and gathers what it proposes for you ([project-management:DEC-056-drift-fixers] points 3 to 6). You run it, or the project manager runs it after each merge into the default branch, in the session that landed the merge (the pm skill's `fix-drift` sub-procedure). Nothing it gathers is applied until you accept it. Unlike the five commands above, it passes the bootstrap gate, since it reads the work tracker.
+
+```
+pkit pm fix-drift [--dry-run] [--force] [--cap N] [--parallel N] [--timeout SECONDS] [--effort LEVEL]
+```
+
+**What it reads.** It pins the default branch's commit, as `pkit repository base` resolves it, and reads everything that decides a dispatch at that commit, in a detached copy of it, never in your checkout:
+
+- the whole-repository check (`pkit friction check --all`)
+- each artefact's type (`pkit friction artefacts`)
+- the fixers point and the grant list, so a grant counts once its change merged
+- each candidate's friction and the commits behind it (`pkit friction explain`)
+- the command forms the run's rules allow (`pkit agents rules project-management:fix-drift`)
+
+**What it starts.** Only stale artefacts whose type's fixer you granted, upstream first. Every other artefact the check reports is listed with its reason:
+
+- deferred debt, and an artefact the check could not judge
+- a dead or ambiguous anchor, which validation reports
+- no type, a tied type, a type no entry names, or a fixer that is not granted or fails its checks
+- a name that could forge a result line: a backtick, a control character, a line or paragraph separator, a `.` or `..` part, or a folder in the run's temp folder
+- a stale upstream, which the artefact waits for, even where the upstream has no granted fixer
+- a file an open pull request already changes, and every artefact, with why, when the work tracker cannot list every open pull request's files whole: more than 200 are open, or a pull request's files still fall short of its count once read page by page
+- an answer that still stands: a proposal or a question waiting for you, a refusal you gave, or a `none` that stands, against the same friction or the same setup
+
+`--force` dispatches what stands. `--dry-run` says what it would start, and starts and writes nothing.
+
+**The bounds.** Each is set as the review command sets its own: a flag, else a variable, else the default.
+
+| Bound | Flag | Variable | Default |
+|---|---|---|---|
+| artefacts for each fixer, counting only those with no standing proposal | `--cap` | `PKIT_DRIFT_CAP` | 5 |
+| fixers at once | `--parallel` | `PKIT_DRIFT_PARALLEL` | all |
+| each fixer's wall-clock limit, in seconds | `--timeout` | `PKIT_DRIFT_AGENT_TIMEOUT` | 1800 |
+| the effort each fixer reasons at | `--effort` | `PKIT_DRIFT_AGENT_EFFORT` | its own |
+
+One run at a time works on the queue, held by a lock. A fixer that reaches its limit is marked failed, with each of its artefacts. A start that failed for a cause outside the fixer's work, and wrote nothing, is retried once; when it fails again, no further fixer starts.
+
+**How a fixer runs.** Each starts through the backbone's run command, `pkit agents run`, confined ([ADR-066](../../../tech-docs/architecture/decisions/ADR-066-unattended-agent-runner.md)). It runs in a clone at the commit, under the rules this capability declares for its runs (Permissions, below), with one brief and no other message:
+
+- **The frame** names the commit, the working copy, the workspace and its temp folder, the artefacts with their types, the command forms the rules allow, and the result lines the run's contract asks for.
+- **The data** is quoted with its source between markers made new for each run, and never instructs: for each commit behind an artefact's friction, the title and text of the pull request that carried it, cut at 4,000 characters and marked so, or that the work tracker holds none or could not be reached; and for an artefact held in an earlier run, its question, your answer and who gave it.
+
+The command refuses to start inside an agent run, since a fixer starts no other agent. Where the harness cannot confine a run, the run is refused, the fixer starts nothing, and the command says why.
+
+**What it gathers.** It reads each fixer's result lines and answers by the run's contract ("Connections" below), never prose:
+
+- A proposed artefact's answer must pass `schemas/fixer-answer.schema.json`, name the same artefact, and keep its diff in the artefact's folder and on the artefact's own file.
+- A breach that the check after the run finds, or a diff that reaches another file, sets that fixer's files aside, under `set-aside/`. None of its proposals is kept, and its artefacts are dispatched again at the next run.
+- A `none` the artefact clears (`not-mine`, `not-stale`) stands until the artefact's friction changes. One the setup clears (`refused`, `out-of-step`) stands until the setup changes, and is reported at every run as a fault of the setup. The setup is the fixer's definition and the overlay, the run's rules and every component's version. One the next run clears (`upstream`, `failed`) is dispatched again. An artefact failing at two runs in a row stands as a fault of the setup.
+
+**The queue.** The command gathers every run into the agent workspace of the repository's main working tree, so removing a worktree removes no proposal. A repository with no main working tree gathers nothing, and the command says why.
+
+```
+.agent-workspace/project-management/drift/
+  index.json            each artefact's state, its fixer, its proposal and the commit it was judged at
+  runs/<run>/<agent>/   each run's files: <artefact>/answer.json, evidence.md and the diff
+  set-aside/<run>/<agent>/   a breach's files, never read as proposals
+  drift.lock            the lock of the run that works on the queue
+```
+
+The index records the version of the run's contract each run followed, each artefact's friction and setup, and how many runs in a row it failed. `land-work` prints how many proposals wait. The project manager brings them to you in one batch ("Deciding the proposals", below).
+
+#### Deciding the proposals — `show-proposals`, `apply-proposals`, `refuse-proposals`, `answer-question`
+
+You decide each proposal: accept it, reword it or refuse it ([project-management:DEC-056-drift-fixers] point 6). You may instead name a delegate to decide them in your place ("Your delegate may decide them" below). Four commands reach the queue, and the project manager reaches it through them alone, never with file tools. Each refuses inside an agent run, since a fixer only proposes, and one at a time works on the queue, under the drift command's lock.
+
+```
+pkit pm show-proposals
+pkit pm apply-proposals <artefact>... [--because <artefact> <words>]... [--sentence <artefact> <sentence>]... [--dry-run]
+pkit pm refuse-proposals <artefact>... [--dry-run]
+pkit pm answer-question <artefact> <answer> [--by NAME] [--dry-run]
+```
+
+**Your delegate may decide them.** You may name one agent, such as the project manager, to decide in your place the answers no change owes ([COR-064](../../decisions/core/COR-064-answer-delegate.md)).
+
+- **Naming and withdrawing.** Name it in the friction key of the backbone configuration (COR-064 point 2). The CLI reference's ["Configuration file"](../../cli/README.md#configuration-file) <!-- unanchored: named as the section that gives the key, whose meaning rests on COR-064, which the page anchors --> names the key. It counts once the default branch holds it. Telling it to stop stops it in that session, and removing the name stops it everywhere.
+- **Which proposals.** A proposal is the delegate's to decide only where the capability that owns its type hands its answers on. A capability whose record keeps them for a person keeps them for you.
+- **How it decides.** It reads every word of each proposal, judges it from what the files hold, and accepts, rewords or refuses it. It never changes a proposal's outcome or its diff.
+- **What stays yours.** An answer it drafted, a question a fixer held, one only an account could settle, and everything else you decide, such as a merge. It decides nothing where the project chose no reviewer of the answers.
+- **What you are told.** A reviewer checks each answer it decided. The pull request that writes them tells you what it decided and what it refused, as information.
+
+**Checked again first.** Before a proposal is shown, and again before it is applied, it is checked at the default branch's commit. It is set aside where its artefact is no longer stale, or its friction differs from what it was judged against. It is set aside too where it was judged under another version of the run's contract, or its files no longer read. A proposal set aside is never shown or applied, and the next `fix-drift` dispatches it again.
+
+**The batch.** `show-proposals` prints each proposal whole, for you to read every word before you decide. A proposal's words can carry a contributor's steering.
+
+- the artefact, its type, its fixer and the commit it was judged at
+- the outcome, with its justification or its sentence
+- the deferrals it keeps, and what you do before it is recorded, such as reporting a defect
+- the evidence, the diff, and the writer's command word for word
+
+It prints each question a fixer held, with the command that answers it, and lists each question you answered, which waits for the next run.
+
+**Accepting.** What you accept reaches the default branch through an ordinary pull request. The project manager files a Task, cuts its branch from the default branch and runs `apply-proposals` there. It then opens the pull request, and you authorise its merge.
+
+- **It refuses, writing nothing,** on the default branch or on no branch, and where an artefact's file differs from the default branch's. It refuses too where an `unchanged` justification still holds a placeholder for you to fill, such as `<the defect reference>`, and no `--because` gives your words.
+- **Upstream first,** it applies each diff, then runs its writer, `pkit friction revalidate`. The writer is built from the answer's fields, never from a command a fixer wrote, and runs with `--yes`, since you, or your delegate, accepted it word for word.
+- **A diff that no longer applies** is set aside. A writer that fails leaves the file as it was, and its proposal keeps waiting.
+- **Your words.** `--because` gives them for an `unchanged` justification, and `--sentence` for an `updated` sentence. Each is held to the line an answer's own words are held to.
+- **For the description,** it prints the `## What changed in each updated document` section, one sentence for each `updated` answer.
+
+It exits 0 when each was applied, 1 when it refused and wrote nothing, and 3 when some were applied and some were not, each line saying which and why.
+
+**Refusing.** `refuse-proposals` remembers your refusal in the queue against the artefact's friction, so `fix-drift` dispatches it again only once its friction changes, or when you pass `--force`. It goes with the queue, which is the clone's. Its lasting form is a deferral, which you may give instead as your own answer, with `pkit friction defer`.
+
+**Answering a question.** `answer-question` records your answer and who gave it, `--by`, else `git config user.name`. While the artefact's friction stays the one the question was asked on, the next `fix-drift` quotes both in the fixer's brief, as data. An answered question no longer counts in `land-work`'s line.
+
+A run's folder is removed once each of its proposals was accepted or refused. These four commands pass the bootstrap gate, as `fix-drift` does.
+
+## Connections
+
+The capability provides the `pkit::work-tracking` role (COR-053); `pkit::` is this distribution's literal for the methodology's publisher qualifier ([the lifecycle README, "The methodology's literals"](../../lifecycle/README.md#the-methodologys-literals)).
+
+- **Accepts** `pkit::work-tracking:doc-check`, version 1: the documentation obligations a pull request owes, per [project-management:DEC-053-doc-check-slot]. The point is `additive` — obligations from different sources never replace one another, and one leaves only through the project's removal override with its reason — and its inert policy is `fail`. Its shape is the companion schema `schemas/doc-check.schema.json`: each obligation names its `source`, its `reason` and what it concerns.
+
+**The mapping is the default filler.** The code-to-doc mapping of `project/config.yaml` (DEC-015) stays where it is configured and fills the point on every resolution, one obligation per rule, keyed by the rule (`mapping:<code pattern>`). It is supplied by this capability's own command, `fill-doc-check`, contributed to its own point: a data point's static `default` lives in package metadata and cannot hold the project's configuration. The backbone runs it as a query wherever the point resolves — `pkit validate`, `pkit status`, `pkit connections resolve` — offline-marked, with `--json` alone. It is exempt from the bootstrap gate: it reads only the mapping, and no config is no obligations.
+
+**The check reads the resolved point.** `check-doc-mapping` reads the point through the backbone — `pkit connections resolve pkit::work-tracking:doc-check --json` — and applies it to the pull request's diff (a data point takes no parameter; applying it is the consumer's work):
+
+- **A mapping obligation is met exactly as before:** the diff touches one of the rule's documents, or the `## Doc impact` section names the changed code path or the rule's pattern. With no documentation capability installed the point holds the mapping alone, and the check prints and exits exactly as it always did — pinned byte for byte by `tests/test_pm_check_doc_mapping_fixtures.py`.
+- **A contributed obligation** — a documentation capability's, or one the project writes in its own filler file — is met by the artefact, never by the `## Doc impact` section, because the check must hold for a pull request from any tool and with no description at all. How depends on what it names:
+  - **Friction on an anchored page** (`page-stale`, naming the page as `document`) **is met only by the page's answer in the diff**, one of these:
+    - a changed file that matches the obligation's `document`
+    - an answer the change adds on the page that the core change check accepts: updated, unchanged or deferred (`pkit friction check --json`). It meets the obligation wherever it falls among the branch's commits, which [land as one](#pr-title-conv-types--the-standard-set-and-why-decision-record-prs-land-as-docs). It does so even where a later fix round edits an anchor the answer covers
+    - a deferral the change rewrote, which the change check lists as edited, since the deferral keeps the point of the one it rewords. It meets the obligation where the change check counts it for its anchor and its reason names an open follow-up (COR-050 point 3). `check-doc-mapping` asks the host through `gh` whether each follow-up the reason names is open. Where the host cannot be asked, as with no token, a follow-up counts as open, with a warning
+  - **Code nothing documents** (`code-undocumented`, naming the code as `path` and no `document`) **is met only by anchoring the path from a page.** Its filler reads the pull request's head, so once a page anchors the path the obligation leaves the point; one still in the point is unmet, whatever else the diff changed, and the check's line names the fix — anchor `<path>` from a page. A project writing a `code-undocumented` obligation that does name a `document` is met as a page's is.
+- **Only this capability's own filler supplies mapping obligations.** An entry from any other origin claiming the `mapping` source would borrow the mapping's `## Doc impact` override and its setting; the check refuses it.
+- **An unresolved point fails the check** (exit 1), naming each filler that could not answer and its fix — update it, pin it, or uninstall it — rather than pass on fewer obligations than it should. The mapping's own filler needs no step of yours: `pkit init` and `pkit sync` provision its dependency for the offline run ([the lifecycle README, "How dependencies are provisioned before an offline run"](../../lifecycle/README.md#the-methodologys-literals)); if it is not provisioned, its reason says so and names `pkit sync`.
+- **A removal override** in the project's filler file (`docs/pkit/fillers/pkit/work-tracking/doc-check.yaml`, with `remove: [{id, reason}]`) takes an obligation out; the check prints each one removed, with its reason.
+
+**Enforcement is per source** (DEC-053 point 3). The mapping keeps its setting, `code_path_to_doc_mapping.enforce`. Every other source is set in `project/config.yaml` under `doc_check.sources.<source>` — `advisory`, the default for a source not listed (unmet obligations are reported, the check passes), or `enforcing` (an unmet obligation fails it). Enforcing one source never enforces another, and `doc_check.sources.mapping` is refused: the mapping has its setting. As before, the real boundary is wiring `check-doc-mapping` as a required CI status check: one line of the project's check gate, `pkit pm check-doc-mapping --base "<base>"`, against the same base as the core change check (`pkit friction check --base "<base>"`) — both diff the head against its merge-base with that ref — with the gate a required status on the default branch.
+
+```yaml
+code_path_to_doc_mapping:
+  enforce: false                # the mapping's setting, as before
+  rules:
+    - { code: "src/cli/**", docs: [docs/cli.md] }
+doc_check:
+  sources:
+    friction: enforcing         # a documentation capability's page friction
+```
+
+**The pages' answers are the change check's, and `## Doc impact` may point at it.** The answers a change wrote are read from the change check, and no section of the description carries them ([project-management:DEC-065-answers-read-from-check]; "The answers a change wrote, in its pull request" above). `open-pr --doc-impact-from-friction` (opt-in) fills an unwritten `## Doc impact` — the template's placeholder, an empty section, or none — with one line counting the documents they are on, "N documents this change affects — their answers are the change check's (`pkit friction check`).", and leaves an authored section as it is; a page still carrying friction is named on stderr, to be answered on the page. The line names no path and no reason, so it overrides no mapping. A check document of a `schema_version` other than 1 is not read, and the command says so (the CLI README, "Friction checks"). Rendering only: the check never reads either section for a contributed obligation. The `## Doc impact` section itself stays required on every Task and pull request (DEC-015), whatever fills the point.
+
+- **Accepts** `pkit::work-tracking:use-cases`, version 1: the use cases settled on the default branch, per [project-management:DEC-054-use-case-validation]. Its shape is the companion schema `schemas/use-cases.schema.json`: each entry an `id` (`UC-` and three or more digits), a `title`, a `status` — `active` or `withdrawn` — and, optionally, the repository-relative `path` of the document that describes the use case. The point is `single`, with no default, and its inert policy is `fallback`: its readers only report, so a filler that cannot answer is a warning in `pkit validate`, never an error. What reads it, and how each state of it reads, is under "Use cases in planning and in bodies", above.
+
+  **Whatever keeps your use cases fills it**: a capability that contributes to the point, or your own filler file, `docs/pkit/fillers/pkit/work-tracking/use-cases.yaml` (`schema_version: 1` and a `value` list of entries), which replaces a capability's answer whole. `pkit status` shows what fills the point. A filler holds to four things, which the point's description states: the value holds every use case that ever settled, withdrawn ones included, but not one whose id your project freed; an id, once settled, names the same use case for good, unless your project declares that nothing cites it — that use case may then leave the value, and its id may later name a different use case; the answer is complete or none — a filler that cannot read a use case gives no answer, never a shorter list; and a capability's filler declares that it reads settled state (`reads: [settled]` on its command), so the backbone does not start it where the default branch cannot be read. Anything that keeps an id is citing it. Your own filler file is your statement of your use cases: it is held to the point's shape and taken as given. With nothing filling the point, nothing in this capability mentions use cases.
+
+- **Accepts** `pkit::work-tracking:fixers`, version 1: which agent fixes the artefacts of each type, per [project-management:DEC-056-drift-fixers] point 1. Its shape is the companion schema `schemas/fixers.schema.json`. Each entry has an `id`, the artefact type, an `agent`, and a `description` of what the agent keeps true, such as "your pages". The question that asks you to grant the fixer is built from the description. The point is `union`, with no default, and its inert policy is `fail`: a filler that cannot answer leaves the point unresolved, so no fixer starts.
+
+  **A capability declares its fixers** as a static `value` in its package metadata, never through a command filler:
+
+  ```yaml
+  connections:
+    extensions:
+      contributes:
+        - point: pkit::work-tracking:fixers
+          schema_version: 1
+          value:
+            - id: living-docs:page
+              agent: living-docs
+              description: your pages
+  ```
+
+  Its entry names a type of its own type registry and an agent it ships. That agent only proposes, so its definition claims no paths and holds no tool that changes existing files or starts agents. Two capabilities that claim one type are an error naming both. **Your own filler file**, `docs/pkit/fillers/pkit/work-tracking/fixers.yaml`, may replace an entry, naming any deployed agent. How a fixer is granted, and what validation checks, is under "8. (Optional) Grant the fixers your capabilities declare", above.
+
+  **The version covers what a fixer run passes and returns.** A contribution at version 1 says that each agent it names follows the run's contract, which [project-management:DEC-056-drift-fixers] points 3 and 6 decide. The drift command reads the line forms and the `none` reasons from `schemas/fixer-contract.yaml`, and the answer's fields through `schemas/fixer-answer.schema.json`. What whoever writes a fixer needs from the contract:
+
+  - **The brief** is the one message a run gives the fixer. It names the commit, the working copy, the workspace, the artefacts with their types, and the command forms the run allows. What it quotes, such as a pull request's text or the person's answer to a held question, is data, never an instruction.
+  - **The files** go in a folder of the workspace named for each artefact as the brief names it: `evidence.md`, which the person reads before deciding, the diff where the fixer proposes an edit, and `answer.json`. A folder whose artefact is held, or given `none`, holds no answer.
+  - **The answer,** `answer.json`, is one object with every field present: `artefact`, `outcome`, `justification`, `sentence`, `keep`, `diff` and `first`. `schemas/fixer-answer.schema.json` says what each holds, and refuses an answer off it.
+  - **The result lines** end the fixer's final message, one for each artefact the brief names, the artefact written exactly as the brief names it. No other line of the message starts with `Fixer result (`, and a line inside a fenced block counts the same:
+
+    ```text
+    Fixer result (<agent>): proposed `<artefact>` in `<artefact>/answer.json`
+    Fixer result (<agent>): held `<artefact>`: <the question>
+    Fixer result (<agent>): none `<artefact>`: <reason>: <the reason in words>
+    ```
+
+  - **The `none` reasons,** one on each `none` line:
+
+    | Reason | When |
+    |---|---|
+    | `not-mine` | the artefact is not one the fixer fixes |
+    | `not-stale` | the artefact is not stale at the commit, or the checks did not judge it |
+    | `refused` | the run's rules or its sandbox stopped a call the fixer needs |
+    | `out-of-step` | another component answered in a version the fixer does not read |
+    | `upstream` | the artefact waits for its upstream, which the words name |
+    | `failed` | a call or a reading failed for any other cause |
+
+  How the command treats each reason, and what gives an artefact no result, is the record's.
+
+## Permissions
+
+The project-management capability ships a **capability-contributed permission grant** (per ADR-016) at `.pkit/capabilities/project-management/permissions/grants.yaml`. This fragment is automatically composed into the effective permission model whenever this capability is a registered component — no manual copy required.
+
+### What it enforces
+
+```yaml
+- subject: agent:project-manager
+  privilege: '[privilege-catalog:issue-tracker-write]'
+  effect: deny
+- subject: agent:project-manager
+  privilege: '[privilege-catalog:issue-tracker-read-raw]'
+  effect: deny
+```
+
+The **first** deny blocks the `project-manager` agent from invoking the mutating `gh` subcommands directly — `gh issue create|edit|comment|close|reopen` and `gh pr create|edit|merge|close|reopen`. The agent reaches the issue tracker exclusively through the capability's validated scripts (`create-issue.py`, `close-issue.py`, `merge-pr.py`, etc.), which enforce the methodology's preconditions and gates (validation, the checkbox close-gate, the approval gate). Note this is a **speed-bump, not a security boundary** — per ADR-004 a tool-call denylist is porous (a code runner such as `python3 -c '…'`, which ADR-025 point 5 leaves unread, or `gh api -X PATCH … state=closed` evades it); the genuine gate enforcement lives inside the scripts, so the deny only removes the reflexive direct-typed bypass.
+
+The **second** deny (`issue-tracker-read-raw`) is a **read-redirect**: it blocks the three raw read views the clean-output verbs replace — `gh issue view`, `gh pr view`, `gh pr diff` — and routes the agent to `pkit project-management show-issue` / `show-pr` (and their `--field <name>` for a single value, [described above](#read-only-diagnostics--show-issue--show-pr)). Those verbs emit clean output an agent can capture as a *bare* command instead of piping a full `gh` view through `grep`/`tail`. The recognizer is deliberately narrow — **only** those three views; `gh pr checks`, `gh run`, `gh api`, `gh issue list`, and `gh pr list` stay available, as do `git` and `pkit`. Like the mutation deny it is a speed-bump (a deny is auto-rejected by the harness with no operator prompt, so the agent simply adapts to the clean verb).
+
+### Adopter inheritance — how you get the deny
+
+Unlike a hand-authored grant in your project's `grants.yaml`, this deny is **capability-owned** and ships automatically:
+
+1. `pkit capabilities install project-management` registers the capability in `.pkit/manifest.yaml`.
+2. The permission model loader (`load_model` in `.pkit/permissions/decide.py`) discovers the manifest-registered capability and loads its fragment — install-state-as-gate.
+3. A one-time `pkit permissions setup autonomy` activates the enforcement hook and profiles; the capability's deny is already in the model before that step.
+
+On upgrade: `pkit upgrade` (or `pkit capabilities upgrade project-management`) propagates any changes to the fragment; the model loader picks them up on the next invocation. No manual grant is ever needed.
+
+### Deny-wins under any profile
+
+The `autonomous` profile grants `issue-tracker` to all agents (broad `gh` reads and writes). The capability deny on `issue-tracker-write` still holds because `decide()` is **deny-wins and order-independent**: a capability deny wins over a profile allow regardless of layer ordering. Run `pkit permissions probe --agent project-manager` to verify the deny is active.
+
+### Visibility
+
+Run `pkit permissions overview` to see the capability-contributed deny listed under "CAPABILITY-CONTRIBUTED DENIES" with its source (`contributed by capability: project-management`). Run `pkit permissions explain project-manager` to see the per-agent view with the same attribution.
+
+To deliberately override the deny (not recommended — it removes the methodology enforcement gate): `pkit permissions grant agent:project-manager issue-tracker-write` in your project's `grants.yaml`. The override is auditable and explicit; it does not touch the capability's fragment.
+
+### The rules of a fixer's run
+
+`permissions/runs.yaml` declares the rules of the runs `fix-drift` starts, and the privileges they name ([project-management:DEC-056-drift-fixers] point 5, ADR-066 point 5). No session's model composes it: the backbone reads it at the commit a run is pinned to, and the adapter realises it in that run's own settings alone. Its rules are denies for every agent, since the command starts agents other capabilities ship:
+
+- **One deny of everything proposing does not need.** What it leaves open: reading the working copy with the file tools, writing new files in the run's workspace, git's reading commands pointed at the working copy (`git -C <working copy> log`, `show`, `diff` and the rest), making a diff with `git diff --no-index` and checking one with `git -C <working copy> apply --check`, the backbone's reading commands, and each command another component declares a query. The adapter holds it as an allow list, and refuses every other call without asking. A writer added later is refused without anyone listing it. A form is allowed with any arguments, so none is listed whose options can run another program: `git grep` is left out, since `--open-files-in-pager` runs one, and the Grep tool searches instead. An option that writes a file is held by the sandbox.
+- **A floor of denies:** writing with the file tools anywhere but the workspace, version control beyond reading, the work tracker, the toolchain that installs or runs packages, every writer of the methodology, and every command of this capability. Each is written as a native deny where a native rule can name it, and the allow list holds the rest.
+
+The session model's denies that bind on the run's agent come along, the guardrails among them. A deny that reaches what the run needs and that no native rule can hold refuses the run. What `pkit agents rules project-management:fix-drift` shows is in [the CLI README, "agents rules"](../../cli/README.md#agents-rules-capabilitycommand---agent-agent---json). `pkit permissions overview` and `explain` list the rules under "RULES OF AGENT RUNS", with this capability as their source.
+
+## Upgrading
+
+When `pkit capabilities upgrade project-management` lands a new version that ships a migration manifest under `migrations/`, the adopter's GitHub state may need reconciliation. The upgrade itself is **not** auto-chained with migration — explicit invocation, so the adopter reads the migration plan before authorising:
+
+```
+pkit project-management migrate
+```
+
+The migrate script:
+
+- Refuses to run if pre-check fails (drift in basic state breaks migration plan computation).
+- Reads pending migration manifests (versions present in `migrations/` but not yet in the adopter's `project/migrations-applied.yaml`).
+- Presents the change plan and prompts for **per-change confirmation** — no batch `--yes` flag by default.
+- Executes confirmed changes via `gh` mutations.
+- Records the applied migration in the adopter's state file (idempotent: re-runs are no-ops).
+
+The discipline that pins this lifecycle — including the same-PR-as-surface-change rule for migration manifests — is [project-management:DEC-017-prerequisites-bootstrap-migrate-discipline].
+
+## Roadmap
+
+The capability evolves on a versioned rollout pinned by [project-management:DEC-020-methodology-as-executable-commands]. Each version is a coherent unit of behaviour change rather than a single big switch:
+
+| Version | What ships |
+|---|---|
+| **v0.3.0** | DEC-020 — methodology rules move from skill prose into deterministic **verb-subject scripts** under `scripts/` (`create-issue.py`, `validate-issue.py`, …); the `pm` composite skill's sub-procedures thin to intent-to-command routers. Plus DEC-021 — team membership gate; `add-member.py` / `remove-member.py` / `show-members.py` |
+| **v0.4.0** | Remaining issue + PR commands; `show-tree.py` diagnostic |
+| **v0.5.0** | Workstream lifecycle (per [project-management:DEC-018-workstream-taxonomy-and-lifecycle]) — `add` / `rename` / `edit` / `merge` / `split` / `remove` / `show` / `list` workstream scripts; `workstreams.yaml` becomes the source of truth; `schemas/workstreams.schema.json` ships |
+| **v0.6.0** | Mandatory-issue-state enforcement (per [project-management:DEC-019-mandatory-issue-state]) — `schemas/mandatory-issue-state.yaml`; `create-issue.py` auto-adds to the configured board; default-to-filer assignment; `assign-issue.py` reassignment script; `validate-issue.py` checks; `templates/.github/workflows/pm-issue-check.yml` post-check workflow template |
+| **v0.7.0+** | Methodology-mesh (per [project-management:DEC-022-methodology-mesh]) — cross-repo state coordination via per-repo `mesh_peers:` (with optional `mesh_source:` governance-repo pointer); `check-mesh.py` diagnostic; `templates/.github/workflows/pm-mesh-check.yml` scheduled workflow; drift surfaces as warnings, not enforced |
+
+The scripts surface as `pkit pm <verb>-<subject>` through the kit's capability-command dispatch (COR-021), and stay invocable by direct path — `.pkit/capabilities/project-management/scripts/<verb>-<subject>.py`.
+
+## Authority — membership lifecycle (v0.3.0+)
+
+Every mutating verb-subject script checks a project-side **`members.yaml`** before proceeding, per [project-management:DEC-021-team-membership-gate]. Two modes:
+
+- **Open mode** — `members.yaml` is absent or has an empty list. Any invoker with repo access passes the gate. This is the install default.
+- **Closed mode** — `members.yaml` lists ≥1 member. Only listed members pass; non-members get a structured refusal with a remediation hint pointing at `add-member.py`.
+
+Bootstrap is **self-add by the first member while open mode applies**. From the moment the first entry lands on main, the repo is closed; subsequent additions require an existing member's PR review.
+
+`add-member` and `remove-member` write `members.yaml` in the working tree, and the change is the person's (#2015). At a terminal each asks before it writes, and `--yes` authorises the change. Off a terminal, without `--yes`, each refuses with exit 1 before the file is written, and names the command to run with `--yes`.
+
+This refines [project-management:DEC-008-pm-and-implementer-roles] — the PM / Implementer role distinction continues to apply *within* the membership; the gate is what restricts entry.
+
+## Citing this capability's decisions
+
+Inside this capability's own content (and from any other kit-shipped or adopter content referencing the discipline), cite decisions by their filename stem: `[project-management:DEC-001-distillation-lineage]`. The validator (`pkit refs validate`) walks capability subtrees and resolves these citations.
+
+Schemas distilled from upstream METs carry a structured `source:` block (per the schemas-area envelope convention) naming the upstream project, commit SHA, and MET IDs they distill from. This makes the lineage machine-checkable.
+
+## Dependencies
+
+- **GitHub** as the work-tracker. The methodology names GitHub primitives directly (per MET-002 / DEC-002): Issues, native sub-issues, Milestones, Projects v2 boards and fields, labels, branch protection, GraphQL.
+- **`gh` CLI** authenticated for the target organization, or equivalent GitHub access for whatever tooling the project-manager invokes.
+- **No other capabilities required.** This capability is self-contained. Another capability may fill the points it accepts ("Connections", above) — the documentation obligations, the use cases — and it works the same with none installed.
+
+## Feedback to the spec
+
+Operational findings — distillation gaps, schema shapes that didn't survive contact with reality, adopter friction — flow back to pm-workflow as scratchpad notes under `pm-workflow/.pkit/scratchpad/active/`. pm-workflow's existing scratchpad → decision review machinery consumes them. The channel is manual for v0.1.0; tooling lands if volume justifies it (per COR-007).

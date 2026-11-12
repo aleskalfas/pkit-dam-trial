@@ -1,0 +1,228 @@
+schema_version: 1
+
+# Privilege catalog — the named domain things an agent may be permitted to do
+# (per COR-028). Each privilege declares how a request is recognized as
+# belonging to it (a structured matcher over Bash commands and/or harness tool
+# names, with a regex escape hatch per Q4c) and which scope dimension it accepts.
+#
+# Namespace owner: permission grants reference privileges via the typed token
+# [privilege-catalog:<id>] (COR-019). The baseline catalog content (vcs, docker,
+# web-fetch, repo-read, kit, guardrails) is authored against this shape in a
+# later task; this file ships the envelope and is extended by capabilities and
+# projects that introduce their own tools.
+
+privileges:
+  # --- common allow-shaped privileges ---
+  vcs:
+    description: Git version control.
+    recognize:
+      bash:
+        - cmd: git
+  issue-tracker:
+    description: GitHub issues and pull requests via the gh CLI.
+    recognize:
+      bash:
+        - cmd: gh
+  issue-tracker-write:
+    description: >-
+      Raw gh mutations that bypass the project-management capability's
+      validating scripts (gh issue create/edit/comment/close/reopen and
+      gh pr create/edit/merge/close/reopen). Deny to force the validating
+      scripts — the matching wrappers (create-issue, edit-issue, close-issue,
+      reopen-issue, open-pr, edit-pr, merge-pr, close-pr, reopen-pr) run the
+      methodology's gates (validation, checkbox close-gate, approval gate).
+      NOTE: this is a speed-bump, not a security boundary — per ADR-004 a
+      tool-call denylist is porous (a code runner such as `python3 -c '…'`
+      or `gh api -X PATCH … state=closed` evades it). The genuine gate
+      enforcement lives inside the scripts; this only removes the reflexive
+      direct-typed bypass.
+    recognize:
+      bash:
+        # Matches the mutating gh subcommands that have validated wrappers:
+        # gh issue {create,edit,comment,close,reopen} and
+        # gh pr {create,edit,merge,close,reopen}.  Does NOT match reads
+        # (gh issue view/list/status, gh pr view/checks/diff) or `gh api`
+        # (left open deliberately as the REST escape hatch — and itself a
+        # bypass vector, per ADR-004).  Runs on the joined token segment after
+        # env-prefix stripping (decide.py segments()), so
+        # "export GH_HOST=x && gh issue close …" is handled correctly.
+        - pattern: '^gh\s+(issue\s+(create|edit|comment|close|reopen)|pr\s+(create|edit|merge|close|reopen))(\s|$)'
+  issue-tracker-read-raw:
+    description: >-
+      Raw gh read views that the project-management capability's clean-output
+      verbs replace (gh issue view, gh pr view, gh pr diff). Deny to force
+      `pkit project-management show-issue` / `show-pr` — the methodology's
+      prompt-free, non-piping read path. Those verbs emit a terse, banner-and-
+      label summary (or `--json`), and `--field <name>` prints a SINGLE value
+      with no chrome, so an agent captures one value as a bare command instead
+      of piping the full `gh` view through grep/tail. Matches ONLY the three
+      replaced views — NOT gh pr checks, gh run, gh api, gh issue/pr list, or
+      any mutation (those stay open here; mutations are covered by
+      issue-tracker-write). NOTE: like issue-tracker-write this is a speed-bump,
+      not a security boundary — per ADR-004 a tool-call denylist is porous
+      (a code runner such as `python3 -c '…'` or `gh api` evades it); it only
+      removes the reflexive direct-typed raw-view bypass so the clean verb is
+      the path of least resistance.
+    recognize:
+      bash:
+        # Matches the three raw read views the show-* verbs replace:
+        # gh issue view, gh pr view, gh pr diff.  Deliberately narrow — the
+        # alternation pins the exact issue/pr subcommand, so it does NOT match
+        # gh pr checks, gh run view, gh api, gh issue list, or gh pr list.
+        # Runs on the joined token segment after env-prefix stripping
+        # (decide.py segments()), so "export GH_PAGER= && gh pr diff …" is
+        # handled correctly.
+        - pattern: '^gh\s+(issue\s+view|pr\s+(view|diff))(\s|$)'
+  kit:
+    description: Run the project-kit CLI.
+    recognize:
+      bash:
+        - cmd: pkit
+  text-filter:
+    description: >-
+      The read-only part of the text-processing shell tier: programs whose only
+      effect is their standard output, which write no file, reach no network,
+      run no other program and change no shell state, so a pipe or chain of
+      them with other granted programs needs no prompt. Each is recognized by a
+      pattern that names it, which the projection does not render as a native
+      rule, so only the hook realizes it (ADR-005 point 5). It carries no path
+      scope, since a scope on a shell read confines nothing (ADR-004). `sort`,
+      `uniq` and `diff` are recognized only in a form that writes no file and
+      runs no other program, holding no pathname pattern that could expand to
+      such a form.
+    recognize:
+      bash:
+        - pattern: '^cat(\s|$)'
+        - pattern: '^head(\s|$)'
+        - pattern: '^tail(\s|$)'
+        - pattern: '^wc(\s|$)'
+        - pattern: '^cut(\s|$)'
+        - pattern: '^tr(\s|$)'
+        - pattern: '^grep(\s|$)'
+        - pattern: '^egrep(\s|$)'
+        - pattern: '^fgrep(\s|$)'
+        - pattern: '^ls(\s|$)'
+        - pattern: '^cmp(\s|$)'
+        - pattern: '^comm(\s|$)'
+        - pattern: '^paste(\s|$)'
+        - pattern: '^basename(\s|$)'
+        - pattern: '^dirname(\s|$)'
+        - pattern: '^realpath(\s|$)'
+        - pattern: '^pwd(\s|$)'
+        - pattern: '^true(\s|$)'
+        - pattern: '^false(\s|$)'
+        - pattern: '^seq(\s|$)'
+        - pattern: '^sleep(\s|$)'
+        - pattern: '^stat(\s|$)'
+        - pattern: '^du(\s|$)'
+        - pattern: '^which(\s|$)'
+        # A word holding a pathname pattern or a brace, which the shell may
+        # expand to a form these three exclude (`-*` to a file named `-ofile`,
+        # or `{-}o` to `-o` under zsh's BRACE_CCL), keeps each of them out.
+        #
+        # `sort` with no word that opens an output file or a compress program,
+        # in any form GNU or BSD sort reads: `-o` or a short bundle holding it
+        # (`-ro`, `-oout`), and a long option cut to a prefix of `--output` or
+        # `--compress-program` (`--o`, `--co`), with or without `=`. `-T` and
+        # `--temporary-directory` (`--t`), which say where its temporary files
+        # go, stay out too. It errs narrow: `-to` and `--check` stay out.
+        - pattern: '^sort(\s|$)(?!(?:.*\s)?(?:-[^-\s]*[oT]|--[cot]))(?!.*[*?\[^#~{])'
+        # `uniq` with its options first, then at most one operand, the input,
+        # and nothing after it: a second operand is the output file. `-` and
+        # `--` are no options here, and a word the shell may expand to two
+        # operands matches no part, so a form whose operands the regex cannot
+        # count stays out.
+        - pattern: '^uniq(?:\s(?:-[^-\s*?\[^#~{][^\s*?\[^#~{]*|--[^\s*?\[^#~{]+))*(?:\s[^-\s*?\[^#~{][^\s*?\[^#~{]*)?$'
+        # `diff` with no word that pipes its output through `pr`: `-l` or a
+        # short bundle holding it, and a long option cut to a prefix of
+        # `--paginate` (`--p`). It errs narrow: `--palette` and a label holding
+        # an `l` stay out too.
+        - pattern: '^diff(\s|$)(?!(?:.*\s)?(?:-[^-\s]*l|--p))(?!.*[*?\[^#~{])'
+  uv-run:
+    description: >-
+      Run a program in the project's Python environment through `uv run`, such
+      as `uv run pytest`. `uv run` runs any program it is given and confines
+      nothing, so a grant allows whatever that program does, where the core
+      can read which program it is. A deny reads that program too (ADR-025
+      point 5), so `uv run rm -rf ~` is denied. No shipped profile grants it
+      (ADR-005 point 5): a project may grant it in its `grants.yaml`.
+    recognize:
+      bash:
+        - cmd: uv
+          subcommand: [run]
+  docker:
+    description: Run docker / docker-compose.
+    recognize:
+      bash:
+        - cmd: docker
+        - cmd: docker-compose
+    scope_type: directory
+  web-fetch:
+    description: Fetch web content.
+    recognize:
+      tool:
+        - WebFetch
+        - WebSearch
+    scope_type: domain
+  repo-read:
+    description: Read repository files.
+    recognize:
+      tool:
+        - Read
+        - Grep
+        - Glob
+  workspace:
+    description: >-
+      Create, read and edit intermediate files in the agent workspace, the
+      git-excluded folder at the root of each checkout (rules/core.md, the
+      workspace rule), with the file tools. Recognized only for a file tool
+      whose target lies inside it; a shell command is judged like any other.
+      Never realized as a session-wide rule; the hook enforces it.
+    recognize:
+      path:
+        folders:
+          - ".agent-workspace"
+        tools:
+          - Read
+          - Write
+          - Edit
+          - MultiEdit
+          - NotebookEdit
+
+  # --- guardrail privileges (the baseline model grants these effect:deny) ---
+  privilege-escalation:
+    description: Privilege escalation via sudo.
+    guardrail: true
+    recognize:
+      bash:
+        - cmd: sudo
+  destructive-fs:
+    description: Recursive filesystem deletion (rm -r/-R/--recursive, any flag form).
+    guardrail: true
+    recognize:
+      bash:
+        # Recursive rm in ANY form: -r, -R, --recursive[=...] or a prefix of it
+        # down to --r, which GNU rm reads as --recursive, or a short bundle
+        # containing r/R (-rf, -fr, -fR, -Rf, -rfv, ...). The regex escape
+        # hatch spells these forms itself: the decision core reads a regex's
+        # flags as written. Bare `rm` / `rm -f <file>` (single-file,
+        # non-recursive) is intentionally NOT a guardrail — that is fs-cleanup
+        # territory.
+        - pattern: '^rm(?=\s).*(\s-[a-zA-Z]*[rR][a-zA-Z]*(\s|$)|\s--r(e|ec|ecu|ecur|ecurs|ecursi|ecursiv|ecursive)?(=|\s|$))'
+  vcs-history-rewrite:
+    description: Rewriting published git history (force-push).
+    guardrail: true
+    recognize:
+      bash:
+        # For a deny, the decision core reads these flags in the forms git
+        # reads them: inside a bundle (-uf), cut to a prefix (--force-w), and
+        # with a value after `=` (--force-with-lease=main). --mirror
+        # force-updates every ref the remote holds.
+        - cmd: git
+          subcommand: [push]
+          flag_any: ["--force", "-f", "--force-with-lease", "--mirror"]
+        # A refspec opening with `+` forces the update of its ref, as
+        # `git push origin +main` does without --force.
+        - cmd: git
+          subcommand: [push]
+          word_prefix_any: ["+"]

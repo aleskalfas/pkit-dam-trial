@@ -1,0 +1,4 @@
+schema_version: 2
+# The workstreams live in workstreams.yaml beside this file; pre-check still requires the key.
+workstreams: []
+has_projects_v2_board: false

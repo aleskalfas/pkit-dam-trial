@@ -1,0 +1,378 @@
+schema_version: 2
+component:
+  kind: capability
+  name: project-management
+  version: 0.57.0
+description: Project-management discipline realized from the pm-workflow methodology — issue hierarchy, state machine, body validation, naming conventions — encoded as schemas a methodology-agnostic engine (skills + agent) consumes at runtime.
+# The floor is the newest backbone this package needs: `pkit report link`
+# (shipped in v1.144.0), which create-issue --from-report invokes per DEC-048's
+# one-linker rule; and the backbone release that took over the process-journal
+# ignore line this package no longer declares — the changeset that dropped the
+# line raises the floor to it at that release (`requires_backbone: release`).
+requires_backbone: ">=2.2.0,<2.3.0"
+aliases:
+  - pm
+# Runtime-local files this capability owns under `.pkit/` (ADR-009 rule 7).
+# Declared repo-root-relative, exactly as `footprint:` is; the renderer rebases
+# onto the `.pkit/`-relative form `.pkit/.gitignore` needs. The issue-lifecycle
+# journals under `project/process/` are not declared here: the process engine
+# writes them, and the backbone ignores them unless the project chose to commit
+# them (`process.journal` in `.pkit/project/config.yaml`, COR-033 point 7).
+runtime_ignore:
+  - .pkit/capabilities/project-management/project/instance/*.json
+commands:
+  pre-check:
+    script: scripts/pre-check.py
+    help: Verify methodology prerequisites are present and configured (read-only diagnostic; hard gate on every pm operation).
+  bootstrap:
+    script: scripts/bootstrap.py
+    help: Create the methodology's required initial GitHub state (labels per classification axes; optionally a starter EPIC).
+  migrate:
+    script: scripts/migrate.py
+    help: Reconcile adopter state after a capability upgrade (per-change confirmation; refuses to run on pre-check failure).
+  back-fill:
+    script: scripts/back-fill.py
+    help: "Corpus back-fill — the auditable propose-and-cite ceremony (per DEC-037 §2 / ADR-031). Default (report) enumerates proposed per-issue substrate writes — a Projects-v2 field value and a milestone from the after_create_issue hooks, plus an axis LABEL (set-axis-label) from a label-carried axis's substrate-map default, the corpus-repair kind that fills gaps and never overwrites — cites why each is proposed, gates on the residual pre-check subset, and mutates nothing; --json emits the machine-stable plan. --apply drives the reviewed plan to writes under the audited skip/report posture (re-validates each issue at apply time: drift→skip, already-set→skip; confirmation-gated, --yes for CI; non-zero exit on any write failure). --emit-script emits an idempotent re-checking script the adopter runs themselves (pm writes nothing). --plan <file> applies/emits from a saved --json plan. --set AXIS=VALUE supplies the repair value for this run instead of the axis's declared default (repeatable per axis; the methodology value, resolved through your remap; refused alongside --plan, whose values are already fixed)."
+  adopt-existing:
+    script: scripts/adopt-existing.py
+    help: "Brownfield onboarding ceremony — inventory + draft, never apply (per DEC-037 §1). Inventories the live tracker through gh READS only (labels + usage, title-prefix patterns, open/closed + a Blocked convention, Projects-v2 fields, milestones), infers + DRAFTS a candidate substrate-map.yaml, and prints an AUDIT report showing the EVIDENCE for each inferred binding (with coverage/confidence signals) so the human's acceptance is informed, not reflexive. Self-checks the draft against substrate-map.schema.json. Mutates NOTHING — never writes the live map, never edits a label/field/issue, never installs. --out writes the DRAFT to a review file (refuses the live map path); --json emits the inventory+inferences+draft+schema-check machine-readably."
+  add-member:
+    script: scripts/add-member.py
+    help: Add a member to the team-membership roster (per DEC-021). Open mode allows self-add; closed mode requires invoker to be a current member.
+  remove-member:
+    script: scripts/remove-member.py
+    help: Remove a member from the team-membership roster (per DEC-021). Removal landing requires PR review per DEC-021.
+  show-members:
+    script: scripts/show-members.py
+    help: Show the current team-membership roster and resolved invoker identity (read-only).
+  set-instance:
+    script: scripts/set-instance.py
+    help: "Set (or --show / --clear) this clone's numeric instance id — the opt-in, per-clone activation gate for instance ownership (DEC-035). Writes a git-ignored runtime file; a clone with no id set behaves as a single-clone repo. Refuses a number where the default branch holds a topology of seats, whose clones are numbered by their seats (DEC-059 point 6), and where the default branch cannot be resolved; --show also names the seat the clone took."
+  create-seats:
+    script: scripts/create-seats.py
+    help: "Run on the change that adds seats to the topology (DEC-059 point 3): creates the state issue of each seat in project/topology.yaml that names none and is not retired, and writes its number into the file in the working tree, each as soon as it exists. Idempotent: a seat that names its state issue is left alone, and a state issue an earlier run created, or left half done, is found by its marker among the open issues and its number written. Who may write on a state issue comes from the members of the default branch; a run that cannot resolve the default branch creates nothing. Refuses a file with other problems check-topology reports. --dry-run prints the plan; asks before creating unless --yes."
+  check-topology:
+    script: scripts/check-topology.py
+    help: "Check project/topology.yaml against the topology of the default branch, or of --base (DEC-059 points 1 to 3), and say which commit it read. Fails on a shape the schema refuses, a seat name used twice, more than one organizer seat, a seat with no state issue or two naming one, a scope naming an undeclared workstream or type, a seat naming a pool the topology does not declare, pools on a seat where none are declared or on a planner's seat (DEC-061 point 10), the label ownership substrate, a seat of the base deleted or moved rather than retired, and a base that cannot be resolved while the working tree holds a topology. A check of a change, read-only and offline."
+  take-seat:
+    script: scripts/take-seat.py
+    help: "Take a seat of the topology the default branch holds for this clone (DEC-059 point 4): the seat named, or the first free one, of --role where given, and only one that names the agent definition this session follows (--agent, or $PKIT_AGENT). A claim on the seat's state issue, whose first claim on a free seat holds; prints the commit read, and the seat's name, number, role and agent definition. A clone holds at most one seat: it takes up the one it holds, and releases a retired one first. Takes no seat where the default branch cannot be resolved, or the seat's state issue is not named or cannot be read, and exits 2 where this code cannot read the topology in full (DEC-061 point 9). Where the topology declares pools of workers, shows each pool's open milestones and warns of stranded work (DEC-061 point 10). --dry-run prints the plan."
+  release-seat:
+    script: scripts/release-seat.py
+    help: "Release the seat this clone holds, or <name> --force --reason \"<why>\" a seat whoever holds it, the reason logged on its state issue (DEC-059 point 5). A release by force comes from the organizer seat's clone, or from a person, at a terminal or with --yes. A release frees every claim of the seat's clone, with no write to those issues. No seat is freed for silence: the tolerant mode is the only one built. A release by force exits 2 where this code cannot read the topology in full (DEC-061 point 9). --dry-run prints the plan."
+  seats:
+    script: scripts/seats.py
+    help: "List the seats of the topology the default branch holds, and say which commit it read (DEC-059 point 3): each seat's number, name, role, agent definition, scope, organizer or retired mark, state issue and holder, read from its state issue, with the seat this clone holds marked. Then names each open state issue of a seat that no seat names, for a person to close. Last names each Task in Review a released seat left, under the seat and the clone whose claim stopped counting, with the open pull request from its branch, for a person to land or to hand over (DEC-059 points 5 and 9). Where the topology declares pools of workers, shows each pool's open milestones, warns of stranded work, and counts the Tasks in Backlog in no pool and those each seat owns outside its pools (DEC-061 point 10). Warns where this code cannot read the topology in full."
+  decline-use-case-task:
+    script: scripts/decline-use-case-task.py
+    help: "Keep (or --show [--json] / --clear) the answer that declined the Task to author the use cases over an empty use-case set (DEC-054 point 5). Batch planning in this checkout then leaves the Task out until the next calendar day, in the machine's local time. Writes the time of the answer to a git-ignored runtime file; --show is read-only."
+  create-issue:
+    script: scripts/create-issue.py
+    help: File a new issue (per DEC-020). Composes title + body from the type's template, applies classification labels, optionally adds to the configured Projects v2 board. Links the issue parent — --parent, or else the EPIC / Feature / Umbrella the body's first line names — as a native sub-issue (per DEC-005 / DEC-039), refusing a --parent that disagrees with the first line. Refuses a non-feature --kind on an epic/feature/umbrella up front (the DEC-011 kind/structural hard-reject). --from-report <N> auto-links the new issue into feedback/CR #N's Tracked by via the backbone's `pkit report link` (per DEC-048; link failure warns + exits 4, never rolls back). A Task filed with --milestone into a Milestone of a pool of workers asks the person, at a terminal or --yes on their word, and its audit comment records the consent (DEC-061 point 6).
+  link-parent:
+    script: scripts/link-parent.py
+    help: "Link existing issues natively under the parent their body's first line names (per DEC-005 / DEC-039): one or more issue numbers, or --all-open. Reports per issue — would link, already linked, milestone parent, no parent line, parent not found or closed — and a summary. Idempotent (an existing link is never re-posted); --dry-run changes nothing; asks before linking unless --yes (a non-interactive run without --yes refuses). Textual containment mode links nothing and refreshes the named parents' children views instead."
+  create-milestone:
+    script: scripts/create-milestone.py
+    help: "File a new Milestone in a declared category (per DEC-016). Computes the next number from existing milestones; composes title from category's title_format; posts to GitHub with the `Close trigger:` body line. --pool <name> puts it into a pool of workers the topology declares, by a `Pool:` line, with the person's consent at a terminal or --yes on their word, logged in its description (DEC-061)."
+  set-pool:
+    script: scripts/set-pool.py
+    help: "Set (<milestone> <pool>) or clear (<milestone> --clear) the pool of workers an open Milestone is in, by the `Pool:` line of its description, and so the pool of each Task in it (DEC-061 points 2 and 6). The pool is one the topology of the default branch declares. The person's act: asked at a terminal, or --yes on their word; off a terminal without it, refused. Replaces the line, never adds a second, reads the description again right before it writes, and logs the change and the consent in the description. --dry-run prints the plan."
+  close-milestone:
+    script: scripts/close-milestone.py
+    help: "Close a Milestone through the validated path (per DEC-016). Respects the close-trigger: content-based refuses while any child issue is open (unless --force, which leaves them on it); a date-based close, or an either one from its due date, rolls each open child forward — state kept, through edit-issue --milestone — to the Milestone's Rollforward target: line, else the next-numbered open Milestone of its category, or --target; closed children stay. No single target: nothing is moved or closed until you name one. Appends an audit line naming the target; a re-run finishes a rollforward a failed move cut short (exit 4); --dry-run lists every move. Where the topology declares pools of workers, the next-numbered is sought within the closing Milestone's pool, a target in another pool is named in the consent prompt, and a forced close names each Task it leaves in no pool (DEC-061 point 7)."
+  validate-issue:
+    script: scripts/validate-issue.py
+    help: Validate an existing GitHub issue against the methodology's body + classification rules — including the DEC-011 kind/structural cross-check (a non-feature type:* label on an epic/feature/umbrella). Findings tagged by severity per validation-severity.yaml.
+  show-issue:
+    script: scripts/show-issue.py
+    help: Show the methodology-relevant view of a GitHub issue (read-only). Surfaces type, classification, assignees, state, parent-ref, required-section summary.
+  history:
+    script: scripts/history.py
+    help: "Render an issue's engine journal — the canonical pkit-governed audit trail — so the state log is discoverable (per DEC-049). --check-drift diffs the journal against the GitHub timeline's state-label events and flags ungoverned changes (the governance boundary). Read-only."
+  assign-issue:
+    script: scripts/assign-issue.py
+    help: Reassign a GitHub issue. Supports --me self-assignment, --assignee for single/multi assignment, --unassign for removal (per DEC-019).
+  move-issue:
+    script: scripts/move-issue.py
+    help: Transition an issue through the lifecycle state machine (per DEC-006). Reads workflow.yaml; cascades parents upward on forward moves. Moves an issue nobody is working on back from In Progress, to backlog in a milestone or todo in none, on the person's authorisation and with --reason, posted before the move; it releases the owner's claim, and refuses an owner this clone cannot release, a container with a child In Progress or in Review, and a state the board carries. Where the substrate map binds the state to the board, reads an open issue's position from its card's Status, refuses a move the Status does not place (DEC-051 point 6), and writes the Status as the move, the cascade each parent's; a write that fails leaves the move unmade (exit 3). Where a board is configured and the map carries the state off it, writes the card's Status to the issue's new state, and the cascade each parent's; a write that fails is one line, and the move stands.
+  sync-board:
+    script: scripts/sync-board.py
+    help: "Write the board's Status again from every issue's state, the projection DEC-006 has the agent maintain, where a board is configured and the substrate map carries the state off it. Refuses, saying which, where the map binds the state to the board or a present map leaves it out (DEC-062 point 5). Reads each issue's state as the lifecycle does (closed is Done; else its state label, its milestone or neither), writes the Status only on the cards that differ, adds a card for each open issue that has none, and names each card whose Status disagreed: the issue's state wins. Names each of the five states the board's Status offers no option for. Leaves alone the cards of other repositories, pull requests and drafts. --dry-run prints the plan; asks before writing unless --yes, and a run with no terminal and no --yes refuses."
+  close-issue:
+    script: scripts/close-issue.py
+    help: Close an issue per DEC-006's closure paths. Default mode is wont-do (reason + checkbox close-gate per DEC-007); pr-merge mode runs the post-close cascade on an issue GitHub closed and refuses an open one, and with --pr <M> closes an open leaf as completed through merged PR M (verified merged and related to the leaf by its body's closing reference or the leaf's branch, checkbox-gated, reference commented). completed mode closes a Task whose work was not a pull request as completed, on the person's authorisation, once every checkbox is ticked (not skippable), posting where the result lives (--result, required), then brings each ancestor behind up to In Progress through move-issue before the closure cascade; a Task in Review and anything but a Task are refused.
+  reopen-issue:
+    script: scripts/reopen-issue.py
+    help: Reopen a closed issue and put it back into the lifecycle — its state label is removed, so it reads as backlog (milestone set) or todo; optionally records an audit reason as a comment. Also repairs an open issue still labelled done.
+  edit-issue:
+    script: scripts/edit-issue.py
+    help: Methodology-aware body / title / milestone edit. Validates the new state against body-format.yaml + titles.yaml before writing; refuses on hard-reject unless --force. --milestone <number|title> attaches the issue to an OPEN milestone or moves it to another (the first-line milestone ref follows) and --clear-milestone detaches it — with --reason, recorded in an audit comment, and only for an issue type that may carry a milestone; a milestone edit that would move the issue in the lifecycle is refused. Bringing a Task into a pool of workers, or moving it between pools, asks the person, at a terminal or --yes on their word, and records the consent in that audit comment (DEC-061 point 6).
+  check-criterion:
+    script: scripts/check-criterion.py
+    help: "Tick one or more acceptance-criterion checkboxes on an issue — or, with --section doc-impact, `## Doc impact` checkboxes — addressed by 1-based index with an optional expected-text guard (per DEC-038). Batch-capable; validates the whole batch up front and refuses before any mutation on a hard inconsistency (out-of-range / text-mismatch / ambiguous guard); idempotent on re-run."
+  uncheck-criterion:
+    script: scripts/uncheck-criterion.py
+    help: "Untick one or more acceptance-criterion checkboxes on an issue (or, with --section doc-impact, `## Doc impact` checkboxes) — the symmetric counterpart to check-criterion (per DEC-038). Same index + optional-text-guard addressing, validate-up-front whole-batch hard-reject, and idempotent recovery."
+  set-field:
+    script: scripts/set-field.py
+    help: "Declaratively set an issue's kind / priority / workstream / parent classification field(s) in one batch call (per DEC-038). Reuses create-issue's classification resolution (substrate-map-aware); --kind applies to kind-driven (Task) issues — swaps the type:* label and realigns the title prefix — and refuses a non-feature kind on epic/feature/umbrella (DEC-011); validates up front and refuses before any mutation on an unknown value; idempotent on re-run."
+  open-pr:
+    script: scripts/open-pr.py
+    help: "Open a GitHub PR per the methodology's branch + title conventions. The closing issue is the positional <N> (as review-work / done-work take it) or --closes <N>, else the branch name's <N>; --closes repeats (one PR can close several issues, each with its own Closes #N line). The title is composed as <type>(<scope>): <summary> — <type> from --type or the primary issue's type:* label, <scope> from --scope, <summary> (the description part) from --summary or the issue title."
+  merge-pr:
+    script: scripts/merge-pr.py
+    help: Merge a PR per git-conventions.yaml's merge convention — one squash commit titled after the PR, head branch deleted on merge (remote ref via the API; local cleanup best-effort). Enforces the DEC-007 checkbox close-gate on every closing issue + the PR body. Where the base merges through a queue it enqueues instead and waits for the merge before the after-merge hooks fire (--wait-minutes; --no-wait returns at once, exit 4); a later run completes a PR the queue merged.
+  close-pr:
+    script: scripts/close-pr.py
+    help: Close a PR without merging; optionally records an audit reason and deletes the source branch.
+  reopen-pr:
+    script: scripts/reopen-pr.py
+    help: Reopen a closed (unmerged) PR. Merged PRs are refused.
+  validate-pr:
+    script: scripts/validate-pr.py
+    help: Validate a PR's title (Conventional Commits + type alignment with closing issues) and body (Closes #N, Doc impact section) per titles.yaml + git-conventions.yaml.
+  edit-pr:
+    script: scripts/edit-pr.py
+    help: Methodology-aware edit of a PR's body or title. Validates new state before writing; refuses on hard-reject unless --force. --closes <N> (repeatable) adds a Closes #N line for each named issue the body does not already close.
+  show-pr:
+    script: scripts/show-pr.py
+    help: Read-only view of a GitHub PR — title parse, state, branches, closing issues, reviewers, doc-impact section presence, and the latest DEC-028 reviewer verdict(s) (--field review surfaces the verdict token + reasons through the governed read path).
+  comment-issue:
+    script: scripts/comment-issue.py
+    help: "Post a freeform comment on an issue through the validated path (per DEC-047). Membership + foreign-repo guarded; mutates no lifecycle state. Refuses a body whose first line would impersonate a structured comment (a DEC-028 verdict / `Approved`-prefix / audit template) so a note cannot spoof the merge gate."
+  comment-pr:
+    script: scripts/comment-pr.py
+    help: "Post a freeform comment on a PR through the validated path (per DEC-047). Membership + foreign-repo guarded; mutates no lifecycle state. Refuses a body whose first line would impersonate a structured comment (a DEC-028 verdict / `Approved`-prefix / audit template) so a note cannot spoof the merge gate."
+  show-tree:
+    script: scripts/show-tree.py
+    help: PM-operational diagnostic. Walks the hierarchy (EPICs → Features/Umbrellas → Tasks → PRs) and reports orphans. Text / JSON / markdown output.
+  add-workstream:
+    script: scripts/add-workstream.py
+    help: Add a workstream to project/workstreams.yaml (per DEC-018). Validates slug; for label-substrate adopters, creates the workstream:<slug> label.
+  show-workstream:
+    script: scripts/show-workstream.py
+    help: Read-only view of one workstream entry (resolves from workstreams.yaml or config.yaml legacy fallback).
+  context-workstream:
+    script: scripts/context-workstream.py
+    help: "Report-context read verb (pkit ADR-050): print the current workstream — branch <type>/<N>-<slug> -> issue #N -> its workstream:* label — bare on stdout, or nothing when underivable. Read-only; exits 0 on success or when underivable, 2 when the capability is not bootstrapped (#747); invoked by the backbone's report compose through the dispatcher so the backbone never reads pm vocabulary itself."
+  list-workstreams:
+    script: scripts/list-workstreams.py
+    help: List every workstream — filterable by status (active/deprecated/all). Surfaces parse errors + duplicate-name warnings.
+  edit-workstream:
+    script: scripts/edit-workstream.py
+    help: Edit an existing workstream's name / description / status / deprecated_reason. Status flips require confirmation per DEC-018.
+  rename-workstream:
+    script: scripts/rename-workstream.py
+    help: Rename a workstream slug. Updates workstreams.yaml + renames the GitHub `workstream:<slug>` label (label-substrate adopters).
+  merge-workstream:
+    script: scripts/merge-workstream.py
+    help: Merge one or more loser workstreams into a survivor. Re-tags issues + deletes loser labels (label-substrate adopters).
+  split-workstream:
+    script: scripts/split-workstream.py
+    help: Split one workstream into 2–5 new slugs (per DEC-018). Default-retag opt-in via --default; without it, issues are flagged for manual retag.
+  remove-workstream:
+    script: scripts/remove-workstream.py
+    help: Remove a workstream. Refuses if any issue still uses the label unless --force. Type-the-slug confirmation prompt.
+  check-mesh:
+    script: scripts/check-mesh.py
+    help: Compare local methodology state against configured mesh peers per DEC-022. Surfaces drift in labels, capability version, members, milestones as warnings. Read-only.
+  check-doc-mapping:
+    script: scripts/check-doc-mapping.py
+    help: "Check a PR's documentation obligations (DEC-015 + DEC-053 + ADR-019): reads the resolved pkit::work-tracking:doc-check point — the code->doc mapping plus any contributed obligations — and applies it to the diff. Read-only; exits non-zero when an enforced obligation is unmet (the mapping with enforce: true; a contributed source set enforcing) or the point does not resolve. A mapping rule is met by its doc in the diff or a `## Doc impact` line naming the code path; a contributed obligation naming a page only by that page changed in the diff, and one naming only a path (code-undocumented) only by a page anchoring the path, which takes it out of the point. Wire as a required CI status check for a real boundary."
+  fill-doc-check:
+    script: scripts/fill-doc-check.py
+    help: "The default filler of the pkit::work-tracking:doc-check point (DEC-053): print the code->doc mapping as the point's obligations, one per rule; --json prints the filler envelope the backbone reads. A query: read-only, offline, no parameter; `pkit sync` provisions its dependency."
+    query-contract: true
+  promote-issue:
+    script: scripts/promote-issue.py
+    help: "Workflow wrapper (DEC-026): Todo → Backlog with milestone + audit comment. Composes over move-issue. Scheduling a Task into a Milestone of a pool of workers asks the person, at a terminal or --yes on their word, and the audit comment records the consent (DEC-061 point 6)."
+  start-work:
+    script: scripts/start-work.py
+    help: "Workflow wrapper (DEC-026): Backlog → In Progress. Creates branch + sets assignee; composes over move-issue. A clone that holds a seat starts no work where this code cannot read the topology in full: it says what it did not understand, writes nothing, and exits 2 (DEC-061 point 9). Where the topology declares pools of workers, it warns of a Task outside the pools of a seat that builds, or one whose Milestone's pool cannot be read, and starts it as directed: a warning, never a gate (DEC-061 point 5)."
+  next-task:
+    script: scripts/next-task.py
+    help: "Take the next ready Task from the shared pool (DEC-059 point 7) and start it, claimed, through start-work. Ready: an open Task in Backlog, with no owner and not assigned to another account, whose ## Dependencies section names no open issue by #N, or, in a project with a topology, a Task In Progress whose claim no longer counts. This clone's own Tasks in Backlog come first, then the shared pool, each the highest in priority first (DEC-012), then the lowest number, within the scope of the seat this clone holds; a clone with no seat, or a planner's seat, takes nothing in a project with a topology. Where another instance claims the Task first, the first claim holds, and this clone takes the next ready Task. --dry-run says which it would start; asks before starting unless --yes. Exit 5 when no Task is ready. Where the topology declares pools of workers, a seat takes only ready Tasks whose native milestone is an open milestone of a pool it serves; milestones that cannot be read take nothing (exit 3), and exit 5 says why in terms of the seat's pools (DEC-061 points 5 and 8). Where the substrate map binds the state to the board, each Task's state is its card's Status, read once from the cards of the open issues listed and no others: a Task it does not place is skipped with a warning, and a board that cannot be read takes nothing (exit 3, DEC-051 point 6). Code that cannot read the topology in full takes nothing (exit 2)."
+  create-draft:
+    script: scripts/create-draft.py
+    help: "Workflow wrapper (DEC-026): opens a draft PR for an in-progress branch. No issue-state transition."
+  review-work:
+    script: scripts/review-work.py
+    help: "Workflow wrapper (DEC-026): In Progress → Review. Opens ready PR or flips draft→ready; assigns reviewers; composes over move-issue."
+  back-to-draft:
+    script: scripts/back-to-draft.py
+    help: "Workflow wrapper (DEC-026): flips a ready PR back to draft; dismisses prior APPROVED reviews. Issue stays in Review."
+  done-work:
+    script: scripts/done-work.py
+    help: "Workflow wrapper (DEC-026): Review → Done. Squash-merges PR via three-way approval gate (APPROVED review / Approved-prefix comment / --bypass); composes over move-issue. Where the base merges through a queue it enqueues instead, prints the PR's place and waits for the merge (as long as the queue estimates, at most 30 min; --wait-minutes; --no-wait returns at once, exit 4); a later run from any clone finds the PR merged and completes the close and cascade."
+  land-work:
+    script: scripts/land-work.py
+    help: "Land an issue's PR in one command (#1203), composing review-pr and done-work: pin the PR's head, wait for its checks (--wait-minutes, default 30; --no-wait reads once — no check reported yet is never green; a PR conflicting with its base stops at once), have the reviewers whose verdicts are not fresh for that head review it, then merge it through done-work. Where the project names the checks that start the review (review.agents.start_after_checks), a run without --yes or --no-wait starts the reviewers once those pass, and waits for the rest after them. Without --yes, off a terminal, it merges nothing: it runs done-work's gates as a dry run and stops on a `ready:` line giving the command that merges that head (--yes --expect-head <sha>; exit 8). That authorisation also covers a later head whose every change since lies inside answer files the change adds, a clean merge of the base counting as none (pkit friction since); it merges there only where nothing needs the person, and any other later head stops the run (exit 3). One line per step; one exit code per next action (README, \"Landing a pull request in one command\"); a re-run resumes. No flag skips the checks or the review."
+  handoff-issue:
+    script: scripts/handoff-issue.py
+    help: "Workflow wrapper (DEC-026): reassign an in-flight issue to a new owner. Audit comment records the handoff; no state transition."
+  review-pr:
+    script: scripts/review-pr.py
+    help: "Local-agent review (DEC-028): invokes every locally-registered agent against the PR diff and posts each verdict as a comment. Sibling to the DEC-026 lifecycle palette."
+  self-test:
+    script: scripts/self-test.py
+    help: "Smoke-test the capability's core transition cycle on the live repo. Creates a throwaway issue, advances it through the state machine, and closes it. Use --dry-run to preview without mutating."
+  detect-state:
+    script: scripts/detect-state.py
+    help: "Process classifier (DEC-033): read-only; answers which lifecycle state an issue is in, from one read of the issue — the detection every state of the shipped issue lifecycle names. The subject is an issue number, or owner/repo#<n> for a native sub-issue in another repository, read there by open/closed alone (closed is done). Invoked by the process engine."
+  detect-todo:
+    script: scripts/detect-todo.py
+    help: "Process detection predicate (DEC-033): read-only; reports whether an issue's inferred lifecycle position is Todo. Registered for direct use; the shipped lifecycle detects with `detect-state`."
+  detect-backlog:
+    script: scripts/detect-backlog.py
+    help: "Process detection predicate (DEC-033): read-only; reports whether an issue's inferred lifecycle position is Backlog. Registered for direct use; the shipped lifecycle detects with `detect-state`."
+  detect-in-progress:
+    script: scripts/detect-in-progress.py
+    help: "Process detection predicate (DEC-033): read-only; reports whether an issue's inferred lifecycle position is In Progress. Registered for direct use; the shipped lifecycle detects with `detect-state`."
+  detect-review:
+    script: scripts/detect-review.py
+    help: "Process detection predicate (DEC-033): read-only; reports whether an issue's inferred lifecycle position is Review. Registered for direct use; the shipped lifecycle detects with `detect-state`."
+  detect-done:
+    script: scripts/detect-done.py
+    help: "Process detection predicate (DEC-033): read-only; reports whether an issue's inferred lifecycle position is Done. Registered for direct use; the shipped lifecycle detects with `detect-state`."
+  gate-checkboxes-ticked:
+    script: scripts/gate-checkboxes-ticked.py
+    help: "Process gate predicate (DEC-033 / DEC-007): read-only deterministic close-gate; result=True iff the issue body has no unticked checkbox. Invoked by the process engine."
+  gate-pr-merged:
+    script: scripts/gate-pr-merged.py
+    help: "Process gate predicate (DEC-033): read-only authorisation-artifact; reports {exists, produced_by} for a merged PR closing the issue (the engine computes cross-authority). Invoked by the process engine."
+  parent-active-descendant:
+    script: scripts/parent-active-descendant.py
+    help: "Process predicate (DEC-033): read-only pm-local descendant walk; reports whether an issue has an in-progress-or-further child. Never used by the engine for position; consulted by cascade logic."
+  cascade-members:
+    script: scripts/cascade-members.py
+    help: "Cascade members source (DEC-034 / COR-037): read-only; returns {members: [...]} — every child of the parent issue (the closure-fold candidate set). Invoked by the process engine."
+  cascade-membership:
+    script: scripts/cascade-membership.py
+    help: "Cascade membership test (DEC-034 / COR-037): read-only; result=True for every candidate issue it can read, whatever its first line names — never a determinate non-member; indeterminate when the issue cannot be read. The subject is an issue number, or owner/repo#<n> for a native sub-issue in another repository, a member on the members list's word without a read. Invoked by the process engine, one subject at a time."
+  enable-default-agent:
+    script: scripts/enable-default-agent.py
+    help: "Activate the project-manager default-agent overlay for the claude-code harness (per DEC-030). Copies the capability-shipped overlay template to adopter-owned state and re-runs pkit sync."
+  disable-default-agent:
+    script: scripts/disable-default-agent.py
+    help: "Deactivate the project-manager default-agent overlay; strips the agent key from .claude/settings.json, removes the live overlay file, and re-runs pkit sync (per DEC-030)."
+  list-fixers:
+    script: scripts/list-fixers.py
+    help: "List the fixers the pkit::work-tracking:fixers point declares (DEC-056 point 1) — which agent fixes the artefacts of each type — with the project's answer for each from the grant list (`fixers` in project/config.yaml): granted, refused or not asked. An entry that fails a check says why its agent starts no agent, and a grant no entry names is listed with the command that revokes it. --json prints one document. Read-only. Exit 1 when the point does not resolve or the grant list cannot be read."
+  grant-fixer:
+    script: scripts/grant-fixer.py
+    help: "Grant a fixer (DEC-056 point 2): `grant-fixer <agent> [--type <type>]...` records in the grant list that the agent may start on its own on the stale artefacts of every type the fixers point gives it, or only the types named. Running it is the person's answer yes. Refuses an agent no entry names and a type the point does not give it; notes a granted type whose entry fails a check. The change shows in the project's diff and counts once it merges into the default branch. --dry-run writes nothing, and refuses where the configuration does not exist, as a real run does."
+  revoke-fixer:
+    script: scripts/revoke-fixer.py
+    help: "Revoke a fixer (DEC-056 point 2): `revoke-fixer <agent> [--type <type>]...` records a refusal for every type the fixers point gives the agent and every type it is granted, or only the types named, so nothing asks about them again. Works on the grant list alone while the point does not resolve. --dry-run writes nothing, and refuses where the configuration does not exist, as a real run does."
+  ask-fixers:
+    script: scripts/ask-fixers.py
+    help: "Ask, for each agent of the fixers point, whether it may start on its own on the types nobody was asked about (DEC-056 point 2), in words built from the declaration. At a terminal each answer is recorded in the grant list as it is given: yes a grant, no a refusal. With nobody at a terminal nothing is granted or recorded, and each question is printed with the one command line that grants its fixer. Exempt from the bootstrap gate, so install and upgrade can ask it."
+  check-fixers:
+    script: scripts/check-fixers.py
+    help: "The project-management:fixers validator (DEC-056 points 1 and 2): each entry of the fixers point and the grant list. An error for the project's own entry naming an agent that is not deployed, and for a grant list that cannot be read; a warning for the project's own entry naming an agent that claims paths, lists no tools (so the harness grants it every tool) or holds a tool that changes existing files or starts agents, and for a grant no entry names (with the command that revokes it); a report for a capability's entry naming a type not its own, an agent it does not ship or that is not deployed, such an agent, or coming through a command filler, and for a refusal in the grant list of a type no entry gives that agent, which asks nothing and starts nothing. --json prints the document validation reads. A query: read-only, offline."
+    query-contract: true
+  fix-drift:
+    script: scripts/fix-drift.py
+    help: "Start each granted fixer on what the default branch left out of date (DEC-056 points 3 to 6). Pins the default branch's commit and reads, in a detached copy of it, the whole-repository check, each artefact's type, the fixers point and the grant list. Dispatches only stale artefacts whose type's fixer is granted, upstream first, within a cap per fixer (--cap, $PKIT_DRIFT_CAP, 5), and lists every other artefact with its reason: deferred, not judged, no type or a tied one, no fixer or none granted, a name that could forge a line, an open pull request that changes it, a stale upstream, an answer that still stands. Each fixer starts through `pkit agents run`, confined to a clone at the commit under the rules of permissions/runs.yaml (ADR-066), at most --parallel at once, each within --timeout seconds ($PKIT_DRIFT_AGENT_TIMEOUT, 1800), with one brief: its frame, and each pull request behind the friction quoted as data. A start that failed for a cause outside the fixer's work is retried once. Reads each fixer's result lines and answers by the run's contract, sets a run aside on a breach, and gathers the proposals into the main working tree's agent workspace, under project-management/drift/, with an index. One run at a time, held by a lock; refuses inside an agent run. Asks the fixers question at a terminal first. --dry-run says what it would start and starts nothing; --force dispatches what stands."
+  show-proposals:
+    script: scripts/show-proposals.py
+    help: "Bring the fixers' proposals to the person in one batch (DEC-056 point 6): each with its evidence, its diff and its writer's command word for word, and each question a fixer held. Each is checked again at the default branch's commit first: one whose artefact is no longer stale, whose friction differs from what it was judged against, which was judged under another version of the run's contract, or whose files no longer read is set aside, never shown, and dispatched again by the next fix-drift. A question the person answered is listed, waiting for the next run."
+  apply-proposals:
+    script: scripts/apply-proposals.py
+    help: "Apply the fixers' proposals the person accepted to the change's branch (DEC-056 point 6): `apply-proposals <artefact>... [--because <artefact> <words>]... [--sentence <artefact> <sentence>]...`. Refuses, writing nothing, on the default branch or no branch, where an artefact's file differs from the default branch's, or where an `unchanged` answer's justification holds a placeholder and no --because gives the person's words. Checks each again at the default branch, then, upstream first, applies its diff and runs its writer, `pkit friction revalidate`, built from the answer's fields. A proposal that no longer holds, or whose diff no longer applies, is set aside and dispatched again; a writer that fails leaves the file as it was. Prints the sentences for the pull request's description. --dry-run checks and writes nothing. Exit 3 when some were applied and some were not."
+  refuse-proposals:
+    script: scripts/refuse-proposals.py
+    help: "Remember the person's refusal of a fixer's proposal or held question (DEC-056 point 6), against the artefact's friction, so fix-drift dispatches it again only once its friction changes. Removes each run's folder whose proposals were all accepted or refused. --dry-run writes nothing."
+  answer-question:
+    script: scripts/answer-question.py
+    help: "Record the person's answer to a question a fixer held, and who gave it (--by, default git's user.name), for the artefact's next brief (DEC-056 points 3 and 6). --dry-run writes nothing."
+# The `project-management:fixers` member of `pkit validate`: a component joins
+# validation by naming a command it registers (COR-055 point 3); the block's
+# keys are ADR-058's. It checks the fixers point's entries and the grant list
+# (DEC-056 points 1 and 2).
+validators:
+  fixers:
+    command: check-fixers
+
+# Connection points (COR-053): the role this capability provides and the data
+# points it defines under it. See the README, "Connections".
+connections:
+  roles: [pkit::work-tracking]
+  extension-points:
+    accepts:
+      pkit::work-tracking:doc-check:
+        schema_version: 1
+        schema: doc-check.schema.json
+        description: >-
+          The documentation obligations a pull request owes (DEC-053), before any
+          diff: check-doc-mapping applies them to the pull request's diff. Each
+          names its source and is met by that source's rule — a mapping rule by
+          its document in the diff or a Doc impact line naming the code path, any
+          other obligation naming a page only by that page changed in the diff,
+          and one naming only its code only by a page anchoring the code, once
+          its filler no longer gives it. Each source has its own enforcement
+          setting in this capability's project configuration; contributed
+          sources are advisory by default. Additive, so an obligation
+          leaves only through the project's removal override with its reason; a
+          filler that cannot answer leaves the point unresolved, and the check
+          fails rather than pass on fewer obligations.
+        combination: additive
+        inert: fail
+      pkit::work-tracking:use-cases:
+        schema_version: 1
+        schema: use-cases.schema.json
+        description: >-
+          The use cases settled on the default branch (DEC-054), one entry per
+          use case: its id, its title, `active` or `withdrawn`, and the path of
+          the document that describes it. Batch planning walks them before it
+          slices the work, and body validation warns of a use case an issue
+          body cites that they do not hold. A filler holds to four things: the
+          value holds every use case that ever settled, withdrawn ones
+          included, but not one whose id the project freed; an id, once
+          settled, names the same use case for good, unless the project
+          declares that nothing cites it — that use case may then leave the
+          value, and its id may later name a different use case; the answer
+          is complete or none — a filler that cannot read a use case gives no
+          answer, never a shorter list; and a capability's filler declares
+          that it reads settled state. Anything that keeps an id is citing
+          it. One keeper answers, and a project filler replaces its answer
+          whole. No default. Its readers
+          only report, so a filler that cannot answer is warned, and they say
+          the use cases could not be read.
+        combination: single
+        inert: fallback
+      pkit::work-tracking:fixers:
+        schema_version: 1
+        schema: fixers.schema.json
+        description: >-
+          Which agent fixes the artefacts of each type (DEC-056 point 1), one
+          entry per type: its id, the artefact type; the agent that proposes the
+          answers for the type's stale artefacts; and a description of what the
+          agent keeps true, in plain words, from which the question that asks
+          the person to grant the fixer is built. A capability's entry names a
+          type of its own and an agent it ships, as a static value, never
+          through a command filler. A project filler may replace an entry,
+          naming any deployed agent. Two capabilities that claim one type are an
+          error naming both. No default. A fixer starts on its own only where
+          the project granted it, in this capability's grant list, which is
+          empty by default. A filler that cannot answer leaves the point
+          unresolved, so no fixer starts. The version covers the run's
+          contract too, which each entry's agent follows: the brief, the
+          answer (fixer-answer.schema.json), the result lines and the none
+          reasons (DEC-056 points 1, 3 and 6).
+        combination: union
+        inert: fail
+        # Asked after an install or upgrade that reaches this point, where a
+        # person can answer (COR-061): one question for each fixer nobody was
+        # asked about (DEC-056 point 2).
+        question: ask-fixers
+  extensions:
+    contributes:
+      # The point's always-included default filler: the project's code-to-doc
+      # mapping, printed by this capability's own command, since the mapping is
+      # the project's configuration and a static `default` cannot hold it.
+      - point: pkit::work-tracking:doc-check
+        schema_version: 1
+        command: fill-doc-check
+        description: The code-to-doc mapping of project/config.yaml, one obligation per rule.

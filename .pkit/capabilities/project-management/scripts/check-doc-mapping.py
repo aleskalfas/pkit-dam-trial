@@ -1,0 +1,489 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "ruamel.yaml>=0.18",
+#   "pathspec>=0.12",
+# ]
+# ///
+"""Project-management capability — check-doc-mapping (verb-subject per DEC-020).
+
+Check a pull request's documentation obligations (DEC-015 + DEC-053 +
+ADR-019). The obligations are the resolved `pkit::work-tracking:doc-check` data
+point, read through the backbone (`pkit connections resolve <point> --json`),
+and this check applies them to the diff:
+
+- **The code->doc mapping** is the point's always-included default filler
+  (`fill-doc-check`, one obligation per rule). A mapping obligation is met
+  exactly as it always was: when the diff touches the rule's code, at least one
+  mapped doc is in the diff too — or a line in the PR's `## Doc impact`
+  section names the code path or the rule's glob.
+- **A contributed obligation** — from a documentation capability, or the
+  project's own filler file — that names a `document` is met only by the
+  page's answer in the diff: a changed file matches its `document`, or the
+  core change check (`pkit friction check --json`, run against the same base
+  as the gate runs it) lists an answer the change adds on the page — updated,
+  unchanged or deferred — that it accepts. A deferral the change rewrote, which
+  the change check lists as edited, meets the page where the change check counts
+  the deferral for its anchor and its reason names a follow-up that the host,
+  asked through `gh`, does not say is closed (COR-050 point 3). A follow-up the
+  host could not be asked about counts, with a warning, and the deferral's
+  reviewer checks it. The change check compares the base
+  with the head, the one squash commit the pull request lands as (DEC-013), so
+  an answer meets the obligation wherever it falls among the branch's commits:
+  a fix round that edits an anchor after the commit that answered for it
+  leaves the page stale at the head, as the whole-repository check reads the
+  branch, and not once it lands. Where the change check gives no list, the
+  check says why and meets the page only by its change in the diff.
+  One that names no `document` — a `code-undocumented` path — is met only by
+  leaving the point: its filler reads the branch's HEAD, so once a page anchors
+  the path it is no longer given. Still given, it is unmet, whatever else the
+  diff changed. A `## Doc impact` line meets neither.
+- **Unresolved means fail.** The point's inert policy is `fail`: when a filler
+  cannot answer, the point does not resolve and the check exits 1, naming the
+  filler and the fix, rather than pass on fewer obligations than it should.
+
+With no documentation capability installed the point holds the mapping's
+obligations alone, and the check prints and exits exactly as it did before the
+point existed.
+
+ADR-019 framing: this script is the capability-owned *mechanism* — a read-only
+check that exits non-zero on an unsatisfied mapping. The real *boundary* is the
+adopter wiring it as a required CI status check behind branch protection
+(`gh api` / a code runner such as `python3 -c` evade any tool-layer check, per
+ADR-004). At the merge-pr
+layer it is only a warning (a speed-bump). The capability ships the mechanism;
+the adopter wires the boundary; the residual gap is declared, not hidden.
+
+Configuration in `project/config.yaml` (opt-in, default off — ADR-019 Case A):
+  code_path_to_doc_mapping:
+    enforce: true            # default false -> advisory: report would-fire, exit 0
+    rules:
+      - code: "packages/cli/src/commands/registry.ts"   # gitignore-style glob
+        docs: ["packages/cli/README.md"]
+  doc_check:                 # DEC-053: each contributed source's own setting
+    sources:
+      friction: enforcing    # default advisory; the mapping keeps `enforce` above
+
+Use SURGICAL 1:1 couplings (a narrow surface file -> its reference doc). A broad
+`tree/** -> README` rule false-positives on most PRs (see the dry-run audit);
+keep those advisory (enforce: false) or don't map them. The mandatory
+`## Doc impact` section remains the universal hard gate; this adds targeted
+enforcement on couplings that genuinely move together.
+
+Diff source: the base — `--base <ref>`, else $PKIT_CHECK_BASE, else the
+default branch — and where HEAD left it, both as the backbone names them
+(`pkit repository base --json`, COR-054), so the check neither resolves a base
+nor computes a merge-base itself. A base that cannot be compared refuses the
+check with the backbone's reason and fix, as the friction change check does; a
+check with no rules and no obligations compares nothing and reads no base.
+Changed files come from `git diff --name-only --diff-filter=ACMRT <fork> HEAD`
+— added/copied/modified/renamed/type-changed; a *deletion* of a code file does
+not demand a doc.
+
+Override (bypassable-with-audit): a line in the PR body's `## Doc impact`
+section that names the triggering code path (or the rule's code glob) marks that
+mapping rule satisfied — a human-visible, reviewed reason, not a silent skip.
+It overrides mapping rules only. PR body from `--pr-body-file <path>` or,
+failing that, `gh pr view` resolved from the current branch. The project may
+also remove an obligation from the point with a reason (the removal override of
+its filler file); the check prints each one removed.
+
+Exit codes:
+  0  every enforced obligation met (or enforcement off / nothing to check)
+  1  an enforced obligation unmet (the mapping with enforce on; a contributed
+     source set enforcing), the doc-check point does not resolve, or the
+     base cannot be compared
+  2  usage error (bad config, git failure, the point unreadable)
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+import pathspec
+
+_HERE = Path(__file__).parent
+sys.path.insert(0, str(_HERE))
+from _lib import bootstrap_gate, default_branch, doc_check, friction_answers
+from _lib.escaped_output import escaping
+from _lib.gh import gh_run, load_adopter_config
+from _lib.membership import (
+    CAPABILITY_NAME,
+    resolve_capability_root,
+)
+
+
+def _changed_files(fork: str) -> list[str] | None:
+    """Non-deleted files changed between `fork` — where HEAD left the base — and HEAD."""
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=ACMRT", fork, "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        print("error: git not found.", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(
+            f"error: git diff from {fork[:12]} failed: {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _doc_impact_section(body: str) -> str:
+    """Return the text of the PR body's `## Doc impact` section (lowercased), read
+    without a list of the answers an earlier run left, which overrides no mapping
+    (DEC-065 point 1)."""
+    if not body:
+        return ""
+    lines = friction_answers.strip(body).splitlines()
+    out: list[str] = []
+    capture = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("## "):
+            if capture:
+                break  # next section ends Doc impact
+            capture = stripped.lower().startswith("## doc impact")
+            continue
+        if capture:
+            out.append(line)
+    return "\n".join(out).lower()
+
+
+def _pr_body(args: argparse.Namespace, config: dict) -> str:
+    if args.pr_body_file:
+        try:
+            return Path(args.pr_body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"warn: could not read --pr-body-file: {exc}", file=sys.stderr)
+            return ""
+    # Resolve the PR body from the current branch (CI / local). Best-effort:
+    # if there is no PR, overrides simply aren't available.
+    proc = gh_run(["gh", "pr", "view", "--json", "body", "-q", ".body"], config, check=False)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout or ""
+
+
+def _matches(glob: str, path: str) -> bool:
+    """gitignore-style match of a single glob against a single path."""
+    spec = pathspec.PathSpec.from_lines("gitignore", [glob])
+    return spec.match_file(path)
+
+
+def _answered(base: str, config: dict) -> dict[str, str]:
+    """The pages the change's answers meet the obligation of, each with the file that
+    holds its answer, from the change check against `base` as the gate runs it
+    (DEC-053 point 2). The check compares the base with the head, the one squash
+    commit the pull request lands as (DEC-013), so an answer meets the obligation
+    wherever it falls among the branch's commits. A deferral the change rewrote meets
+    it where the check counts it and its follow-up is open, as the host says
+    (`_follow_up_state`). Where the check gives no list, it says why and meets none:
+    never a pass on an answer it could not read."""
+    derived = friction_answers.written(base)
+    if derived.problem is not None:
+        print(
+            "warn: the change check gives no list of the answers this change adds, so a "
+            f"page is met only by its change in the diff: {derived.problem}",
+            file=sys.stderr,
+        )
+        return {}
+    findings = (derived.document or {}).get("findings")
+    return doc_check.answer_files(
+        derived.answers,
+        [f for f in findings if isinstance(f, dict)] if isinstance(findings, list) else [],
+        _follow_up_state(config),
+    )
+
+
+#: How long the host may take to say whether a follow-up is open.
+GH_TIMEOUT = 60
+
+
+def _follow_up_state(config: dict) -> doc_check.OpenFollowUp:
+    """Whether a follow-up a rewritten deferral names is open, as the host answers
+    through `gh` (DEC-023), each asked once a run. None where the host could not be
+    asked, such as with no `gh`, no token or no network, which a warning says: the
+    deferral then counts on its words, and its reviewer checks the follow-up is open
+    (COR-050 point 3). Any failure of `gh` counts as not asked, a number that is no
+    issue included, since its exit code does not tell them apart."""
+    states: dict[doc_check.FollowUp, bool | None] = {}
+
+    def state(follow_up: doc_check.FollowUp) -> bool | None:
+        if follow_up not in states:
+            states[follow_up] = _ask_host(follow_up, config)
+        return states[follow_up]
+
+    return state
+
+
+def _ask_host(follow_up: doc_check.FollowUp, config: dict) -> bool | None:
+    repo = ["--repo", follow_up.repo] if follow_up.repo else []
+    argv = ["gh", "issue", "view", str(follow_up.number), *repo, "--json", "state"]
+    try:
+        proc = gh_run([*argv, "--jq", ".state"], config, check=False, timeout=GH_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        why = f"`gh` could not be run: {exc}"
+    else:
+        if proc.returncode == 0:
+            return proc.stdout.strip() == "OPEN"
+        said = (proc.stderr or "").strip().splitlines()
+        why = f"`gh issue view` exited {proc.returncode}" + (f": {said[-1]}" if said else "")
+    print(
+        f"warn: could not ask whether {follow_up} is open ({why}); a rewritten deferral "
+        "naming it counts on its words, and its reviewer checks the follow-up "
+        "(COR-050 point 3).",
+        file=sys.stderr,
+    )
+    return None
+
+
+@escaping
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Check the code->doc mapping (DEC-015 + ADR-019). Read-only. "
+            "Exits non-zero on an unsatisfied enforced mapping; the real "
+            "boundary is wiring this as a required CI status check."
+        ),
+    )
+    parser.add_argument(
+        "--base",
+        default=None,
+        help=(
+            "Base ref to diff HEAD against (default: $PKIT_CHECK_BASE, else the "
+            "default branch — `pkit repository base` shows it, COR-054)."
+        ),
+    )
+    parser.add_argument(
+        "--pr-body-file",
+        default=None,
+        help="File containing the PR body (override source). Default: gh pr view.",
+    )
+    parser.add_argument(
+        "--capability-root",
+        type=Path,
+        default=None,
+        help=f"Default: <repo-root>/.pkit/capabilities/{CAPABILITY_NAME}/.",
+    )
+    args = parser.parse_args()
+
+    capability_root = resolve_capability_root(args.capability_root)
+    if capability_root is None:
+        print(f"error: {CAPABILITY_NAME} capability not found.", file=sys.stderr)
+        return 2
+
+    # Prerequisite gate (#747): refuse on an un-bootstrapped project rather
+    # than operating on assumed defaults. See _lib/bootstrap_gate.py.
+    if not bootstrap_gate.enforce("check-doc-mapping", capability_root=capability_root):
+        return 2
+
+    config = load_adopter_config(capability_root)
+    mapping = config.get("code_path_to_doc_mapping") or {}
+    if not isinstance(mapping, dict):
+        print(
+            "error: code_path_to_doc_mapping must be a mapping with "
+            "`enforce:` and `rules:` (per ADR-019).",
+            file=sys.stderr,
+        )
+        return 2
+    enforce = bool(mapping.get("enforce", False))
+    rules = mapping.get("rules") or []
+    settings, settings_problem = doc_check.source_settings(config)
+    if settings_problem is not None:
+        print(f"error: {settings_problem}", file=sys.stderr)
+        return 2
+
+    # The obligations: the resolved doc-check point (DEC-053) — the mapping's,
+    # as the default filler printed them, and whatever else fills the point.
+    try:
+        point = doc_check.read_point()
+    except doc_check.PointUnreadable as exc:
+        print(f"error: could not read the {doc_check.POINT} point: {exc}.", file=sys.stderr)
+        return 2
+    obligations = doc_check.split(point, CAPABILITY_NAME)
+    if not point.resolved or obligations.problems:
+        _report_unresolved(point, obligations.problems)
+        return 1
+    contributed = obligations.contributed
+    if not rules and not obligations.mapping and not contributed:
+        print("check-doc-mapping: no rules configured; skipped.")
+        return 0
+
+    try:
+        base = default_branch.check_base(args.base)
+    except default_branch.Unanswered as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if base.problem is not None or base.fork is None:
+        why = base.problem or f"the base {base.ref!r} cannot be compared."
+        print(f"error: {why}", file=sys.stderr)
+        return 1
+    changed = _changed_files(base.fork)
+    if changed is None:
+        return 2
+    changed_set = set(changed)
+
+    section = _doc_impact_section(_pr_body(args, config))
+
+    mode = "enforce" if enforce else "advisory"
+    print(f"check-doc-mapping: {len(rules)} rule(s), {len(changed)} changed file(s), mode={mode}")
+    if contributed:
+        print(
+            f"check-doc-mapping: {len(contributed)} contributed obligation(s) from "
+            f"{', '.join(doc_check.sources_of(contributed))}"
+        )
+
+    unsatisfied: list[str] = []
+    for obligation in obligations.mapping:
+        code_glob = str(obligation["code"])
+        docs = obligation["documents"]
+        triggered = sorted(f for f in changed if _matches(code_glob, f))
+        if not triggered:
+            continue  # this rule's code surface wasn't touched
+        doc_touched = any(any(_matches(str(d), f) for f in changed_set) for d in docs)
+        if doc_touched:
+            print(f"  ✓ {code_glob} → doc updated")
+            continue
+        # Override: the Doc-impact section names the glob or a triggering file.
+        overridden = bool(section) and (
+            code_glob.lower() in section or any(t.lower() in section for t in triggered)
+        )
+        if overridden:
+            print(f"  ⊘ {code_glob} → overridden via `## Doc impact` (audited)")
+            continue
+        docs_str = ", ".join(str(d) for d in docs)
+        print(f"  ✗ {code_glob} → {docs_str} (not updated; e.g. {triggered[0]})")
+        unsatisfied.append(code_glob)
+
+    # Contributed obligations. One naming a page is met by the page's answer in
+    # the diff: the page changed, or the change check lists an answer the change
+    # adds on it, which it accepts. One naming none is met only by leaving the
+    # point: the filler read HEAD, so an obligation still here is unmet, however
+    # much else the diff changed. The `## Doc impact` section is not read.
+    unanswered: dict[str, int] = {}
+    unanchored: dict[str, int] = {}
+    answered: dict[str, str] | None = None  # read once, at the first page left to meet
+    for obligation in contributed:
+        source = str(obligation["source"])
+        reason = obligation["reason"]
+        if "document" not in obligation:
+            path = str(obligation["path"])
+            print(
+                f"  ✗ [{source}] {path} → no page anchors it ({reason}); "
+                f"anchor `{path}` from a page"
+            )
+            unanchored[source] = unanchored.get(source, 0) + 1
+            continue
+        page = str(obligation["document"])
+        if any(_matches(page, f) for f in changed_set):
+            print(f"  ✓ [{source}] {page} → answered in the diff")
+            continue
+        if answered is None:
+            answered = _answered(base.ref, config)
+        # The answer's location is the page's exactly: read as a pattern, `README.md`
+        # would take an answer on any README in the tree for the root's.
+        file = answered.get(page)
+        if file is not None:
+            print(f"  ✓ [{source}] {page} → answered in the diff ({file})")
+            continue
+        print(f"  ✗ [{source}] {page} → no answer in the diff ({reason})")
+        unanswered[source] = unanswered.get(source, 0) + 1
+
+    for obligation_id, reason in doc_check.removed(point):
+        print(f"  − {obligation_id} → removed by the project filler: {reason}")
+
+    if not unsatisfied and not unanswered and not unanchored:
+        print(
+            "check-doc-mapping: all touched mappings satisfied."
+            if not contributed
+            else "check-doc-mapping: every obligation met."
+        )
+        return 0
+
+    failed = False
+    if unsatisfied and enforce:
+        print(
+            f"\n[refused] {len(unsatisfied)} mapping(s) unsatisfied — update the "
+            "mapped doc(s), or add a `## Doc impact` line naming the code path.",
+            file=sys.stderr,
+        )
+        failed = True
+    elif unsatisfied:
+        print(
+            f"\n[advisory] {len(unsatisfied)} mapping(s) would fire under enforce: true. "
+            "Set code_path_to_doc_mapping.enforce: true (with surgical rules) to block.",
+            file=sys.stderr,
+        )
+    # Per source, its pages' obligations, then its paths'; each source on its setting.
+    unmet = [
+        (source, count, "unanswered", "answer each on its page in this diff")
+        for source, count in unanswered.items()
+    ] + [
+        (source, count, "unanchored", "anchor each path from a page")
+        for source, count in unanchored.items()
+    ]
+    for source, count, state, fix in sorted(unmet, key=lambda entry: entry[0]):
+        if doc_check.setting_of(settings, source) == doc_check.ENFORCING:
+            print(
+                f"\n[refused] {count} {source} obligation(s) {state} — {fix}; "
+                "a `## Doc impact` line does not meet them.",
+                file=sys.stderr,
+            )
+            failed = True
+        else:
+            print(
+                f"\n[advisory] {count} {source} obligation(s) {state}. Set "
+                f"doc_check.sources.{source}: enforcing to block.",
+                file=sys.stderr,
+            )
+    return 1 if failed else 0
+
+
+def _report_unresolved(point: doc_check.ResolvedPoint, problems: list[str]) -> None:
+    """The point does not resolve, or an entry breaks the source rule: the check
+    cannot see every obligation it should, so it fails rather than pass on fewer
+    (DEC-053, the `fail` inert policy). Names each inert filler and its fix."""
+    what = (
+        f"does not resolve: {point.why}"
+        if not point.resolved
+        else f"carries what the check refuses: {'; '.join(problems)}"
+    )
+    print(
+        f"[unresolved] the {doc_check.POINT} point {what}. The check cannot see every "
+        "obligation it should, so it fails rather than pass on fewer (DEC-053).",
+        file=sys.stderr,
+    )
+    for filler in point.inert:
+        name = str(filler.get("name", ""))
+        print(
+            f"  inert: {name} ({filler.get('supplies', '')}): {filler.get('reason', '')}",
+            file=sys.stderr,
+        )
+        if name == CAPABILITY_NAME:
+            print(
+                f"  fix: run `pkit pm {doc_check.FILLER_VERB}` to see why it gives no "
+                "answer; when its environment is not provisioned, `pkit sync` "
+                "provisions it for the offline run.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  fix: update {name}, pin it, or uninstall it.", file=sys.stderr)
+    if not point.inert:
+        print(
+            "  fix: `pkit validate` names the finding (its `connections` member).",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

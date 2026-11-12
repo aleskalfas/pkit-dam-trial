@@ -1,0 +1,1733 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "ruamel.yaml>=0.18",
+# ]
+# ///
+"""Project-management capability — create-issue (verb-subject per DEC-020).
+
+Files a new issue against the methodology's body shape: validates the
+type, checks the title against `titles.yaml`'s per-type rules,
+composes the body from the matching `templates/<Type>.md`, applies the
+classification axes (type:*, priority:*, workstream:* per
+`classification.yaml`), and posts the issue via `gh issue create`.
+
+An issue parent — `--parent`, or when that is absent the EPIC / Feature /
+Umbrella the body's first line names — is also set as GitHub's native
+sub-issue parent (DEC-005), subject to the substrate-map's `containment`
+selector (DEC-039). `--parent` and a first line naming a different issue are
+refused before anything is filed.
+
+Before anything is written, `--dry-run` included, the body is checked against
+`body-format.yaml` (DEC-010) by the reader validate-issue shares
+(`_lib/body_rules`): a body that lacks a section its type requires, or holds a
+heading of the first level, is refused, and a rule that only warns is reported.
+
+A Feature or Task body given with `--body-file` that cites use cases in its
+`## Use cases` section is read against the use-case point (DEC-054): a cited
+use case the point does not hold is reported, and so is a point that could not
+be read; neither refuses the filing nor changes the exit code.
+
+The decision ids any body cites are asked of the backbone, through `pkit refs
+lookup` (DEC-010): one that no record holds is reported, and so are ids that
+could not be checked. Neither refuses the filing nor changes the exit code.
+
+For board-substrate adopters (per DEC-019 +
+`schemas/mandatory-issue-state.yaml`), the new issue is also added to
+the configured Projects v2 board as the final step of filing. The
+default assignee is the resolved invoker identity per DEC-019's
+default_at_filing: filer.
+
+With an instance id set (`set-instance`, DEC-035 point 1), the new issue is
+claimed for this clone right after it is filed, so the clone owns the arc it
+files from birth (DEC-035 point 3), through `_lib/instance_claims`. An issue
+filed for another person (`--assignee`) is not claimed (DEC-035 point 5). A
+claim that fails is a warning, and the issue stays filed. With no id set,
+nothing of this runs. In a project with a topology of seats, a clone in a
+planner's seat files with no owner, so the issue enters the shared pool, and a
+clone in any other seat claims what it files for its seat (DEC-059 point 7). A
+clone that took a seat confirms it on the seat's state issue before anything is
+written, and the command refuses where it cannot (DEC-059 point 6).
+
+A Task filed with `--milestone` into a Milestone of a pool of workers enters
+that pool, which is the person's act (DEC-061 point 6): asked at a terminal,
+or `--yes` on their word, and off a terminal without it the filing is refused
+before anything is written. The consent is recorded in an audit comment on the
+Task. An `after_create_issue` hook that assigns a Milestone is handed this
+run's `--yes`, and asks the same way.
+
+Membership predicate per DEC-021 runs at startup; closed mode refuses
+non-members with the standard structured refusal.
+
+Self-contained via PEP 723; runs via
+  uv run --script .pkit/capabilities/project-management/scripts/create-issue.py
+
+Or, via the dispatcher (per COR-021):
+  pkit project-management create-issue --type task --title "..."
+
+With --from-report <N> (per [project-management:DEC-048-from-report-auto-link]),
+a successfully created issue is also linked into feedback/change-request #N's
+`## Tracked by` list by invoking the backbone's canonical editor
+(`pkit report link <N> <new>`) as a subprocess — the one-linker rule: this
+script never reimplements the Tracked-by edit. The backbone verb owns the
+maintainer-side same-repo check; its refusal is surfaced verbatim. A link
+failure after a successful create never rolls the issue back — it warns
+loudly with the exact remediation command and exits 4.
+
+Exit codes:
+  0  issue created
+  1  membership refusal, or this clone's seat could not be confirmed, or a
+     Task filed into a pool off a terminal without --yes
+  2  usage error / validation refusal
+  3  gh failure (auth, network, repo not found, ...)
+  4  issue created, but --from-report link failed (issue NOT rolled back;
+     remediation command printed)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
+
+_HERE = Path(__file__).parent
+sys.path.insert(0, str(_HERE))
+from _lib import (
+    axis_carriage,
+    axis_labels,
+    board_status,
+    body_parent_ref,
+    body_rules,
+    bootstrap_gate,
+    classification_rules,
+    containment,
+    decision_ids,
+    instance_claims,
+    pools,
+    provenance,
+    session_guard,
+    title_rules,
+    use_case_citations,
+    workstreams,
+)
+from _lib import lifecycle_inference as infer
+from _lib.comment import post_comment
+from _lib.containment import LinkOutcome, link_sub_issue
+from _lib.gh import gh_project_run, gh_run, load_adopter_config
+from _lib.hooks import fire_hooks
+from _lib.membership import (
+    CAPABILITY_NAME,
+    check_membership,
+    resolve_capability_root,
+    resolve_invoker_identity,
+)
+from _lib.milestone import list_open_milestones, resolve_milestone
+from _lib.placeholder_detection import (
+    PHASE_CREATE,
+    detect_placeholder_residuals,
+)
+from _lib.structural_type import infer_structural_type
+from _lib.substrate_writes import milestone_create_args
+
+VALID_STRUCTURAL_TYPES = ("epic", "feature", "umbrella", "task")
+VALID_KINDS = ("feature", "bug", "docs", "test", "refactor", "maintenance")
+VALID_PRIORITIES = ("High", "Medium", "Low")
+DEFAULT_KIND = "feature"
+DEFAULT_PRIORITY = "Medium"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "File a new issue against the project-management methodology's "
+            "body shape. Composes title + body from the type's template, "
+            "checks the title against titles.yaml, applies classification labels, optionally adds "
+            "to the configured Projects v2 board (per DEC-019)."
+        ),
+    )
+    parser.add_argument(
+        "--type",
+        required=True,
+        choices=VALID_STRUCTURAL_TYPES,
+        help="Structural issue type per issue-types.yaml.",
+    )
+    parser.add_argument(
+        "--title",
+        required=True,
+        help="Title text (without the [Type] prefix — that's prepended automatically).",
+    )
+    parser.add_argument(
+        "--kind",
+        choices=VALID_KINDS,
+        default=DEFAULT_KIND,
+        help=(
+            "Classification axis `type:*` value per classification.yaml. "
+            f"Default: {DEFAULT_KIND}. Drives PR-title alignment when the "
+            "issue closes."
+        ),
+    )
+    parser.add_argument(
+        "--priority",
+        choices=VALID_PRIORITIES,
+        default=DEFAULT_PRIORITY,
+        help=f"Priority axis per classification.yaml. Default: {DEFAULT_PRIORITY}.",
+    )
+    parser.add_argument(
+        "--workstream",
+        default=None,
+        help=(
+            "Workstream slug, one project/workstreams.yaml holds as active. Required "
+            "whenever a LABEL carries the workstream axis — greenfield, or a "
+            "`label:` binding in substrate-map.yaml — and no `default:` covers it."
+        ),
+    )
+    parser.add_argument(
+        "--parent",
+        type=int,
+        default=None,
+        help=(
+            "Parent issue number. Substituted into the body template's "
+            "first parent-ref line, and linked as a native sub-issue parent. "
+            "When omitted, the issue parent the body's first line names "
+            "(an EPIC / Feature / Umbrella ref) is linked instead; a "
+            "Milestone first line links nothing. Refused when it and the "
+            "body's first line name different issues. create-issue enforces "
+            "parent-*requiredness* "
+            "only (whether a parent-ref is required for this type, degradable "
+            "via the hierarchy mode); it does NOT gate issue-types.yaml's "
+            "containment graph at filing — the containment_invariants are a "
+            "prose invariant, not a create-time gate."
+        ),
+    )
+    parser.add_argument(
+        "--assignee",
+        default=None,
+        help="Assignee GitHub login. Defaults to the resolved invoker identity.",
+    )
+    parser.add_argument(
+        "--milestone",
+        default=None,
+        help=(
+            "Milestone to attach. Accepts the milestone number "
+            "(e.g. `6`) or its exact title (e.g. "
+            "`Milestone 1: Self-host project-kit pm capability cleanly`). "
+            "Matches `gh issue create --milestone`'s permissive behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--body-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a file whose content becomes the issue body, "
+            "bypassing the template-based composition. The file's "
+            "first line must be the parent-ref per the issue type's "
+            "`parent_ref_form` (the same first-line check the "
+            "template-composition path enforces); an issue parent it "
+            "names is linked natively even without --parent. Useful "
+            "when the caller has the full body already prepared (e.g. "
+            "agent filing). See #218."
+        ),
+    )
+    parser.add_argument(
+        "--board",
+        type=int,
+        default=None,
+        help=(
+            "Projects v2 board ID. Overrides the adopter's "
+            "`projects_v2_board_id` config for this invocation."
+        ),
+    )
+    parser.add_argument(
+        "--from-report",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Feedback/change-request issue number to auto-link the new issue "
+            "into. After a successful create, invokes the backbone's "
+            "`pkit report link N <new>` (the canonical `## Tracked by` "
+            "editor per [project-management:DEC-048-from-report-auto-link]) — "
+            "never a second Tracked-by implementation. Maintainer-side, "
+            "same-repo: the backbone verb enforces that and its refusal is "
+            "surfaced verbatim. A link failure never rolls the issue back "
+            "(exit 4 + remediation command)."
+        ),
+    )
+    parser.add_argument(
+        "--capability-root",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the installed capability's directory "
+            f"(default: <repo-root>/.pkit/capabilities/{CAPABILITY_NAME}/)."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be done; do not invoke gh.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt before invoking gh.",
+    )
+    session_guard.add_override_argument(parser)
+    args = parser.parse_args()
+
+    capability_root = resolve_capability_root(args.capability_root)
+    if capability_root is None:
+        print(
+            f"error: {CAPABILITY_NAME} capability not found.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Prerequisite gate (#747): refuse on an un-bootstrapped project rather
+    # than operating on assumed defaults. See _lib/bootstrap_gate.py.
+    if not bootstrap_gate.enforce("create-issue", capability_root=capability_root):
+        return 2
+
+    yaml_loader = YAML(typ="safe")
+
+    # Membership gate first.
+    config = load_adopter_config(capability_root)
+    members = _read_members(capability_root, yaml_loader)
+    invoker = resolve_invoker_identity(config=config)
+    membership = check_membership(members, invoker)
+    if not membership.allowed:
+        print(membership.refusal_message, file=sys.stderr)
+        return 1
+
+    # Foreign-repo mutation guard (COR-039 / ADR-034). Compares the cwd-derived
+    # mutation target against the cd-invariant session anchor (CLAUDE_PROJECT_DIR);
+    # gates a cross-repo mutation (refuse under autonomy / prompt interactively)
+    # unless the operator confirms the override. Runs before any gh mutation.
+    if not session_guard.enforce(override=args.allow_foreign_repo):
+        return 1
+
+    # Read schemas + adopter config.
+    issue_types = _read_yaml(capability_root / "schemas" / "issue-types.yaml", yaml_loader)
+    titles = _read_yaml(capability_root / "schemas" / "titles.yaml", yaml_loader)
+    classification = _read_yaml(capability_root / "schemas" / "classification.yaml", yaml_loader)
+    body_format = _read_yaml(capability_root / "schemas" / "body-format.yaml", yaml_loader)
+    config = _read_yaml(capability_root / "project" / "config.yaml", yaml_loader)
+
+    type_entry = (issue_types.get("types") or {}).get(args.type)
+    if not isinstance(type_entry, dict):
+        print(
+            f"error: issue-types.yaml has no entry for type {args.type!r}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Refuse the kind/structural mismatch DEC-011 declares a hard-reject, up
+    # front before any gh mutation. An epic/feature/umbrella carries kind
+    # `feature` by definition, so filing one with a non-feature `--kind` would
+    # manufacture the mismatch that breaks the closing PR's Conventional-Commits
+    # `<type>` derivation (open-pr / validate-pr read the closing issue's
+    # `type:*` label). The check reads `allowed_structural_types_per_kind` via
+    # the shared predicate — the SAME reader set-field and validate-issue use.
+    # A kind permitted on the type (any kind on `task`; `feature` on the others)
+    # passes. Empty/absent classification degrades permissively (nothing to
+    # ground the refusal on).
+    if not classification_rules.kind_allowed_for_structural_type(
+        args.kind, args.type, classification
+    ):
+        print(
+            f"error: --kind {args.kind!r} is not valid for structural type "
+            f"{args.type!r} — epic/feature/umbrella carry kind 'feature' by "
+            "definition (classification.yaml structural_restriction / "
+            "[project-management:DEC-011-title-formats]). File this as a Task "
+            "(--type task) if it is genuinely bug/docs/test/refactor/chore work, "
+            "or as a --kind feature cluster if it delivers a coherent capability.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Compose the full title prefix. For structural types whose title is
+    # kind-driven (the leaf `task` type, per classification.yaml's
+    # title_prefix_by_value + structural_restriction), the prefix comes from
+    # the kind label so `--kind bug` yields `[Bug]`, matching what validate
+    # enforces. Other structural types (epic/feature/umbrella) carry kind
+    # `feature` implicitly and use their own structural title_prefix.
+    title_prefix = _title_prefix_for(type_entry, classification, args.type, args.kind)
+    full_title = f"[{title_prefix}] {args.title.strip()}"
+
+    # Run titles.yaml's checks for this type — the pattern and every declared
+    # wording rule (#803) — at their declared severity, before any gh call:
+    # filing writes the title. A blocking finding refuses; a warning is shown
+    # and filing goes on.
+    #
+    # Left NOT substrate-map-aware (deferred to #4), and safe only because create
+    # composes `full_title` from the KIT's own title vocabulary and does NOT
+    # honour any substrate-map write-side `title-prefix` remap — so the pattern it
+    # checks is always the one it just wrote. This flips to a live false-refuse (a
+    # (b)-class gate) if/when #4's write-side prefix honouring lands; revisit then.
+    title_findings = title_rules.check_title(titles, title_rules.issue_key(args.type), full_title)
+    for severity, label, detail in title_findings:
+        if severity not in title_rules.BLOCKING_SEVERITIES:
+            print(f"[{severity}] {label}: {detail}", file=sys.stderr)
+    refusals = [f for f in title_findings if f[0] in title_rules.BLOCKING_SEVERITIES]
+    if refusals:
+        for severity, label, detail in refusals:
+            print(
+                f"error: composed title {full_title!r} refused [{severity}] {label}: {detail}",
+                file=sys.stderr,
+            )
+        return 2
+
+    # The adopter's optional substrate-map (ADR-026 / DEC-036). None ⇒
+    # greenfield. Loaded here (not just for label resolution below) because the
+    # hierarchy MODE it declares governs whether the parent-requiredness check
+    # just below gates or merely advises.
+    substrate_map = axis_labels.load_substrate_map(capability_root)
+    hierarchy = axis_labels.hierarchy_disposition(substrate_map)
+
+    # Validate parent type (if --parent given) / parent-REQUIREDNESS.
+    #
+    # Parent-requiredness softens per the hierarchy MODE (DEC-036 D4). The
+    # mechanism is a short-circuit, not a token re-resolution: under
+    # `hierarchy: advisory` (a flat brownfield tracker with no machine-checkable
+    # parent-refs) `_parent_requiredness_is_gated` returns False BEFORE consulting
+    # the authored severity, so create-issue NEVER demands a parent the repo
+    # cannot express — a parent-ref is still recorded as body-text when --parent
+    # is given. The per-type `parent_ref_required_severity` field is the authored
+    # default consulted only on the gated arm (greenfield / `hierarchy: gated`),
+    # where it keeps the hard-reject exactly as before. (Resolving the authored
+    # severity THROUGH the DEC-014 token path under advisory is deferred —
+    # ADR-026; today advisory simply short-circuits the gate.) This softens ONLY
+    # requiredness; the containment invariants stay hard (they carry no knob —
+    # the no-knob-stays-hard fail-safe).
+    parent_issue_types = type_entry.get("parent_issue_types") or []
+    parent_ref_optional = bool(type_entry.get("parent_ref_optional", False))
+    milestone_is_valid_parent = "milestone" in parent_issue_types
+    parent_ref_missing = (
+        args.parent is None
+        and not parent_ref_optional
+        and not (args.milestone is not None and milestone_is_valid_parent)
+    )
+    if parent_ref_missing:
+        gated = _parent_requiredness_is_gated(type_entry, hierarchy)
+        message = (
+            f"--parent is required for issue type {args.type!r}. "
+            f"Permitted parent types: {', '.join(parent_issue_types) or '<none>'}. "
+            f"You may pass --milestone instead when milestone is a permitted parent."
+        )
+        if gated:
+            print(
+                f"error: {message} "
+                "If your tracker is flat / brownfield, set `hierarchy: advisory` "
+                "in substrate-map.yaml so parent-refs are recorded but not "
+                "required.",
+                file=sys.stderr,
+            )
+            return 2
+        # advisory hierarchy: degrade to a warning, proceed parentless.
+        print(
+            f"[advisory] {message} (not gated under hierarchy: advisory — "
+            "filing without a parent-ref)",
+            file=sys.stderr,
+        )
+
+    # Resolve --milestone (accepts number OR title; per #217).
+    # Normalises `args.milestone` to the int form so downstream code
+    # (parent-ref URL composition, display) sees a single shape. The
+    # TITLE is kept separately because `gh issue create --milestone`
+    # matches by NAME only (`gh issue create --help`: "Add the issue to
+    # a milestone by name") — passing the number fails with
+    # "could not add to milestone '<N>': '<N>' not found" (#223).
+    milestone_title: str | None = None
+    if args.milestone is not None:
+        resolved = resolve_milestone(str(args.milestone), config)
+        if resolved is None:
+            print(
+                f"error: --milestone {args.milestone!r} did not match any "
+                "OPEN milestone (tried as number, then as title). "
+                "List with `gh api repos/<owner>/<repo>/milestones?state=open`.",
+                file=sys.stderr,
+            )
+            return 2
+        args.milestone = resolved.number
+        milestone_title = resolved.title
+
+    # A Task filed into a Milestone of a pool enters that pool, which is the
+    # person's act (DEC-061 point 6): judged here, asked before the write.
+    pool_move = pools.Move(False)
+    if args.type == "task" and args.milestone is not None:
+        pool_move = pools.move(
+            None,
+            args.milestone,
+            rows=list_open_milestones(config, gh=lambda argv: gh_run(argv, config, check=False)),
+            capability_root=capability_root,
+        )
+
+    # Workstream requirement when a LABEL carries the axis.
+    #
+    # The gate MIRRORS the writer's (`_build_labels`) write/no-write decision for
+    # the workstream axis, reusing the SAME seam predicates and the SAME
+    # `resolve_write` the writer uses — so the gate and the resolution cannot
+    # drift (one source of truth per axis). It demands `--workstream` only when a
+    # workstream LABEL is the substrate AND no such label would be written for an
+    # omitted value:
+    #
+    #   * The workstream is label-carried when the carriage accessor says so —
+    #     `kit-label` (greenfield: the kit's own `workstream:*` label IS the
+    #     adopter's substrate) or `adopter-label` (bound to a REMAPPED label). A
+    #     `title` / `derived` / `board` / `degrade` carriage is NOT label-carried —
+    #     `_build_labels` writes no workstream label for it — so demanding
+    #     `--workstream` would refuse a filing for a value the next stage discards:
+    #     the #559 / #443 false gate (it over-fired on these sibling arms). The
+    #     gate does not fire there.
+    #   * Carriage is asked ONCE, of `_lib/axis_carriage`, and the board flag is
+    #     not consulted separately ([project-management:DEC-051-axis-carriage-
+    #     activation] decision point 4). The gate previously carried its own
+    #     `not has_board` term, which resolved board-versus-label FIRST: under a
+    #     configured board a label-bound workstream never reached the seam, so the
+    #     gate stayed silent while `_build_labels` went on to write the label. The
+    #     mirror was broken exactly where the report said it was.
+    #   * On a label-carried axis, an omitted `--workstream` is already covered
+    #     when the adopter declared a `default:` that resolves to a REAL write
+    #     under the writer's own `resolve_write` (`_build_labels` seeds `value or
+    #     axis_default(...)` at L789 and labels the result). We run that default
+    #     through the SAME `resolve_write`, so a default that itself DEGRADEs (a
+    #     value-unresolvable default) does NOT count as coverage — the gate still
+    #     demands an explicit value rather than let the label-carried axis silently
+    #     drop.
+    #
+    # A label-carried axis with no covering default still requires the value.
+    # Greenfield (no map ⇒ label-carried, no default) is byte-unchanged: the gate
+    # fires exactly as before. This is a mirror of the writer, not a stronger
+    # invariant — it demands `--workstream` only when a label would actually be
+    # written once a value is supplied.
+    workstream_carriage = axis_carriage.carriage("workstream", config, substrate_map)
+    workstream_label_carried = workstream_carriage in ("kit-label", "adopter-label")
+    workstream_default = axis_labels.axis_default("workstream", substrate_map)
+    default_writes_a_label = workstream_default is not None and isinstance(
+        axis_labels.resolve_write("workstream", workstream_default, substrate_map),
+        str,
+    )
+    if args.workstream is None and workstream_label_carried and not default_writes_a_label:
+        print(
+            f"error: --workstream is required. workstream is carried "
+            f"{axis_carriage.describe('workstream', config, substrate_map)}, so a "
+            f"label IS written for it — and no value was given, with no `default:` "
+            f"in project/substrate-map.yaml to supply one.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Workstream value validation against the project's workstreams file.
+    #
+    # DEC-012 refuses a value outside the allowed set, and DEC-018 makes
+    # `project/workstreams.yaml` that set: the value must be one the file holds
+    # as active (#1933). The legacy `workstreams:` key of config.yaml is read
+    # only where the file is absent (`_lib/workstreams.read_declared`).
+    #
+    # Skipped when the substrate-map declares `workstream` unsupported (or absent
+    # — absent ≡ unsupported, the load-bearing rule): the writer discards the
+    # value (`resolve_write` DEGRADEs, no label written), so validating it
+    # would false-refuse a filing for a value that will never be written (#559).
+    # Kept for greenfield / served — a typo-catch on a value that WILL be written.
+    workstream_unsupported = (
+        axis_labels.axis_disposition("workstream", substrate_map) == "unsupported"
+    )
+    if args.workstream is not None and not workstream_unsupported:
+        refusal = workstreams.filing_refusal(
+            args.workstream, workstreams.read_declared(capability_root)
+        )
+        if refusal is not None:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 2
+
+    # Compose the body. Two paths per #218:
+    #   1. --body-file: read the file's content verbatim. The first
+    #      line must match one of the type's allowed parent-ref forms
+    #      (the same set validate-body accepts); errors out otherwise.
+    #   2. Default: stamp from the type's template + parent-ref line.
+    #
+    # For path 2 the parent-ref label is made faithful to the parent's REAL
+    # structural type (#356): a Task under EPIC #128 opens `EPIC: #128`, not the
+    # first label in parent_ref_form. The parent type is detected from its title
+    # prefix via the same `_infer_structural_type` the validator / show / tree
+    # scripts use; on any detection failure the label degrades to parent_ref_form's
+    # first option (the prior behaviour), and a parent whose label is not one of
+    # the type's forms is named in the first option with a warning
+    # (`body_parent_ref.issue_parent_line`, the writer set-field shares).
+    parent_label = None
+    if args.parent is not None:
+        parent_type = _detect_parent_structural_type(args.parent, config, issue_types)
+        if parent_type is not None:
+            parent_label = _parent_ref_label(issue_types, parent_type)
+    parent_line = _parent_line(
+        type_entry,
+        parent_num=args.parent,
+        milestone_num=args.milestone,
+        parent_label=parent_label,
+    )
+    expected_parent_ref = parent_line.line
+    if parent_line.warning is not None and args.body_file is None:
+        print(f"[warn] {parent_line.warning}.", file=sys.stderr)
+    if args.body_file is not None:
+        if not args.body_file.is_file():
+            print(
+                f"error: --body-file path {str(args.body_file)!r} is not a file.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            body = args.body_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"error: failed to read --body-file {str(args.body_file)!r}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        # Accept the first line as-is when it matches ANY allowed parent-ref form
+        # for this type (#356) — the same option set validate-body accepts — rather
+        # than demanding the single recomputed `expected_parent_ref`. This is the
+        # path agents use, supplying their own (correctly-labelled) parent-ref.
+        # Skip a leading DEC-013 `Integration:` marker — it sits ABOVE the
+        # parent-ref (#763), so the parent-ref is the next line.
+        first_line = body_parent_ref.first_line(body)
+        matchers = _parent_ref_form_matchers(str(type_entry.get("parent_ref_form", "")))
+        first_line_is_parent_ref = any(m.match(first_line) for m in matchers)
+        # This first-line format check mirrors the requiredness gate above: it
+        # HARD-rejects a non-parent-ref first line ONLY where a missing parent-ref
+        # is gated (greenfield / `hierarchy: gated`), reusing the SAME
+        # `_parent_requiredness_is_gated` predicate so the two gates can never
+        # disagree (#557). Under `hierarchy: advisory` a flat brownfield tracker has
+        # no machine-checkable parent-refs, so a non-parent-ref first line is
+        # accepted and the body used verbatim (parentless) — the #218 prepared-body
+        # path an agent uses to file a parentless issue. The requiredness gate above
+        # is the SOLE owner of the parent-handling advisory warning (it fires for
+        # the genuine missing-parent case, no `--parent`); this check does NOT
+        # re-warn, so a `--parent`-given body whose first line is not a ref is
+        # accepted silently — the native `--parent` linkage is what matters; body-
+        # text refs aren't machine-checked under advisory.
+        if (
+            matchers
+            and not parent_ref_optional
+            and not first_line_is_parent_ref
+            and _parent_requiredness_is_gated(type_entry, hierarchy)
+        ):
+            print(
+                f"error: --body-file's first line must be one of the parent-ref "
+                f"forms for issue type {args.type!r}:\n"
+                f"  {type_entry.get('parent_ref_form', '')}\n"
+                f"Got:\n  {first_line}",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        template_path = capability_root / "templates" / f"{title_prefix}.md"
+        if not template_path.is_file():
+            # Fall back to title-case for the file (e.g., Feature.md).
+            template_path = (
+                capability_root / "templates" / f"{type_entry.get('title_prefix', '')}.md"
+            )
+        body = _compose_body(template_path, parent_ref=expected_parent_ref)
+
+    # The issue parent to link natively (#1033). `--parent` names it; without the
+    # flag, it is the issue the body's first line names (for a prepared body, the
+    # line the check above accepts), so a body filed from a file is linked exactly
+    # as `--parent` would link it. Only an issue parent (EPIC / Feature /
+    # Umbrella) links: a `Milestone:` first line is not a sub-issue relationship.
+    # Both paths' bodies are read the same way (a template-composed body carries
+    # only the flag's own ref, so it never names a second parent). When the flag
+    # and the first line name different issues, the native link and the textual
+    # record would disagree from the moment of filing, so refuse before any
+    # mutation rather than pick one. The disagreement is read as every reader of
+    # the parent reads the line (`body_parent_ref.named_issue`), in any form: a
+    # loose `Feature: #2 — auth` names #2 for the close gate, so it disagrees with
+    # `--parent 3` even where the form check above let the body through
+    # (`hierarchy: advisory`). Linking from the first line alone stays narrower —
+    # only a form the type allows.
+    first_line_ref = body_parent_ref.parse_first_line(
+        body, str(type_entry.get("parent_ref_form", ""))
+    )
+    first_line_parent = first_line_ref.issue_number if first_line_ref else None
+    named_parent = body_parent_ref.named_issue(body)
+    if args.parent is not None and named_parent is not None and named_parent != args.parent:
+        print(
+            f"error: --parent #{args.parent} and the body's first line "
+            f"{body_parent_ref.first_line(body)!r} name different parents "
+            f"(#{args.parent} vs #{named_parent}). The first line is the "
+            "textual parent record and the native sub-issue link must name the "
+            "same issue — correct one of them, or omit --parent to link the "
+            "first line's parent.",
+            file=sys.stderr,
+        )
+        return 2
+    parent_number = args.parent if args.parent is not None else first_line_parent
+
+    # The body rules (DEC-010), read from body-format.yaml by the reader
+    # validate-issue and edit-issue share: each section the type requires, and
+    # the universal rules. A blocking finding refuses before anything is
+    # written, `--dry-run` included; a warning is shown and filing goes on. A
+    # template-stamped body is checked as a body file is: the schema, not the
+    # template, is the contract.
+    body_findings = body_rules.check(body, args.type, body_format)
+    body_refusals = body_rules.blocking(body_findings)
+    for severity, label, detail in body_findings:
+        if (severity, label, detail) not in body_refusals:
+            print(f"[{severity}] {label}: {detail}", file=sys.stderr)
+    if body_refusals:
+        for severity, label, detail in body_refusals:
+            print(f"error: body refused [{severity}] {label}: {detail}", file=sys.stderr)
+        print("error: nothing was filed.", file=sys.stderr)
+        return 2
+
+    # Residual-placeholder check at create-phase (DEC-031).
+    # Emits warnings when the composed body is still the raw skeleton so
+    # the author sees the unfinished state from the first moment.  Does
+    # NOT block filing — the hard-reject gate fires at the first
+    # lifecycle transition via validate-issue --phase transition.
+    _warn_placeholder_residuals(body, args.type, body_format, capability_root)
+
+    # The use cases a prepared Feature or Task body cites (DEC-054): reported,
+    # never refused. The point is read only for a body that cites one.
+    if args.body_file is not None:
+        _warn_use_case_citations(body, args.type, body_format)
+
+    # The decision ids the body cites that no record holds (DEC-010): reported,
+    # never refused. The backbone is asked only for a body that cites one.
+    _warn_decision_ids(body, body_format)
+
+    # Resolve assignee.
+    assignee = args.assignee or invoker.github_login
+    if not assignee:
+        print(
+            "error: could not resolve assignee. Pass --assignee explicitly "
+            "or ensure `gh api user` works (sets the default).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Labels. Axis-labels are RESOLVED through the seam's write-path resolver
+    # (ADR-026 sole-constructor + fail-closed): greenfield (no substrate-map)
+    # resolves to the kit's own `<axis>:<value>`; a present map resolves to the
+    # adopter's substrate value, or omits the label entirely (DEGRADE) on an
+    # unsupported/absent/value-unresolvable axis — never coerced to a kit write.
+    # `substrate_map` was loaded above (it also governs hierarchy mode).
+    labels, label_advisories, resolved_by_axis = _build_labels(
+        kind=args.kind,
+        priority=args.priority,
+        workstream=args.workstream,
+        config=config,
+        substrate_map=substrate_map,
+    )
+    for advisory in label_advisories:
+        print(f"[advisory] {advisory}", file=sys.stderr)
+
+    # Pre-flight summary.
+    print("about to create issue:")
+    print(f"  title:      {full_title}")
+    print(f"  type:       {args.type}  (structural)")
+    # The classification label as resolved — read from the `_build_labels`
+    # result (G-2, #265) so the displayed value and the APPLIED label cannot
+    # diverge (one resolution, not two). Absent ⇒ DEGRADE (unsupported / absent /
+    # value-unresolvable `type` axis) ⇒ not labelled.
+    kind_label = resolved_by_axis.get("type")
+    kind_display = kind_label if kind_label else "(not labelled — axis unsupported)"
+    print(f"  kind:       {kind_display}  (classification label)")
+    print(f"  priority:   {args.priority}")
+    if args.workstream:
+        print(f"  workstream: {args.workstream}")
+    if parent_number is not None:
+        parent_source = "" if args.parent is not None else "  (from the body's first line)"
+        print(f"  parent:     #{parent_number}{parent_source}")
+        # Containment-substrate selector (DEC-039 D2 / ADR-035): show which
+        # parent-link decision the post-create step will take. `native` (and the
+        # greenfield default) links the native sub-issue; `textual` skips it and
+        # records only the textual parent-ref.
+        containment = axis_labels.containment_mode(substrate_map)
+        if containment == axis_labels.CONTAINMENT_TEXTUAL:
+            print("  containment: textual  (native sub-issue link skipped; textual ref only)")
+        else:
+            print("  containment: native   (native sub-issue link + textual ref)")
+    if args.milestone:
+        print(f"  milestone:  #{args.milestone}")
+    if pool_move.asks:
+        print(f"  pool:       {pool_move.said()}  (the person's consent, DEC-061 point 6)")
+    print(f"  assignee:   {assignee}")
+    print(f"  labels:     {', '.join(labels)}")
+    # Instance ownership (DEC-035): None unless this clone set an instance id,
+    # or holds a seat of a topology (DEC-059), and then nothing below changes.
+    # A seat is confirmed on its state issue before anything is written.
+    try:
+        clone = instance_claims.this_clone(
+            capability_root, invoker.github_login, config, dry_run=args.dry_run
+        )
+    except instance_claims.Unconfirmed as exc:
+        return instance_claims.say_unconfirmed("create-issue", None, exc)
+    if clone is not None:
+        print(f"  ownership:  {instance_claims.claim_plan(clone, assignee, filing=True)}")
+    if args.from_report is not None:
+        print(
+            f"  from-report: #{args.from_report}  "
+            "(will link the new issue into its Tracked by via `pkit report link`)"
+        )
+    # Board MEMBERSHIP, not carriage: every issue belongs on the configured board
+    # (DEC-019), whatever substrate carries its classification axes. This read of
+    # `has_projects_v2_board` is the flag's own job and must NOT be routed through
+    # the carriage accessor — doing so would silently drop the membership
+    # requirement for any board adopter who wrote a single label binding
+    # ([project-management:DEC-051-axis-carriage-activation], "board membership
+    # stays with the flag").
+    has_board = bool(config.get("has_projects_v2_board", False))
+    board_id = args.board if args.board is not None else config.get("projects_v2_board_id")
+    if has_board:
+        print(f"  board:      v2/{board_id}  (auto-add per DEC-019)")
+        role = board_status.role(dict(config, projects_v2_board_id=board_id), substrate_map)
+        if role == "projection":
+            print("  status:     the card's Status set to the issue's state (DEC-006)")
+        elif role == "source":
+            print(
+                "  status:     the card's Status set to the state the issue is filed into, "
+                "the state's source (DEC-062 point 5)"
+            )
+
+    if args.dry_run:
+        print("\n[dry-run] gh would be invoked; nothing written.")
+        return 0
+
+    if pool_move.asks:
+        stop = pools.authorise(pool_move, subject="the new Task", yes=args.yes, verb="create-issue")
+        if stop is not None:
+            return stop
+    elif not args.yes and sys.stdin.isatty():
+        reply = input("Proceed? [y/N] ").strip().lower()
+        if reply not in ("y", "yes"):
+            print("aborted.", file=sys.stderr)
+            return 0
+
+    # Seam: stamp exactly one provenance footer onto the initial body (ADR-037).
+    body = provenance.stamp(body, provenance.read_versions(capability_root))
+
+    # Invoke gh issue create.
+    issue_url = _gh_create_issue(
+        title=full_title,
+        body=body,
+        labels=labels,
+        assignee=assignee,
+        milestone_title=milestone_title,
+        config=config,
+    )
+    if issue_url is None:
+        return 3
+
+    print(f"\n[ok] created: {issue_url}")
+
+    # Set GitHub's native sub-issue link under the parent, IN ADDITION to the
+    # textual first-line parent-ref already written into the body above (DEC-005:
+    # native sub-issues are the canonical containment mechanism; the textual ref
+    # is the universal spine). The parent is `parent_number` — `--parent`, or the
+    # issue the body's first line names when the flag is absent (#1033). Only an
+    # ISSUE parent is linked natively — a milestone parent (--milestone, or a
+    # `Milestone:` first line) is not a sub-issue relationship and carries its own
+    # native Milestone field, so it is not linked here. The link is
+    # idempotent (value-equality re-link is a no-op, DEC-026) and degrades to a
+    # no-op where the instance lacks sub-issue support — the textual ref carries
+    # the relationship in that case, and a native failure never fails the create.
+    #
+    # Containment-substrate gate (DEC-039 D2, contract ADR-035): the `containment`
+    # selector in the substrate-map (already loaded above) decides whether the
+    # native link fires. `native` (and the greenfield default — no map) → link as
+    # today; `textual` → SKIP the native link entirely, the textual child-side ref
+    # written above is the record (the universal spine, DEC-039 D3). A single
+    # decision point; the textual ref is written regardless of mode.
+    new_issue_number = _extract_issue_number_from_url(issue_url)
+    if new_issue_number is not None:
+        # One-time immutable filing-version comment (DEC-041): the
+        # load-bearing record of the version this issue was born under.
+        print(provenance.post_filing_comment(new_issue_number, capability_root, config))
+        # The person's consent to the Task's pool, in its own audit comment
+        # (DEC-061 point 6). A failed post is a warning: the Task stays filed.
+        if pool_move.asks and not post_comment(
+            "issue",
+            new_issue_number,
+            pools.consent_comment("create-issue", pool_move, args.milestone),
+            config,
+            run=gh_run,
+        ):
+            print(
+                f"[warn] #{new_issue_number} was filed into {pool_move.said()}, and the audit "
+                "comment recording the person's consent could not be posted.",
+                file=sys.stderr,
+            )
+        # Claim the filed issue for this clone (DEC-035 point 3). An issue
+        # filed for another person is not this clone's (DEC-035 point 5), and
+        # a planner's seat files with no owner (DEC-059 point 7).
+        if clone is not None and instance_claims.claims_at_filing(clone, assignee):
+            instance_claims.say(instance_claims.claim(new_issue_number, clone, config))
+    containment = axis_labels.containment_mode(substrate_map)
+    if (
+        parent_number is not None
+        and new_issue_number is not None
+        and containment == axis_labels.CONTAINMENT_NATIVE
+    ):
+        link = link_sub_issue(
+            config,
+            parent_number=parent_number,
+            child_number=new_issue_number,
+        )
+        prefix = "[ok]" if link.ok else "[warn]"
+        # The seam reports only the native link; the textual ref is this verb's,
+        # written above, and on an instance without sub-issues it is the record.
+        note = (
+            f"{link.detail}; textual ref recorded"
+            if link.outcome is LinkOutcome.UNSUPPORTED
+            else link.detail
+        )
+        print(f"{prefix} {note}", file=sys.stderr)
+        if link.outcome is LinkOutcome.FAILED:
+            # A failed link is not an instance without sub-issues (#808): the
+            # line above says why, in GitHub's words where GitHub refused, and
+            # the issue stays filed under its textual ref. Name the way back,
+            # and — where GitHub refused it — the way out (ADR-035).
+            print(
+                f"[warn] #{new_issue_number} is filed under #{parent_number} by its "
+                f"first line only; once the cause above is fixed, `pkit pm link-parent "
+                f"{new_issue_number}` makes the native link.",
+                file=sys.stderr,
+            )
+            if link.refused:
+                print(f"  → {axis_labels.TEXTUAL_CONTAINMENT_WAY_OUT}", file=sys.stderr)
+    elif parent_number is not None and containment == axis_labels.CONTAINMENT_TEXTUAL:
+        print(
+            f"[ok] containment: textual mode — native sub-issue link skipped; "
+            f"textual parent-ref to #{parent_number} recorded as the containment record",
+            file=sys.stderr,
+        )
+        # Render-on-demand textual children view (DEC-039 D4 / ADR-035 section 4):
+        # in textual mode the parent has no native sub-issues panel, so refresh
+        # its generated do-not-edit children comment now that this child's textual
+        # ref is written. Full overwrite of the one marked comment (never an
+        # append); failure-posture-neutral — a failed refresh is a one-line note,
+        # never a create failure (the textual ref is the spine). The mode gate
+        # lives inside `refresh_children_comment`; we are already on the textual
+        # arm, so the call writes.
+        _refresh_parent_children_view(
+            config,
+            parent_number=parent_number,
+            containment_mode=containment,
+        )
+
+    # Auto-add to board for board-substrate adopters (per DEC-019).
+    #
+    # Capture the created board-item node id (and resolve the project node id)
+    # so the `after_create_issue` `set-board-field` hook can seed the non-label
+    # field default onto THIS new item (DEC-037 §3 — the non-label per-create
+    # default; the same field write the one-time back-fill drives over the
+    # corpus). Without these two ids the hook skips ("no board-item id in
+    # context"), so the Projects-v2 field default would never seed on create.
+    # The milestone default (`assign-milestone`) needs only the issue number
+    # and seeds regardless.
+    board_item_id: str | None = None
+    project_node_id: str | None = None
+    if has_board and board_id:
+        board_item_id = _gh_add_to_board(board_id, issue_url, config)
+        if board_item_id is None:
+            print(
+                f"[warn] issue created but failed to add to board v2/{board_id}.",
+                file=sys.stderr,
+            )
+            if board_status.role(config, substrate_map) == "source":
+                print(
+                    "  The board carries the state, so the issue's position cannot be read "
+                    "until it has a card and a Status: add it to the board and set its "
+                    "Status (DEC-051 point 6).",
+                    file=sys.stderr,
+                )
+        else:
+            owner = _owner_from_issue_url(issue_url)
+            project_node_id = _resolve_project_node_id(board_id, owner, config)
+            if new_issue_number is not None:
+                _set_first_status(
+                    new_issue_number,
+                    board_item_id,
+                    owner=owner,
+                    board_config=dict(config, projects_v2_board_id=board_id),
+                    substrate_map=substrate_map,
+                    workflow=_read_yaml(capability_root / "schemas" / "workflow.yaml", yaml_loader),
+                    milestone_title=milestone_title,
+                    labels=labels,
+                )
+
+    # Fire lifecycle hooks per DEC-024. Report-and-continue contract:
+    # hook failures don't propagate to this script's exit code. The board-item
+    # / project node ids let the `set-board-field` hook target the new item;
+    # both stay absent in label-fallback mode (no board), where that hook is a
+    # no-op skip by design.
+    # The issue's milestone, as this run filed it, lets an `assign-milestone`
+    # hook tell where a Task moves from (DEC-061 point 6), and `--yes` is the
+    # person's consent it may need.
+    issue_context: dict[str, Any] = {
+        "number": new_issue_number,
+        "title": full_title,
+        "milestone": (
+            {"number": args.milestone, "title": milestone_title}
+            if args.milestone is not None
+            else None
+        ),
+    }
+    if board_item_id is not None:
+        issue_context["board_item_id"] = board_item_id
+    fire_hooks(
+        "after_create_issue",
+        context={
+            "issue": issue_context,
+            "repo": _resolve_repo_name_with_owner_safe(),
+            "project_node_id": project_node_id,
+        },
+        config=config,
+        capability_root=capability_root,
+        yes=args.yes,
+    )
+
+    # --from-report: link the new issue into the report's `## Tracked by` by
+    # invoking the backbone's canonical editor (DEC-048's one-linker rule —
+    # `pkit report link` is the SOLE Tracked-by implementation; this script
+    # only decides when it fires). Runs LAST so a link failure never skips the
+    # containment link / board add / hooks above. The backbone verb owns the
+    # maintainer-side same-repo gate; its refusal (or any other failure) is
+    # surfaced verbatim, with the exact remediation command, and maps to exit
+    # 4 — the issue itself is never rolled back.
+    if args.from_report is not None:
+        return _link_from_report(args.from_report, new_issue_number)
+
+    return 0
+
+
+def _link_from_report(report_n: int, new_issue_number: int | None) -> int:
+    """Link the just-created issue into report `#report_n` via `pkit report link`.
+
+    The subprocess call is the one-linker realization (DEC-048): the
+    `## Tracked by` edit is implemented once, in the backbone's report link
+    editor; this capability invokes the canonical verb rather than importing
+    backbone Python or re-editing the body itself. Returns the script's exit
+    code contribution: 0 on a successful link, 4 on any failure (the issue was
+    already created — loud warning + remediation command, never a rollback).
+    """
+    if new_issue_number is None:
+        print(
+            f"[warn] issue created but NOT linked into report #{report_n}'s "
+            "Tracked by: could not parse the new issue number from the gh "
+            "output.\n"
+            f"Run manually: pkit report link {report_n} <new-issue-number>",
+            file=sys.stderr,
+        )
+        return 4
+    argv = ["pkit", "report", "link", str(report_n), str(new_issue_number)]
+    remediation = f"Run manually: pkit report link {report_n} {new_issue_number}"
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+    except (OSError, FileNotFoundError):
+        print(
+            f"[warn] issue created but NOT linked into report #{report_n}'s "
+            "Tracked by: `pkit` not on PATH.\n" + remediation,
+            file=sys.stderr,
+        )
+        return 4
+    if proc.returncode != 0:
+        # Surface the backbone verb's own message verbatim — including its
+        # maintainer-side refusal ("runs only inside the report target repo").
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(
+            f"[warn] issue created but NOT linked into report #{report_n}'s "
+            f"Tracked by:\n{detail}\n" + remediation,
+            file=sys.stderr,
+        )
+        return 4
+    print(
+        f"[ok] linked #{new_issue_number} into report #{report_n}'s Tracked by "
+        "(via `pkit report link`)."
+    )
+    return 0
+
+
+def _warn_placeholder_residuals(
+    body: str,
+    structural_type: str,
+    body_format: dict,
+    capability_root: Path,
+) -> None:
+    """Emit stderr warnings when *body* still contains template-skeleton content.
+
+    Runs at create-phase (DEC-031): the hard-reject gate lives in
+    validate-issue --phase transition.  Filing is not blocked; the warnings
+    make the unfinished body visible from the first moment.
+    """
+    findings = detect_placeholder_residuals(
+        body=body,
+        structural_type=structural_type,
+        body_format=body_format,
+        capability_root=capability_root,
+        phase=PHASE_CREATE,
+    )
+    for _sev, label, detail in findings:
+        print(f"[warning] {label}: {detail}", file=sys.stderr)
+
+
+def _warn_use_case_citations(body: str, structural_type: str, body_format: dict) -> None:
+    """Report on stderr the use cases *body* cites that the use-case point does not
+    hold, or that they could not be checked (DEC-054), at the severity the
+    body-format schema gives the rule. Filing is not blocked: the rule is a report."""
+    for severity, label, detail in use_case_citations.findings(
+        body, structural_type, body_format, use_case_citations.read_point
+    ):
+        print(f"[{severity}] {label}: {detail}", file=sys.stderr)
+
+
+def _warn_decision_ids(body: str, body_format: dict) -> None:
+    """Report on stderr the decision ids *body* cites that no record holds, or that
+    they could not be checked (DEC-010), at the severity the body-format schema
+    gives the rule. Filing is not blocked: the rule is a report."""
+    for severity, label, detail in decision_ids.findings(body, body_format, decision_ids.lookup):
+        print(f"[{severity}] {label}: {detail}", file=sys.stderr)
+
+
+def _build_labels(
+    *,
+    kind: str,
+    priority: str,
+    workstream: str | None,
+    config: dict,
+    substrate_map: axis_labels.SubstrateMap | None,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """Resolve the applied-label list for a new issue through the seam (ADR-026).
+
+    Returns ``(labels, advisories, resolved_by_axis)`` where ``resolved_by_axis``
+    maps each axis that RESOLVED to its applied label string (a DEGRADE'd axis is
+    absent from the dict). Callers that need to DISPLAY a resolved label read it
+    from this dict rather than re-resolving — so the displayed value and the
+    applied label share one resolution and cannot diverge (G-2, #265).
+
+    Each axis (``type`` via ``kind``, ``priority``, ``workstream``) is resolved
+    with :func:`axis_labels.resolve_write`:
+
+      * greenfield (``substrate_map is None``) ⇒ the kit's own
+        ``<axis>:<value>`` label, byte-identical to the pre-rewire output;
+      * a present map, axis bound ⇒ the adopter's own substrate value;
+      * a present map, axis unsupported / absent / value-unresolvable ⇒
+        :data:`axis_labels.DEGRADE`, which is **omitted from the label list**
+        (fail-closed — never coerced to a kit write) and recorded as an
+        advisory line;
+      * a present map, axis bound via ``title-prefix`` ⇒ the axis is carried in
+        the TITLE, not a label, so it contributes **no label** and no advisory
+        (#454). This is distinct from DEGRADE: the axis is served (in the title),
+        just not label-carried. The same holds for the ``board`` and ``derive``
+        arms — see the carriage paragraph below, which is how all three are now
+        recognised.
+
+    **Carriage is resolved first, per axis, for every axis.** Which substrate
+    carries an axis is asked of :func:`axis_carriage.carriage`
+    ([project-management:DEC-051-axis-carriage-activation] decision point 4): a
+    map binding governs the axis it names, and the board flag carries no axis
+    ([project-management:DEC-062-axes-chosen-in-the-map] point 1). ``priority``
+    and ``workstream`` used to be appended to the
+    resolution list only ``if not has_board`` — a board-versus-label decision taken
+    BEFORE the seam was consulted, so under a configured board a label-bound
+    priority never reached the seam and no label was written for an axis whose map
+    said labels carry it. That is the ordering inversion the report describes
+    (#708). The ``type`` axis already resolved in the pinned order in this same
+    function, which is why it was never affected — it is the in-tree oracle for the
+    shape the other two now follow.
+
+    Where the adopter declared a per-axis ``default:`` and the resolved value
+    is missing, the seam's :func:`axis_labels.axis_default` supplies it before
+    resolution.
+
+    DEGRADE is filtered structurally: it is a non-str singleton, so the
+    ``isinstance(resolved, str)`` gate skips it. This is the call-site half of
+    ADR-026 part (ii) — a degrade has no write.
+    """
+    labels: list[str] = []
+    advisories: list[str] = []
+    resolved_by_axis: dict[str, str] = {}
+
+    # All three axes are considered; each one's SUBSTRATE decides whether a label
+    # is written for it. The value may be blank (workstream is nullable); the
+    # adopter's per-axis `default:` seeds it before resolution.
+    axes_to_apply: list[tuple[str, str | None]] = [
+        ("type", kind),
+        ("priority", priority),
+        ("workstream", workstream),
+    ]
+
+    for axis, value in axes_to_apply:
+        # Carriage FIRST — the composition ordering ADR-026 pins and DEC-051
+        # restores. Only a label-carried axis is resolved to a write-label:
+        #
+        #   * `title` — carried in the TITLE (applied via issue-types.yaml's
+        #     `title_prefix`), so it contributes NO write-label (#454). Skipping
+        #     BEFORE resolution is what makes it safe: `resolve_write` returns the
+        #     prefix STRING (e.g. `[Feature]` for `--kind feature` under a
+        #     `feature: "[Feature]"` remap), which a naive writer applies as a
+        #     `gh --label` — and the tracker has no bracket labels, so
+        #     `gh issue create` hard-fails `'[Feature]' not found`.
+        #   * `board` — carried by a Projects-v2 field, written by the
+        #     `after_create_issue` hook, not by this label writer.
+        #   * `derived` — computed from tracker state (open/closed + a blocked
+        #     label); there is no write-label to compose.
+        #
+        # None of the three is a DEGRADE: the axis IS served, just not by a label,
+        # so no advisory is emitted for them. Emitting one would report a served
+        # axis as unsupported and soften every rule that needs it — the lie the
+        # board arm makes newly reachable, since `resolve_write` returns DEGRADE
+        # for a board-carried axis exactly as it does for a genuinely absent one
+        # (ADR-053 decision point 6).
+        #
+        # A `degrade` carriage deliberately does NOT skip here: it falls through to
+        # `resolve_write`, DEGRADEs, and emits the advisory below — unchanged,
+        # because for an axis the adopter declared unsupported (or omitted) that
+        # advisory is TRUE. Only the served-elsewhere arms are filtered out.
+        if axis_carriage.carriage(axis, config, substrate_map) in (
+            "title",
+            "board",
+            "derived",
+        ):
+            continue
+        # Apply the adopter's declared per-axis default only when the caller
+        # gave no explicit value (workstream is the only nullable axis here;
+        # type/priority always carry an argparse default).
+        resolved_value = value or axis_labels.axis_default(axis, substrate_map)
+        if not resolved_value:
+            # No value and no default — nothing to label on this axis. This is
+            # the greenfield workstream-omitted case (an axis the board carries
+            # never reaches here; a label-carried one is required upstream), so it
+            # is not an advisory.
+            continue
+        resolved = axis_labels.resolve_write(axis, resolved_value, substrate_map)
+        if isinstance(resolved, str):
+            labels.append(resolved)
+            resolved_by_axis[axis] = resolved
+        else:
+            advisories.append(
+                f"axis {axis!r} unsupported under your substrate-map — not labelled "
+                f"(value {resolved_value!r})"
+            )
+
+    return labels, advisories, resolved_by_axis
+
+
+def _extract_issue_number_from_url(url: str) -> int | None:
+    """Parse the trailing issue number from `gh issue create`'s URL output."""
+    m = re.search(r"/issues/(\d+)(?:[/?#].*)?$", url.strip())
+    return int(m.group(1)) if m else None
+
+
+def _refresh_parent_children_view(
+    config: dict,
+    *,
+    parent_number: int,
+    containment_mode: str,
+) -> None:
+    """Refresh the parent's render-on-demand children comment in textual mode.
+
+    The create-side refresh TRIGGER for the textual children view (DEC-039 D4 /
+    ADR-035 section 4). Fetches the issue corpus (``{number: body}`` — the textual
+    side of `resolve_children` costs no extra API calls once it is in hand) and a
+    parallel ``{number: title}`` map for nicer rendering, then routes through the
+    one writer (`containment.refresh_children_comment`), which renders, finds the
+    existing marked comment, and overwrites it (or creates one) — never an append,
+    idempotent when the child set is unchanged.
+
+    Failure-posture-neutral: every outcome is reported as a one-line stderr note
+    and NONE fails the create (the child-side textual ref is the spine). A corpus
+    that could not be read in full does NOT degrade to a partial render — the
+    publish is skipped, leaving the previous comment in place. This is a write
+    over the only parent-side child list a textual-mode tracker has, and it
+    carries no hedge of its own, so a stale view beats a confidently short one.
+    """
+    corpus, titles, reason = _fetch_issue_corpus(config)
+    if reason is not None:
+        # Refuse to publish rather than publish a short list. The comment is the
+        # only parent-side view of children in textual mode, and it carries no
+        # hedge of its own — a reader takes it as the parent's children, full
+        # stop. Skipping leaves the previous render in place, which is stale at
+        # worst; overwriting it with a partial one is confidently wrong.
+        print(
+            f"[warn] children view not refreshed: {reason}, and a partial list "
+            "would read as the complete one",
+            file=sys.stderr,
+        )
+        return
+    result = containment.refresh_children_comment(
+        config,
+        parent_number=parent_number,
+        corpus=corpus,
+        containment_mode=containment_mode,
+        titles=titles,
+    )
+    prefix = "[ok]" if result.ok else "[warn]"
+    print(f"{prefix} {result.detail}", file=sys.stderr)
+
+
+def _fetch_issue_corpus(
+    config: dict,
+) -> tuple[dict[int, str], dict[int, str], str | None]:
+    """The issue corpus for the children-view render, and whether it is whole.
+
+    Acquisition belongs to the containment seam (ADR-035 §5), which enumerates to
+    exhaustion and says when it could not. This used to run its own
+    `gh issue list --limit 1000` and return two empty maps on any failure — so a
+    broken fetch rendered as an EMPTY children list, indistinguishable from a
+    parent that genuinely has none, and past 1000 issues a short list read as the
+    complete set (#863).
+
+    The third element is that honesty: None when the corpus is whole, otherwise
+    the fact that made it partial — the query failed, or it was not enumerated to
+    exhaustion. The caller refuses to publish rather than overwrite the parent's
+    children comment with a short list under a heading claiming to be complete,
+    and reports which fact it established rather than a guess at the cause
+    (ADR-035 point 5).
+    """
+    corpus = containment.fetch_issue_corpus(config, fields="number,body,title")
+    if corpus is None:
+        return {}, {}, "the issue list could not be read at all"
+    if not corpus.complete:
+        return corpus.bodies, corpus.titles, "the issue corpus was not read in full"
+    return corpus.bodies, corpus.titles, None
+
+
+def _resolve_repo_name_with_owner_safe() -> str:
+    """Best-effort `owner/name` resolution for hook context. Empty on failure."""
+    try:
+        proc = subprocess.run(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+# ---- schema helpers --------------------------------------------------
+
+
+# The validation-severity token a hard (gating) parent-requiredness rule carries,
+# and the warning token it degrades to under advisory hierarchy. Centralised so
+# the create-issue gate and any future validator agree on the spelling.
+_SEVERITY_HARD_REJECT = "[validation-severity:hard-reject]"
+_SEVERITY_WARNING = "[validation-severity:warning]"
+
+
+def _parent_requiredness_is_gated(
+    type_entry: dict,
+    hierarchy: str,
+) -> bool:
+    """Whether a MISSING required parent-ref hard-rejects (gates) or just warns.
+
+    The hierarchy MODE governs this via a short-circuit, NOT a token
+    re-resolution (DEC-036 D4):
+
+    * ``hierarchy == "advisory"`` ⇒ return ``False`` (not gated) immediately,
+      BEFORE the authored severity is consulted. create-issue files parentless
+      and advises. The ``parent_ref_required_severity`` field is deliberately not
+      read on this arm — advisory short-circuits the gate regardless of the
+      authored default. (Resolving that authored token through the DEC-014 path
+      under advisory is deferred per ADR-026; the short-circuit is what ships.)
+    * otherwise (``gated`` / greenfield) ⇒ the per-type
+      ``parent_ref_required_severity`` field is the authored default (hard-reject
+      when the schema omits it); return ``True`` when it is ``hard-reject`` — the
+      byte-unchanged greenfield gate.
+
+    This governs ONLY parent-requiredness. The containment invariants carry no
+    such knob and are never reached here — they stay hard by construction.
+    """
+    if hierarchy == axis_labels.HIERARCHY_ADVISORY:
+        return False
+    authored = type_entry.get("parent_ref_required_severity", _SEVERITY_HARD_REJECT)
+    return authored == _SEVERITY_HARD_REJECT
+
+
+def _read_yaml(path: Path, yaml_loader: YAML) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = yaml_loader.load(path.read_text(encoding="utf-8"))
+    except (OSError, YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_members(capability_root: Path, yaml_loader: YAML) -> list[dict]:
+    path = capability_root / "project" / "members.yaml"
+    data = _read_yaml(path, yaml_loader)
+    members = data.get("members") or []
+    return members if isinstance(members, list) else []
+
+
+def _title_prefix_for(
+    type_entry: dict,
+    classification: dict,
+    structural_type: str,
+    kind: str,
+) -> str:
+    """Derive the rendered ``[Prefix]`` title prefix for a new issue (#356).
+
+    For a structural type whose title is *kind-driven* — the leaf ``task`` type,
+    where classification.yaml restricts non-``feature`` kinds — the prefix is read
+    from ``axes.type.title_prefix_by_value[<kind>]`` so ``--kind bug`` yields
+    ``[Bug]`` (what validate-body enforces against the kind label). All other
+    structural types (epic/feature/umbrella) carry kind ``feature`` implicitly and
+    use their own ``title_prefix`` (with ``title_case`` applied).
+    """
+    if classification_rules.kind_drives_title(structural_type, classification):
+        prefix_by_value = classification_rules.title_prefix_by_value(classification)
+        mapped = prefix_by_value.get(kind)
+        if mapped:
+            return str(mapped)
+    rendered = str(type_entry.get("title_prefix", structural_type.capitalize()))
+    if type_entry.get("title_case", "title") == "upper":
+        rendered = rendered.upper()
+    return rendered
+
+
+def _parent_ref_label(issue_types: dict, parent_type: str) -> str | None:
+    """The parent-ref label for a parent of structural type ``parent_type``.
+
+    The label is the parent type's own rendered ``title_prefix`` (epic→``EPIC``,
+    feature→``Feature``, umbrella→``Umbrella``) — the same token its
+    ``parent_ref_form`` uses. ``None`` when the parent type is unknown. Read by
+    ``body_parent_ref.type_label``, the one reading set-field shares.
+    """
+    return body_parent_ref.type_label(issue_types, parent_type)
+
+
+def _detect_parent_structural_type(parent_num: int, config: dict, issue_types: dict) -> str | None:
+    """Best-effort read of a parent issue's structural type from its title (#356).
+
+    Reads the parent's title via ``gh issue view`` and infers the structural type
+    so the body's parent-ref label matches the parent's REAL type. Returns ``None``
+    on any failure (gh absent, non-zero exit, non-JSON, missing/unknown title
+    prefix); the caller then degrades to the ``parent_ref_form``'s first option.
+    Quiet by design — a failed detection is a graceful degrade, not an error.
+    """
+    try:
+        proc = gh_run(
+            ["gh", "issue", "view", str(parent_num), "--json", "title"],
+            config,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    title = payload.get("title") if isinstance(payload, dict) else None
+    if not isinstance(title, str):
+        return None
+    # Prefix-only BY DESIGN: this infers a *parent's* structural type, and
+    # containers (EPIC/Feature/Umbrella) never carry kind prefixes. Passing
+    # `classification` here would resolve a kind-prefixed Task as a candidate
+    # parent, which the containment graph then rejects anyway — a behaviour
+    # change, not a fix. Do not "align" this in a future parity pass (#793).
+    return infer_structural_type(title, issue_types)
+
+
+def _parent_ref_form_matchers(parent_ref_form: str) -> list[re.Pattern[str]]:
+    """Compile a type's ``parent_ref_form`` into per-option first-line matchers.
+
+    Used to accept a ``--body-file`` whose first line is ANY allowed parent-ref
+    form for the type (#356), the same option set validate-body accepts. The
+    compilation lives in ``_lib.body_parent_ref`` — the one reading of the first
+    line, which the derived native link (#1033) uses too.
+    """
+    return body_parent_ref.form_matchers(parent_ref_form)
+
+
+def _parent_ref_line(
+    type_entry: dict,
+    parent_num: int | None,
+    milestone_num: int | None = None,
+    parent_label: str | None = None,
+) -> str:
+    """Build the parent-ref line that goes at the top of the body
+    (:func:`_parent_line`'s line)."""
+    return _parent_line(type_entry, parent_num, milestone_num, parent_label).line
+
+
+def _parent_line(
+    type_entry: dict,
+    parent_num: int | None,
+    milestone_num: int | None = None,
+    parent_label: str | None = None,
+) -> body_parent_ref.ParentLine:
+    """The parent-ref line that goes at the top of the body, and what to warn of.
+
+    When ``milestone_num`` is given (and the type permits milestone as a
+    parent), emits the markdown-link form so the rendered link points to
+    the actual milestone rather than auto-linking to an issue:
+        ``Milestone: [#<N>](../milestone/<N>)``
+
+    When ``parent_num`` is given, emits the plain ``<Label>: #<N>`` form
+    (issue auto-links are correct for issue parents), written by
+    ``body_parent_ref.issue_parent_line`` — the writer ``set-field --parent``
+    shares. ``parent_label`` is the label matching the PARENT's actual
+    structural type (e.g. ``EPIC`` for a Task filed under an EPIC, #356), used
+    when it is one of the type's forms; when it is ``None`` — the parent type
+    could not be detected — the label degrades to the first option in the type's
+    ``parent_ref_form`` (the prior behaviour), as it does, with a warning, for a
+    parent whose label the type's forms do not offer.
+    """
+    if milestone_num is not None and "milestone" in (type_entry.get("parent_issue_types") or []):
+        return body_parent_ref.ParentLine(body_parent_ref.milestone_line(milestone_num))
+    if parent_num is None:
+        return body_parent_ref.ParentLine("")
+    form = str(type_entry.get("parent_ref_form", "Parent: #<N>"))
+    return body_parent_ref.issue_parent_line(form, parent_num, parent_label)
+
+
+def _compose_body(template_path: Path, parent_ref: str) -> str:
+    """Read the template, strip GitHub-issue-template frontmatter, substitute parent ref."""
+    if not template_path.is_file():
+        # Minimal fallback body.
+        return parent_ref + ("\n\n" if parent_ref else "")
+    raw = template_path.read_text(encoding="utf-8")
+    body = _strip_issue_template_frontmatter(raw)
+    if parent_ref:
+        # Replace the first `<Label>: #` placeholder line (e.g., `Feature: #`)
+        # with the actual parent ref.
+        body = re.sub(
+            r"^([A-Za-z]+)(:\s*)#\s*$",
+            parent_ref,
+            body,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    return body
+
+
+def _strip_issue_template_frontmatter(raw: str) -> str:
+    """Remove a leading `---\\n...---\\n` block if present."""
+    if not raw.startswith("---\n"):
+        return raw
+    end = raw.find("\n---\n", 4)
+    if end < 0:
+        return raw
+    return raw[end + len("\n---\n") :]
+
+
+# ---- gh helpers ------------------------------------------------------
+
+
+def _gh_create_issue(
+    *,
+    title: str,
+    body: str,
+    labels: list[str],
+    assignee: str,
+    milestone_title: str | None,
+    config: dict,
+) -> str | None:
+    """Invoke `gh issue create` and return the issue URL on success.
+
+    ``milestone_title`` is the milestone's NAME, not its number:
+    `gh issue create --milestone` matches by name only (#223).
+    """
+    cmd = [
+        "gh",
+        "issue",
+        "create",
+        "--title",
+        title,
+        "--body",
+        body,
+        "--assignee",
+        assignee,
+    ]
+    for label in labels:
+        cmd.extend(["--label", label])
+    if milestone_title is not None:
+        # The `--milestone` argv fragment is constructed by the sole constructor
+        # (ADR-031); create-issue only chooses when it fires and splices it into
+        # its own create call (which also carries title / body / labels /
+        # assignee). The create itself executes below.
+        cmd.extend(milestone_create_args(milestone_title))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        print("error: `gh` not on PATH. Install GitHub CLI.", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(
+            f"error: gh issue create failed (exit {proc.returncode}).\n"
+            f"stderr: {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    # gh prints the URL on stdout.
+    return proc.stdout.strip() or None
+
+
+def _owner_from_issue_url(issue_url: str) -> str | None:
+    """Extract the `<owner>` segment from a github issue URL, or ``None``.
+
+    Both the board membership write (inside ``_gh_add_to_board``) and the
+    project-node-id resolution (``main`` → ``_resolve_project_node_id``) scope to
+    the issue's owner. They parse it independently at each site from the same
+    source URL, so the two agree by construction (pure regex over one input).
+    """
+    m = re.match(r"https?://[^/]+/([^/]+)/", issue_url)
+    return m.group(1) if m else None
+
+
+def _gh_add_to_board(board_id: int, issue_url: str, config: dict) -> str | None:
+    """Add an issue to a Projects v2 board via gh project item-add.
+
+    The owner is derived from the issue URL (github.com/<owner>/<repo>/...).
+
+    Returns the created board *item* node id on success (so the
+    `after_create_issue` `set-board-field` hook can target the new item per
+    DEC-037 §3 — the non-label field default), or ``None`` on any failure.
+    The item id is captured here, at the one moment it is freshly known,
+    rather than re-resolved with a board-wide GraphQL scan (the way the
+    one-time back-fill must, since it has no fresh item to read).
+
+    `gh project item-add --format json` returns the created item as
+    ``{"id": "<item-node-id>", ...}``; we read `.id` off that.
+    """
+    owner = _owner_from_issue_url(issue_url)
+    if owner is None:
+        return None
+    # Route through the `gh project` sole-constructor (#453): it threads the
+    # configured `GH_HOST` (a raw `subprocess.run` lands on github.com and fails
+    # `unknown owner type` on a GHES/org board, skipping the DEC-024 board-field
+    # hook) and splices `--owner` — preferring `gh.default_owner`, else the
+    # URL-derived `owner` passed here.
+    cmd = [
+        "gh",
+        "project",
+        "item-add",
+        str(board_id),
+        "--url",
+        issue_url,
+        "--format",
+        "json",
+    ]
+    try:
+        proc = gh_project_run(cmd, config, fallback_owner=owner, check=False)
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    item_id = payload.get("id") if isinstance(payload, dict) else None
+    return item_id if isinstance(item_id, str) and item_id else None
+
+
+def _set_first_status(
+    number: int,
+    item_id: str,
+    *,
+    owner: str | None,
+    board_config: dict,
+    substrate_map: axis_labels.SubstrateMap | None,
+    workflow: dict,
+    milestone_title: str | None,
+    labels: list[str],
+) -> None:
+    """Set the new card's Status to the state the issue was filed in (DEC-006).
+
+    Where the board's Status is a projection this project keeps — a board, and
+    the state carried off it (`_lib/board_status`) — the state is read as
+    `_lib/lifecycle_inference` reads an open issue's: Todo, or Backlog with a
+    milestone. Where the map binds the state to the board, the Status is its
+    source (DEC-062 point 5), and the issue is filed into Backlog with a
+    milestone, Todo otherwise, as the lifecycle reads a new issue's state with no
+    label: the write puts it there. Where a present map leaves the state out,
+    nothing is written. ``board_config`` names the board the card was added to,
+    `--board` included, and ``owner`` is the repository's owner, read from the
+    issue's url, by which the board is found where `gh.default_owner` is unset. A
+    write that fails is one line, and the issue stays filed."""
+    role = board_status.role(board_config, substrate_map)
+    if role is None:
+        return
+    milestone = {"title": milestone_title} if milestone_title else None
+    if role == "source":
+        state = infer.filing_state(milestone)
+    else:
+        state = infer.infer_current_state(
+            state="open", milestone=milestone, labels=labels, substrate_map=substrate_map
+        )
+    status = board_status.StatusBoard(board_config, workflow, repository_owner=owner)
+    written = status.write(number, state, item_id=item_id)
+    if role == "projection" or written.ok:
+        board_status.report(written, stands="the issue is filed")
+        return
+    print(
+        f"{written.line()}; the issue is filed, and the board carries its state, so its "
+        "position cannot be read until its card has a Status: set it on the board "
+        "(DEC-051 point 6)",
+        file=sys.stderr,
+    )
+
+
+def _resolve_project_node_id(board_id: int, owner: str | None, config: dict) -> str | None:
+    """Resolve the Projects-v2 *project* node id from the board NUMBER.
+
+    The `set-board-field` hook's field-value write needs the project's GraphQL
+    node id, but the adopter only declares the board *number*
+    (`projects_v2_board_id`). This resolves number → node id via `gh project
+    view --format json` (`.id`), the same read `back-fill.py`'s
+    `_resolve_project_node_id` and `pre-check` use — kept here as the per-create
+    half of that one resolution shape. A READ only; returns ``None`` when the
+    board does not resolve (the hook then skips with "no board configured"
+    rather than guessing).
+
+    Cache-first (#310): the board → node-id mapping is invariant, so the resolved
+    id is cached in adopter config as `projects_v2_node_id` at adoption time
+    (bootstrap / adopt-existing). When that cache is present this returns it and
+    SKIPS the per-create `gh project view` round-trip — the whole point of #310.
+    Only on a cache MISS does it live-resolve. Either path yields the SAME node id;
+    the cache just removes a synchronous read from the hot create path. (This
+    read-through does not write the cache back — population is the adoption
+    ceremonies' job, so a cache miss stays a live read without a create-time write.)
+    """
+    cached = config.get("projects_v2_node_id") if isinstance(config, dict) else None
+    if isinstance(cached, str) and cached:
+        return cached
+
+    # Route through the `gh project` sole-constructor (#453): a raw
+    # `subprocess.run` here would land on github.com and fail to resolve an
+    # org-owned board's node id on a GHES host. The constructor threads
+    # `GH_HOST` and splices `--owner` (prefer `gh.default_owner`, else the
+    # caller's URL-derived `owner`).
+    view_args = ["gh", "project", "view", str(board_id), "--format", "json"]
+    try:
+        proc = gh_project_run(view_args, config, fallback_owner=owner, check=False)
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    node_id = payload.get("id") if isinstance(payload, dict) else None
+    return node_id if isinstance(node_id, str) and node_id else None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

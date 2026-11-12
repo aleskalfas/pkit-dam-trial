@@ -1,0 +1,297 @@
+"""Shared `gh` CLI shell-out helper per [project-management:DEC-023-gh-host-and-owner].
+
+Every pm script that shells out to `gh` routes through this module so the
+adopter's `project/config.yaml` `gh:` block — not ambient shell state —
+determines which host and owner the call lands on. The public surface:
+`gh_env`, `gh_owner_flag`, `gh_run`, `gh_project_run`, `gh_get_issue`,
+`gh_get_pr`, `load_adopter_config`.
+
+`gh project` calls route through the `gh_project_run` sole-constructor (not
+`gh_run` directly): unlike `gh issue create`, `gh project` does not infer the
+host from the repo remote and needs an explicit `--owner` for an org-owned
+board, so the constructor always splices both (per DEC-023 + #453).
+
+Adopter config shape (both fields optional; absence = delegate to ambient):
+
+    gh:
+      host: github.com                  # threaded as GH_HOST env var
+      default_owner: ai-platform-incubation # spliced as `--owner` where applicable
+
+Precedence: config wins over ambient. When `GH_HOST` is set in the shell
+AND `gh.host` is set in config, the config value is what reaches `gh`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    from ruamel.yaml import YAML
+    from ruamel.yaml.error import YAMLError
+except ImportError:  # ruamel is in the kit's pyproject; this is defensive.
+    YAML = None  # type: ignore[assignment, misc]
+    YAMLError = Exception  # type: ignore[assignment, misc]
+
+
+def gh_env(config: dict[str, Any]) -> dict[str, str]:
+    """Build the `env=` dict to pass to subprocess.run for a `gh` invocation.
+
+    Always starts from os.environ (so adopter PATH, HOME, etc. propagate).
+    When the adopter config declares `gh.host`, override `GH_HOST` to that
+    value — this is the config-wins-over-ambient rule per DEC-023.
+
+    A caller that wants strict-no-ambient (test isolation) can pass the
+    returned dict to subprocess.run(env=...); the kit's normal callers
+    use it directly without thinking about it.
+    """
+    env = dict(os.environ)
+    gh_block = _gh_block(config)
+    host = gh_block.get("host")
+    if isinstance(host, str) and host:
+        env["GH_HOST"] = host
+    return env
+
+
+def gh_owner_flag(config: dict[str, Any]) -> list[str]:
+    """Return `['--owner', '<default_owner>']` when configured, else `[]`.
+
+    Callers splice the result into the `gh` argv where the operation
+    accepts `--owner` (project / org / cross-owner label operations).
+    For operations that don't accept `--owner`, callers don't call this
+    function — the helper does not auto-detect operation shape.
+    """
+    gh_block = _gh_block(config)
+    owner = gh_block.get("default_owner")
+    if isinstance(owner, str) and owner:
+        return ["--owner", owner]
+    return []
+
+
+def gh_project_run(
+    args: list[str],
+    config: dict[str, Any],
+    *,
+    fallback_owner: str | None = None,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
+    """The **sole constructor** for a `gh project` invocation (host + owner spliced).
+
+    `gh project` subcommands — unlike `gh issue create` — do NOT infer the host
+    from the repo remote and REQUIRE an explicit `--owner` for an org-owned board.
+    A raw `subprocess.run(["gh", "project", ...])` therefore lands on
+    `github.com` with no owner and false-negatives on a GitHub Enterprise host or
+    an org-owned board (the #453 failure). Routing every `gh project` call through
+    this one constructor makes that regression structurally unreachable — the
+    ADR-026 axis-label-seam pattern applied to project calls: no call site
+    string-appends `--owner` or picks a host itself.
+
+    What it splices:
+
+    * **host** — always, by delegating to :func:`gh_run` (which threads
+      `GH_HOST` from `config['gh']['host']`, config-wins-over-ambient per DEC-023).
+    * **owner** — prefer `config['gh']['default_owner']` (via
+      :func:`gh_owner_flag`); else the caller's `fallback_owner` (derived from the
+      issue URL or the repo remote); else no `--owner` at all (delegating to
+      `gh`'s own default-owner behaviour, the pre-#453 ownerless path). This is
+      the same precedence the ad-hoc `_resolve_board_owner` helpers already use,
+      lifted into the constructor so no call site re-implements it.
+
+    `args` MUST NOT already contain `--owner` — this constructor owns that flag.
+    Callers pass the bare `["gh", "project", <verb>, ...]` argv and their derived
+    owner as `fallback_owner`; the constructor decides the effective owner and
+    splices it after the argv (before any trailing kwargs to `gh_run`).
+
+    Returns the CompletedProcess unchanged (via :func:`gh_run`); callers interpret
+    exit code and stdout/stderr per the operation's contract.
+    """
+    owner_flag = gh_owner_flag(config)
+    if not owner_flag and fallback_owner:
+        owner_flag = ["--owner", fallback_owner]
+    return gh_run([*args, *owner_flag], config, **kwargs)
+
+
+def gh_run(
+    args: list[str],
+    config: dict[str, Any],
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
+    """Run a `gh` command with the adopter's pinned environment.
+
+    Equivalent to `subprocess.run(args, env=gh_env(config), ...)` with the
+    caller's kwargs forwarded. Defaults `text=True` and `capture_output=True`
+    so callers don't repeat the same boilerplate; passing those explicitly
+    overrides the default. Callers must include any `gh_owner_flag(config)`
+    elements in `args` themselves — the helper does not splice them.
+
+    Returns the CompletedProcess unchanged; callers interpret exit code
+    and stdout/stderr per the operation's contract.
+    """
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("capture_output", True)
+    # Always set env unless the caller explicitly passed env=None or env=...
+    if "env" not in kwargs:
+        kwargs["env"] = gh_env(config)
+    return subprocess.run(
+        args, **kwargs
+    )  # args composed from validated config + kit-controlled strings
+
+
+def gh_get_issue(
+    issue_number: int,
+    config: dict[str, Any],
+    *,
+    fields: str,
+) -> dict[str, Any] | None:
+    """Fetch issue data via `gh issue view --json <fields>`.
+
+    Returns the parsed JSON dict on success, or None on any failure
+    (gh not on PATH, non-zero exit, or non-JSON stdout). Each caller
+    passes only the `--json` fields it actually needs so the GitHub API
+    round-trip is minimal.
+
+    It is the capability's read of a single issue of work, so it refuses a
+    state issue ([project-management:DEC-058-state-issues] point 3): it asks
+    for the issue's body too, and returns None, with the reason printed,
+    where the body carries a state issue's marker. So no command of the
+    lifecycle acts on a state issue, and no check counts one as work. The
+    marker is read by the state-issue seam's one function (ADR-071 point 6).
+
+    Canonical error-handling pattern shared across all pm scripts:
+      - FileNotFoundError → gh is not on PATH; prints an error and returns None.
+      - Non-zero exit → prints gh's stderr and returns None.
+      - JSONDecodeError → prints a note and returns None.
+      - A state issue → prints why and returns None.
+
+    Callers must not rely on keys beyond those they requested in `fields`.
+    """
+    asked_body = "body" in (name.strip() for name in fields.split(","))
+    try:
+        proc = gh_run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--json",
+                fields if asked_body else f"{fields},body",
+            ],
+            config,
+            check=False,
+        )
+    except FileNotFoundError:
+        print("error: `gh` not on PATH. Install GitHub CLI.", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(
+            f"error: gh issue view {issue_number} failed.\nstderr: {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print(
+            f"error: gh returned non-JSON for issue {issue_number}.",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return data
+    if _is_state_issue(str(data.get("body") or "")):
+        print(
+            f"error: #{issue_number} is a state issue. It holds shared state, not work, "
+            "and no command of the lifecycle acts on it (DEC-058 point 3).",
+            file=sys.stderr,
+        )
+        return None
+    if not asked_body:
+        data.pop("body", None)
+    return data
+
+
+def _is_state_issue(body: str) -> bool:
+    """Whether `body` marks a state issue, by the state-issue seam's one
+    reader of the marker. Imported here, not at the top, since the seam's
+    module must load without this one."""
+    try:
+        from _lib.state_issues import is_state_issue
+    except ImportError:  # a test that puts `_lib` itself on the path
+        from state_issues import is_state_issue  # type: ignore[no-redef]
+    return is_state_issue(body)
+
+
+def gh_get_pr(
+    pr_number: int,
+    config: dict[str, Any],
+    *,
+    fields: str,
+) -> dict[str, Any] | None:
+    """Fetch PR data via `gh pr view --json <fields>` — `gh_get_issue`'s twin.
+
+    Same contract: the parsed JSON dict on success, None on any failure (gh
+    not on PATH, a non-zero exit — a PR that does not exist included — or
+    non-JSON stdout), with the reason printed to stderr. Callers pass only the
+    fields they need and must not rely on any others.
+    """
+    try:
+        proc = gh_run(
+            ["gh", "pr", "view", str(pr_number), "--json", fields],
+            config,
+            check=False,
+        )
+    except FileNotFoundError:
+        print("error: `gh` not on PATH. Install GitHub CLI.", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(
+            f"error: gh pr view {pr_number} failed.\nstderr: {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print(
+            f"error: gh returned non-JSON for PR {pr_number}.",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _gh_block(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the `gh:` mapping from adopter config; empty dict if absent.
+
+    Robust to both an absent `gh` key and a `gh: null` YAML value (which
+    PyYAML parses as None). Anything that isn't a mapping is treated as
+    absent — the validator in pre-check.py flags the shape error
+    separately.
+    """
+    block = config.get("gh") if isinstance(config, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def load_adopter_config(capability_root: Path) -> dict[str, Any]:
+    """Load the adopter's `project/config.yaml` and return it as a dict.
+
+    Returns an empty dict if the file is missing, empty, unparseable, or
+    not a mapping at the top level — every pm script's `gh` calls
+    continue to function with ambient state in that case. The `pre-check`
+    script is the gating layer that surfaces config-shape problems with
+    actionable diagnostics; this helper just gives every other script a
+    one-liner to get the adopter's config and thread it through `gh_run`.
+    """
+    if YAML is None:  # pragma: no cover — ruamel is in the kit's pyproject
+        return {}
+    path = capability_root / "project" / "config.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        data = YAML(typ="safe").load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}

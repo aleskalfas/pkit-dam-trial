@@ -1,0 +1,10 @@
+schema_version: 1
+backbone_version: 2.2.0
+completed_version: 2.2.0
+components:
+  - kind: adapter
+    name: claude-code
+    manifest: .pkit/adapters/claude-code/project/manifest.yaml
+  - kind: capability
+    name: project-management
+    manifest: .pkit/capabilities/project-management/project/manifest.yaml

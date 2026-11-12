@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "substrate-map.schema.json",
+  "title": "Substrate map — adopter axis→substrate bindings (brownfield)",
+  "description": "Formal shape of substrate-map.yaml — the OPTIONAL adopter-side file by which a brownfield project binds each methodology axis (type, priority, workstream, state) onto whatever its immutable tracker already encodes (per project-management:DEC-036, read-path contract ADR-026). The file's presence is the activation signal: ABSENT ⇒ greenfield (every axis reads the kit's own labels, byte-unchanged); PRESENT ⇒ each axis resolves through its declared binding, and any axis NOT listed degrades (treated as `unsupported`, NOT greenfield). Per axis EXACTLY ONE binding: `label` (a value→value remap onto existing labels), `title-prefix` (a value→prefix remap), `derive` (a detection predicate, lifecycle-state), `board: true` (the value lives on a field of the configured Projects-v2 board; `priority` / `workstream` / `state`, the board's Status field for `state`), `kit-label: true` (the kit's own `<axis>:<value>` labels, read, written and checked as with no map, per project-management:DEC-062 point 3), or `unsupported: true`. A map carries nothing beyond its bindings (DEC-062 point 4): a `kit-label` axis behaves in any map as it does with no map. Two top-level MODE selectors sit beside `axes` (neither is a label-encoded axis): `hierarchy` (`gated`/`advisory` — parent-requiredness, DEC-036 D4) and `containment` (`native`/`textual` — the containment substrate, DEC-039 D2 / ADR-035). Document-shaped schema: the file IS the resource (no id collection). Companion per COR-018 / the .pkit/schemas/ area conventions.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "axes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "pkit_schema": {
+      "type": "string",
+      "description": "Self-describing adopter-data binding (per COR-023). Expected value: 'project-management:substrate-map'."
+    },
+    "binds_to": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Per-schema fallback binding (per COR-023). Present on the capability-side schema YAML so the resolver can match an adopter substrate-map.yaml file without an explicit `pkit_schema:` field."
+    },
+    "source": {
+      "$ref": "refs.schema.json#/$defs/source"
+    },
+    "hierarchy": {
+      "type": "string",
+      "enum": ["gated", "advisory"],
+      "description": "Parent-ref MODE — how parent-REQUIREDNESS is enforced (per project-management:DEC-036 D4). NOT a label-encoded axis (the `label`/`title-prefix`/`derive` binding kinds do not fit a parent-ref mode), so it lives at the map's top level, beside `axes`, not under it. `gated` (the default when this key is ABSENT, and the greenfield behaviour): parent-refs are required where a type sets `parent_ref_optional: false`, gated as a hard-reject. `advisory`: a flat tracker — the parent-requiredness rules degrade to advisory (warning); a parent-ref is recorded as body-text when given but is NOT required and NOT gated, so create-issue never demands a parent the repo cannot express. The CONTAINMENT invariants (Feature-in-Feature, EPIC-in-EPIC, …) stay HARD in BOTH modes — `advisory` relaxes only requiredness, never the nesting rules. An absent key ⇒ `gated` (NOT advisory: the safe direction for a requiredness rule)."
+    },
+    "containment": {
+      "type": "string",
+      "enum": ["native", "textual"],
+      "description": "Containment SUBSTRATE selector — how the parent ↔ child edge is written (per project-management:DEC-039 D2, contract ADR-035). A MANUAL operator selector (auto-detection of sub-issue support is deferred). NOT a label-encoded axis (the `label`/`title-prefix`/`derive` binding kinds do not fit a substrate selector), so — like `hierarchy` — it lives at the map's top level, beside `axes`, not under it. `native` (the default when this key is ABSENT, and the greenfield behaviour): create-issue --parent sets GitHub's native sub-issue link IN ADDITION to the textual first-line parent-ref (the methodology ideal, DEC-005). `textual`: the tracker does not support native sub-issues (older GHES) or the operator prefers textual — the native link is NOT attempted; only the textual child-side parent-ref is recorded, and that ref is the universal spine written in BOTH modes (DEC-039 D3), so it is the containment record. The parent-side textual view is render-on-demand (DEC-039 D4), a separate build. An absent key ⇒ `native` (NOT textual: the safe default toward the methodology ideal — the read-time degradation in the containment seam already handles an instance that lacks native support). The selector INTENT lives in this committed map; no resolved value is written back (one-consumer contract, ADR-035 / DEC-036 D2)."
+    },
+    "axes": {
+      "type": "object",
+      "description": "Per-axis bindings. A key MAY be omitted entirely — an omitted axis in a present map is treated as `unsupported`, NOT greenfield (DEC-036 / ADR-026 the load-bearing rule). Only the four methodology axes are recognised; unknown keys are rejected.",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/axis_binding",
+          "not": { "required": ["board"] },
+          "description": "How the `type` axis is encoded in this tracker. The Feature-in-Feature containment invariant is keyed on `type` and stays HARD regardless of this binding (DEC-036 D4). `board` is NOT admissible here: PR-title alignment reads the type LABEL, and a board field is invisible from a PR — the label-carriage is a functional dependency, not a preference."
+        },
+        "priority": {
+          "$ref": "#/$defs/axis_binding",
+          "description": "How the `priority` axis is encoded — native P0/P1/P2 labels via a `label` remap, or `board: true` when a Projects-v2 board field carries it."
+        },
+        "workstream": {
+          "$ref": "#/$defs/axis_binding",
+          "description": "How the `workstream` axis is encoded — `board: true` when a Projects-v2 board field carries it, or `unsupported: true` when the tracker has no workstream encoding at all. The two are NOT interchangeable: `board` is served, `unsupported` degrades."
+        },
+        "state": {
+          "$ref": "#/$defs/axis_binding",
+          "description": "How the lifecycle-state axis is encoded: a `derive` predicate over open/closed + a blocked label (the DEC-033 detector swap), a `label` remap, the kit's own `state:*` labels (`kit-label: true`), or `board: true`, where the board's Status field is the source of an open issue's position (project-management:DEC-062 point 5), read as project-management:DEC-051 point 6 says. A closed issue is Done whatever its card says. Omitted or `unsupported`, the state degrades: it is read from the native primitives, and no board Status is written for it."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "axis_binding": {
+      "type": "object",
+      "description": "Exactly one binding per axis: `label`, `title-prefix`, `derive`, `board: true`, `kit-label: true`, or `unsupported: true`. An optional `default` (a substrate value to seed on writes) MAY accompany any of them — on a `board` arm it is corroborating metadata only (the hook carries the write), so a `default` with no matching `set-board-field` hook is reported.",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional substrate value to seed on a write when the caller supplies none (e.g. `P1` for a priority axis bound to native priority labels). A read-side note for the writer; the read seam never invents it."
+        },
+        "label": {
+          "$ref": "#/$defs/label_binding"
+        },
+        "title-prefix": {
+          "$ref": "#/$defs/title_prefix_binding"
+        },
+        "derive": {
+          "$ref": "#/$defs/derive_binding"
+        },
+        "board": {
+          "type": "boolean",
+          "const": true,
+          "description": "Bind the axis to the configured Projects-v2 board — the value lives on a board field, NOT on a label. PARAMETERLESS by design: the field identity is a WRITE parameter declared on the DEC-024 `after_create_issue` hook (a second declaration point for it was refused in config for the same reason), and a field name here would be a claim about a live board this file cannot self-validate. Admissible on `priority`, `workstream` and `state` — `type` is label-carried by functional dependency (PR-title alignment reads the label). On `state` the board's Status is the source of an open issue's position (project-management:DEC-062 point 5), read as DEC-051 point 6 says. The board flag carries no axis of its own: an axis is on the board only where this arm says so. REQUIRES `has_projects_v2_board: true`; the pair `board: true` + no configured board is unsatisfiable and is refused. Unlike `unsupported`, the axis is SERVED: rules needing it are not softened, and writers must not report a degraded label write as success."
+        },
+        "kit-label": {
+          "type": "boolean",
+          "const": true,
+          "description": "Bind the axis to the kit's own `<axis>:<value>` labels (per project-management:DEC-062 point 3). PARAMETERLESS: the labels are the kit's own, so there is nothing to remap. The axis is read, written and checked, and bootstrap creates its labels, exactly as with no map, so a project can move one axis off the kit's labels and keep the others on them with none degrading. Admissible on every axis."
+        },
+        "unsupported": {
+          "type": "boolean",
+          "const": true,
+          "description": "Mark the axis explicitly unsupported — the feature needing it degrades (advisory/disabled). Equivalent to omitting the axis from a present map; written explicitly when the adopter wants the intent on record."
+        }
+      },
+      "oneOf": [
+        { "required": ["label"] },
+        { "required": ["title-prefix"] },
+        { "required": ["derive"] },
+        { "required": ["board"] },
+        { "required": ["kit-label"] },
+        { "required": ["unsupported"] }
+      ]
+    },
+    "label_binding": {
+      "type": "object",
+      "description": "Bind the axis to an existing label set via a kit-value→adopter-label remap. The resolved substrate is the adopter's OWN label string (e.g. `P0`), never the kit's `<axis>:<value>` form.",
+      "additionalProperties": false,
+      "required": ["remap"],
+      "properties": {
+        "remap": {
+          "type": "object",
+          "description": "Map from a methodology value (the kit's own, e.g. `High`) to the adopter's existing label name (e.g. `P0`). A methodology value with NO entry here is value-unresolvable within this bound axis — it degrades only the rules depending on that value, never the axis as a whole (ADR-026 fourth arm).",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "title_prefix_binding": {
+      "type": "object",
+      "description": "Bind the axis to a title-prefix convention via a kit-value→prefix remap (e.g. `task → [Task]`). The resolved substrate is the prefix string the adopter already uses in issue titles.",
+      "additionalProperties": false,
+      "required": ["remap"],
+      "properties": {
+        "remap": {
+          "type": "object",
+          "description": "Map from a methodology value to the adopter's title-prefix string. A methodology value with no entry is value-unresolvable (the AUJ `[Task]`/`[Epic]`-but-no-`[Feature]` case, ADR-026 fourth arm).",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "derive_binding": {
+      "type": "object",
+      "description": "Bind the axis to a detection predicate over tracker reality — the DEC-033 detector swap for lifecycle-state (open/closed + a blocked label) in place of `state:*` labels. The predicate ENGINE (first-matching-detection-wins, reduced state set) lands with the detector work; this schema declares the binding shape only.",
+      "additionalProperties": false,
+      "required": ["states"],
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "The tracker signal the predicate reads (e.g. `open-closed`). Forward-declared; the detector engine that consumes it is sibling Wave-2 work.",
+          "minLength": 1
+        },
+        "states": {
+          "type": "object",
+          "description": "Map from a derived (collapsed) state id to the condition that detects it. The condition grammar is the detector engine's concern; declared here as a string per state so the binding is well-formed ahead of the engine.",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

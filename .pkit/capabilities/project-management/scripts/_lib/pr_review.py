@@ -1,0 +1,240 @@
+"""A pull request's required reviewers and its freshness rule, wired once (#1195).
+
+The verbs that judge a PR's reviewer verdicts must agree on who has to
+review it and on whether a verdict still stands:
+
+  * `done-work`'s merge gate counts each required reviewer's fresh verdict;
+  * `review-pr` invokes the required set and skips a reviewer whose verdict
+    is fresh;
+  * `show-pr --field review` / `review-history` mark a verdict stale exactly
+    when the gate would not count it (ADR-042 D2);
+  * `land-work`'s hold on `[person]` findings reads the verdicts of the
+    required set, and marks and holds on a stale one (through `done-work`'s
+    wiring, DEC-055 point 3).
+
+Each used to wire the resolver by hand — the same closing-issue, label and
+changed-files fetchers, the same opt-out and not-code reads, its own reading
+of the baseline, the same PR view fields and the same `rule_for_pr` call — so
+the agreement rested on three copies staying identical. This module is that
+wiring: `resolve_pr_review` resolves the PR's required set
+(`_lib.required_reviewers`) from the project config and returns it with the
+freshness rule it keys (`_lib.verdict_freshness`), and `REVIEW_VIEW_FIELDS`
+names what the rule and the verdict reading need from `gh pr view`.
+
+The substrate stays injected, as in the modules this one composes: the `gh`
+callables, the contribution collector and the author-change readers are
+arguments, and each verb passes the names its own module imported. A verb's
+tests patch those names on the verb's module, so the patches reach the
+resolution and the rule.
+
+The rule reads the PR's head, base and commits from its view, which
+`done-work` and `review-pr` fetch only once the resolution has succeeded —
+the gate after it has checked the per-reviewer overrides against the
+resolved set, too. So the rule is completed from the view the verb fetched
+(`PrReview.freshness_rule`), not fetched here: a refusal still comes before
+the round trip. When the head arrived on the host is read through the verb's
+`gh` helper, by the rule itself, and only when it judges a verdict that
+names no head (`_lib.head_arrival`).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+try:
+    from _lib.author_delta import AuthorDelta, BaseCheck
+    from _lib.closing_issue_fetchers import (
+        GhGetIssueFn,
+        GhRunFn,
+        issue_labels,
+        pr_base_and_head,
+        pr_changed_files,
+        pr_closing_issue_numbers,
+    )
+    from _lib.friction_answers import answers_folder
+    from _lib.head_arrival import HeadArrival, read_head_arrival, unread_arrival
+    from _lib.required_reviewers import (
+        Resolution,
+        _Unresolvable,
+        read_not_code,
+        resolve_required_local_reviewers,
+    )
+    from _lib.review_contributions import ContributionCollection
+    from _lib.review_opt_outs import read_opt_outs
+    from _lib.ruled_artefacts import RuledAlteration, ruled_altered
+    from _lib.verdict_freshness import PR_VIEW_FIELDS, FreshnessRule, rule_for_pr
+except ImportError:  # pragma: no cover - exercised via spec-loaded fallback
+    from author_delta import AuthorDelta, BaseCheck  # type: ignore[no-redef]
+    from closing_issue_fetchers import (  # type: ignore[no-redef]
+        GhGetIssueFn,
+        GhRunFn,
+        issue_labels,
+        pr_base_and_head,
+        pr_changed_files,
+        pr_closing_issue_numbers,
+    )
+    from friction_answers import answers_folder  # type: ignore[no-redef]
+    from head_arrival import (  # type: ignore[no-redef]
+        HeadArrival,
+        read_head_arrival,
+        unread_arrival,
+    )
+    from required_reviewers import (  # type: ignore[no-redef]
+        Resolution,
+        _Unresolvable,
+        read_not_code,
+        resolve_required_local_reviewers,
+    )
+    from review_contributions import ContributionCollection  # type: ignore[no-redef]
+    from review_opt_outs import read_opt_outs  # type: ignore[no-redef]
+    from ruled_artefacts import RuledAlteration, ruled_altered  # type: ignore[no-redef]
+    from verdict_freshness import (  # type: ignore[no-redef]
+        PR_VIEW_FIELDS,
+        FreshnessRule,
+        rule_for_pr,
+    )
+
+
+# The `gh pr view --json` fields a PR's verdicts are judged from: the comments
+# they are posted in, and what the freshness rule reads. A verb adds the
+# fields it needs for itself to these.
+REVIEW_VIEW_FIELDS = ("comments", *PR_VIEW_FIELDS)
+
+
+@dataclass(frozen=True)
+class PrReview:
+    """A PR's resolved required reviewers, and the freshness rule they key.
+
+    `resolution` is the required set, or the fail-closed reason it could not
+    be resolved (DEC-032 D5) — a verb checks `resolution.ok` before acting on
+    the set. `author_delta` and `base_kept` are `_lib.author_delta`'s, as the
+    verb passed them in, and `ruled_altered` is `_lib.ruled_artefacts`'.
+    `head_arrival` reads when the PR's head arrived, `(pr_view, head)`; by
+    default it reads nothing, so a verdict naming no head is stale.
+    """
+
+    resolution: Resolution
+    author_delta: Callable[..., AuthorDelta]
+    base_kept: Callable[..., BaseCheck]
+    ruled_altered: Callable[..., RuledAlteration] = ruled_altered
+    head_arrival: Callable[[Mapping, str], HeadArrival] = unread_arrival
+
+    def freshness_rule(self, pr_view: Mapping) -> FreshnessRule:
+        """The freshness rule for the PR at the head `pr_view` reports.
+
+        `pr_view` carries at least `REVIEW_VIEW_FIELDS`. A resolution that
+        failed names no floor-scoped reviewer, so under it every verdict goes
+        stale on any change.
+        """
+        return rule_for_pr(
+            pr_view,
+            self.resolution,
+            author_delta=self.author_delta,
+            base_kept=self.base_kept,
+            ruled_altered=self.ruled_altered,
+            head_arrival=self.head_arrival,
+        )
+
+
+def resolve_pr_review(
+    pr_number: int,
+    config: dict,
+    repo_root: Path,
+    *,
+    gh_run: GhRunFn,
+    gh_get_issue: GhGetIssueFn,
+    collect_contributions: Callable[[Path], ContributionCollection],
+    author_delta: Callable[..., AuthorDelta],
+    base_kept: Callable[..., BaseCheck],
+    ruled_altered: Callable[..., RuledAlteration] = ruled_altered,
+    folder_of: Callable[[Path], str | None] = answers_folder,
+    read_arrival: Callable[..., HeadArrival] = read_head_arrival,
+) -> PrReview:
+    """Resolve PR `pr_number`'s required reviewers, with their freshness rule.
+
+    The required set is DEC-032 D1's: the baseline under
+    `review.agents.local_registered:` united with every contributed reviewer
+    the PR's closing issues or its diff require, less the opt-outs, the diff
+    read through the not-code list — all read from `config`, the adopter's pm
+    config — and with the backbone's folder of friction answers left out of
+    the code floor. `repo_root` is the directory holding `.pkit/`, where
+    `collect_contributions` finds the installed contributions.
+
+    `gh_run` and `gh_get_issue` (`_lib.gh`'s) feed the closing-issue, label,
+    changed-files and base-and-head fetchers; `author_delta` and `base_kept`
+    are what the freshness rule reads the author's changes and the base's
+    history through. `ruled_altered` (`_lib.ruled_artefacts`') reads which
+    ruled artefacts a change altered, for the `touches-ruled-artefact` floor:
+    the resolver asks it about the PR's base and head, and the freshness rule
+    about each stretch of the author's own change since a reviewed head
+    (#1386). `folder_of` (`_lib.friction_answers.answers_folder`) reads where
+    the backbone keeps the friction answers at `repo_root`, asked only where
+    the code floor turns on it. `read_arrival`
+    (`_lib.head_arrival.read_head_arrival`) reads, through `gh_run`, when the
+    PR's head arrived on the host, for a verdict that names no head.
+    """
+    resolution = resolve_required_local_reviewers(
+        pr_number,
+        baseline_local=_baseline_local(config),
+        repo_root=repo_root,
+        closing_issue_numbers=lambda n: pr_closing_issue_numbers(n, config, gh_run=gh_run),
+        issue_labels=lambda n: issue_labels(n, config, gh_get_issue=gh_get_issue),
+        changed_files=lambda n: pr_changed_files(n, config, gh_run=gh_run),
+        opt_outs=read_opt_outs(config),
+        not_code=replace(read_not_code(config), answers_folder=lambda: folder_of(repo_root)),
+        collect_contributions=collect_contributions,
+        ruled_artefacts=lambda n: _ruled_artefacts(
+            n, config, gh_run=gh_run, ruled_altered=ruled_altered
+        ),
+    )
+    return PrReview(
+        resolution,
+        author_delta=author_delta,
+        base_kept=base_kept,
+        ruled_altered=ruled_altered,
+        head_arrival=lambda pr_view, head: read_arrival(pr_view, head, config, gh_run=gh_run),
+    )
+
+
+def _ruled_artefacts(
+    pr_number: int,
+    config: dict,
+    *,
+    gh_run: GhRunFn,
+    ruled_altered: Callable[..., RuledAlteration],
+) -> tuple[str, ...] | _Unresolvable:
+    """The artefacts PR `pr_number`'s change altered that an accepted rule
+    binds on, and those it brought under an accepted rule — from where it left
+    the base branch's head to its head — or why they cannot be read (DEC-032 D1)."""
+    commits = pr_base_and_head(pr_number, config, gh_run=gh_run)
+    if isinstance(commits, _Unresolvable):
+        return commits
+    found = ruled_altered(*commits)
+    return found.locations if found.ok else _Unresolvable(found.error)
+
+
+def _baseline_local(config: Any) -> list[str]:
+    """The baseline term of the required set: each named entry under
+    `review.agents.local_registered:`, in order."""
+    review = config.get("review") if isinstance(config, dict) else None
+    agents = review.get("agents") if isinstance(review, dict) else None
+    registered = (agents.get("local_registered") if isinstance(agents, dict) else None) or []
+    return [
+        entry.get("name") for entry in registered if isinstance(entry, dict) and entry.get("name")
+    ]
+
+
+def remote_baseline(config: Any) -> list[str]:
+    """The remote reviewers the gate requires: each `github_login` under
+    `review.agents.remote_registered:`, in order (DEC-028 step 2)."""
+    review = config.get("review") if isinstance(config, dict) else None
+    agents = review.get("agents") if isinstance(review, dict) else None
+    registered = (agents.get("remote_registered") if isinstance(agents, dict) else None) or []
+    return [
+        entry.get("github_login")
+        for entry in registered
+        if isinstance(entry, dict) and entry.get("github_login")
+    ]

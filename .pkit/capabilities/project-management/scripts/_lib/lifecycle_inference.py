@@ -1,0 +1,509 @@
+"""Shared issue-lifecycle position + gate inference (pm-local, DEC-033).
+
+This module is the single home of the issue-lifecycle's *domain* inference,
+lifted verbatim from `move-issue`'s pre-rebind logic so the rebound predicate
+commands resolve identical positions and gate outcomes — behaviour parity is
+the acceptance bar (DEC-033 Implications).
+
+The process engine (COR-033, in the binary) is content-free: it knows states,
+transitions, gates, a position, a journal — nothing about issues, labels,
+milestones, branches, or PRs. All of *that* lives here and is exposed to the
+engine only as the structured-JSON predicate contract (the detector + gate
+scripts call into this module).
+
+Position precedence (`infer_current_state`) reproduces move-issue's
+`_infer_current_state` EXACTLY in the greenfield (no-map) case — this is the #1
+parity risk per DEC-033:
+
+  1. GitHub issue state == closed                -> done
+  2. first `state:*` label present               -> that state
+  3. milestone assigned                          -> backlog
+  4. otherwise                                    -> todo
+
+Under a PRESENT substrate-map (ADR-026 §5, DEC-033 detector swap) the reader is
+map-aware. When that map binds `state` to a `derive` predicate, position
+resolves from the open/closed substrate (+ a blocked label) instead of the kit
+`state:*` labels — closed -> done, open+Blocked -> blocked, else the collapsed
+open-ish `open` — and any kit `state:*` label is IGNORED (the wedge #265 named,
+closed by #269). A `label`-bound `state` reads the adopter's mapped label set
+(reverse remap) in place of the kit set. No map / non-derive / greenfield reads
+exactly the four-step precedence above — the parity bar. The swap is a CHANGE OF
+PREDICATE, not of the engine/position contract (DEC-033): first-matching-detection
+still wins; only WHICH reality the predicate reads changes.
+
+Where the map binds `state` to the board, an open issue's position is the one its
+card's Status names ([project-management:DEC-062-axes-chosen-in-the-map] point 5),
+taken here as an input, a :class:`StatusRead`, beside the labels and the
+milestone: this module reads no board, and stays pure. Closed is Done with no
+board read. A Status that places the issue in no open state, or a read that came
+to nothing, yields :data:`UNDETERMINED`, never a guess from the labels or the
+milestone ([project-management:DEC-051-axis-carriage-activation] point 6).
+
+The lifecycle's classifier built on top of this (`detect-state`, which every
+state names) answers the one state this returns, so at most one state's
+detection is true and the order of states in workflow.yaml decides nothing
+among them; the per-state detectors, registered for direct use, are
+mutually exclusive for the same reason (each returns
+`result = (infer_current_state(...) == my_state)`). Because this reader is the
+single home of the position read (the classifier, the detectors and
+move-issue's local alias all delegate here), making it map-aware makes the whole
+detection path map-aware at one point — and that read AGREES with how
+move-issue / close-issue WRITE under a derive map (they write/strip no kit
+`state:*` label; the open/closed substrate carries state), so there is no
+read/write disagreement.
+
+The parent in-progress *descendant walk* (DEC-033 Implications (d)) is a
+pm-local breadth concern; it lives in `parent_has_active_descendant` here and is
+NEVER pulled into the engine. It is exposed as its own predicate, distinct from
+the position detectors — it must not alter the parity truth-table above (an
+issue's resolved position stays label-driven), so detection callers do not fold
+it into `infer_current_state`.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+from _lib import axis_carriage, axis_labels, default_branch, friction_answers
+from _lib.checkbox_gate import unticked_boxes  # noqa: F401 — re-export
+
+# Canonical state ordering — the one move-issue's forward checks and the forward
+# cascade read.
+STATE_ORDER = ["todo", "backlog", "in-progress", "review", "done"]
+
+#: The states a board's Status can place an open issue in: a closed issue is
+#: Done whatever its card says ([project-management:DEC-062-axes-chosen-in-the-map]
+#: point 5).
+OPEN_STATES = ("todo", "backlog", "in-progress", "review")
+
+#: The position of an open issue whose board-carried state its card's Status does
+#: not give ([project-management:DEC-051-axis-carriage-activation] point 6). It
+#: is no state of the lifecycle, so no command acts on it as one: each reads it
+#: as a position it cannot tell, never as a guess.
+UNDETERMINED = "undetermined"
+
+#: What the board's Status read of one open issue came to.
+StatusOutcome = Literal["placed", "unreadable", "no-card", "unset", "not-open"]
+
+
+@dataclass(frozen=True)
+class StatusRead:
+    """The board's Status of one open issue, as a read of it came out, where the
+    map binds state to the board (DEC-051 point 6). Pure data: a command reads
+    it through `_lib/board_status`, and :func:`infer_current_state` takes it
+    beside the labels and the milestone.
+
+    ``outcome`` is one of four, each its own: ``placed`` with ``state`` the open
+    state its Status names; ``unreadable``, the board could not be read, with
+    what was said in ``said``; ``no-card``; ``unset``; and ``not-open``, a
+    Status naming no open state, the option in ``said``. ``board`` names the
+    board, as `board #4`. ``named`` is True where an unreadable ``said`` names
+    the fault itself, as for no board configured or a board with no
+    single-select Status, and False where it is what `gh` said."""
+
+    outcome: StatusOutcome
+    state: str | None = None
+    said: str = ""
+    board: str = "the board"
+    named: bool = False
+
+    def finding(self, number: int) -> str:
+        """Why issue ``number``'s position is not read from the board, in one
+        sentence a command prints; empty where its Status placed it."""
+        if self.outcome == "placed":
+            return ""
+        if self.outcome == "unreadable":
+            return f"the board's Status of #{number} could not be read: {self.said}"
+        if self.outcome == "no-card":
+            return (
+                f"#{number} has no card on {self.board}, so its position cannot be "
+                "read from the board's Status"
+            )
+        if self.outcome == "unset":
+            return (
+                f"#{number}'s card on {self.board} has no Status, so its position "
+                "cannot be read from it"
+            )
+        return (
+            f"#{number}'s card on {self.board} has the Status {self.said!r}, which "
+            "names no open state, so its position cannot be read from it"
+        )
+
+    def remedy(self, number: int) -> str:
+        """What lets the read place the issue, for the line under the finding."""
+        if self.outcome == "unreadable" and self.named:
+            return "fix what is named above, then run this again"
+        if self.outcome == "unreadable":
+            return "fix what `gh` said above, then run this again"
+        if self.outcome == "no-card":
+            return (
+                f"add #{number} to {self.board} and set its Status to where the issue "
+                "stands, then run this again"
+            )
+        return (
+            f"set the Status of #{number}'s card to where the issue stands: Todo, "
+            "Backlog, In Progress or Review, then run this again"
+        )
+
+
+def filing_state(milestone: dict | None) -> str:
+    """The state a new issue is filed into: Backlog with a milestone, which is
+    the scheduling DEC-006's Todo → Backlog gate takes, else Todo — where the
+    lifecycle reads a new open issue with no state label."""
+    return "backlog" if milestone else "todo"
+
+
+def state_is_board_carried(substrate_map: axis_labels.SubstrateMap | None) -> bool:
+    """Whether the map binds state to the board, asked of the carriage accessor:
+    the board's Status is then the source of an open issue's position
+    ([project-management:DEC-062-axes-chosen-in-the-map] point 5). No I/O; the
+    board flag carries no axis, so the configuration is not consulted."""
+    return axis_carriage.is_board_carried("state", None, substrate_map)
+
+
+def workflow_process(workflow: dict | None) -> dict:
+    """Return the process-definition block of a parsed workflow.yaml.
+
+    Since the schema_version 3 rebind (DEC-033), `states` + `transitions` live
+    under a top-level `process:` block (the substrate shape, COR-033). This
+    helper resolves that block, falling back to the top level for a pre-v3
+    (schema_version 2) override an adopter may still hold — so pm readers work
+    against either shape. Returns an empty dict for unusable input.
+    """
+    if not isinstance(workflow, dict):
+        return {}
+    process = workflow.get("process")
+    if isinstance(process, dict):
+        return process
+    return workflow
+
+
+def legal_targets(workflow: dict | None, current_state: str, structural_type: str) -> list[str]:
+    """The states workflow.yaml lets an issue of `structural_type` move to
+    from `current_state`, in declaration order.
+
+    The one reading of the transition table's legality: move-issue refuses a
+    move whose target is not in this list, and the composing verbs (start-work,
+    review-work) ask the same question before they mutate anything (#942,
+    #947), so a pre-check and the move it guards cannot disagree. A transition counts only when its
+    `applies_to` names `[issue-types:<structural_type>]`.
+    """
+    transitions = workflow_process(workflow).get("transitions") or []
+    type_token = f"[issue-types:{structural_type}]"
+    out: list[str] = []
+    for t in transitions:
+        if not isinstance(t, dict):
+            continue
+        if t.get("from") != current_state:
+            continue
+        if type_token not in (t.get("applies_to") or []):
+            continue
+        target = t.get("to")
+        if isinstance(target, str):
+            out.append(target)
+    return out
+
+
+def state_display_name(workflow: dict | None, state_id: str) -> str:
+    """The `display_name` workflow.yaml gives `state_id` ("In Progress"), or the
+    id itself when it declares none."""
+    for state in workflow_process(workflow).get("states") or []:
+        if isinstance(state, dict) and state.get("id") == state_id:
+            name = state.get("display_name")
+            if isinstance(name, str) and name:
+                return name
+    return state_id
+
+
+def infer_current_state(
+    *,
+    state: str,
+    milestone: dict | None,
+    labels: list[str],
+    substrate_map: axis_labels.SubstrateMap | None = None,
+    status: StatusRead | None = None,
+) -> str:
+    """Best-effort live position — reproduces move-issue `_infer_current_state`.
+
+    **Board-carried `state` (the map binds `state: {board: true}`).** A closed
+    issue is Done, with no board read. An open issue stands where its card's
+    Status places it: ``status``, as the caller read it through
+    `_lib/board_status`. Where the Status does not place it — the board could
+    not be read, no card, no Status, a Status naming no open state, or no read
+    given — the position is :data:`UNDETERMINED`, and neither the labels nor
+    the milestone are read in its place, so nothing is guessed
+    ([project-management:DEC-051-axis-carriage-activation] point 6).
+
+    Otherwise two arms, selected by the adopter's substrate-map (ADR-026 §5, DEC-033):
+
+    **Greenfield / non-derive `state` (``substrate_map is None``, OR present but
+    `state` is not `derive`-bound).** The kit `state:*` precedence, UNCHANGED —
+    parity-critical, DO NOT reorder:
+      closed -> done; first `state:*` label; milestone -> backlog; else todo.
+    This is the byte-identical default: a `None` map (the default arg) reproduces
+    the pre-map behaviour exactly, so every caller that does not thread a map
+    keeps today's resolution. A present map whose `state` is `label`-bound reads
+    the adopter's mapped label set (reverse remap) in place of the kit `state:*`
+    set, falling through to milestone/todo as before; a present map whose `state`
+    is `title-prefix`/`unsupported`/absent simply finds no label and falls
+    through — none of these touch the closed->done or milestone arms.
+
+    **Derive-bound `state` (a present map binds `state` to a `derive` predicate).**
+    Position resolves from the open/closed substrate via
+    ``axis_labels.derive_state`` (ADR-026 §5's reduced state set): closed ⇒ the
+    terminal ``done``; an open issue with a ``Blocked`` label ⇒ ``blocked``; an
+    open issue without ⇒ the collapsed open-ish ``open``. This **ignores any kit
+    ``state:*`` label entirely** — a leftover ``state:todo`` (written before the
+    map was declared) must NOT shadow the open/closed read. The milestone arm
+    does not apply: a derive-from-open/closed binding cannot distinguish Backlog
+    from the other open-ish states, so they collapse to one ``open`` (the reduced
+    state set is the binding's decision, DEC-036). This closes the SIBLING GAP
+    #265's docstring named (#269 under Feature #268): the derive READ is a
+    predicate SWAP, faithful to DEC-033 — the engine/position contract is
+    unchanged, only WHICH predicate over reality resolves position.
+
+    This reader is the single home of the position read: the engine's
+    detection (`lifecycle_predicates.classify_state`, and `detect_state`
+    behind the per-state commands), `parent_has_active_descendant`, `cascade_members`
+    and move-issue's local alias all delegate here, so making
+    THIS map-aware makes the whole detection path map-aware in one place — the
+    read agrees with how move-issue / close-issue WRITE under a derive map (they
+    write/strip no kit `state:*` label; the open/closed substrate carries state).
+    """
+    if state_is_board_carried(substrate_map):
+        if state == "closed":
+            return "done"
+        placed = status.state if status is not None and status.outcome == "placed" else None
+        return placed if placed is not None and placed in OPEN_STATES else UNDETERMINED
+
+    derive = axis_labels.state_derive_binding(substrate_map)
+    if derive is not None:
+        # Derive-bound `state`: resolve from open/closed (+ blocked label),
+        # ignoring any kit `state:*` label (the wedge). The milestone/todo
+        # fall-throughs do not apply — the open-ish states are collapsed.
+        return axis_labels.derive_state(is_closed=state == "closed", labels=labels)
+
+    if state == "closed":
+        return "done"
+    # A present map may bind `state` to the adopter's own label set (reverse
+    # remap); greenfield reads the kit `state:*` set. `resolve_read` is the
+    # identity in the no-map case, so greenfield stays byte-identical.
+    label_state = axis_labels.resolve_read("state", labels, substrate_map)
+    if label_state is not None:
+        return label_state
+    if milestone:
+        return "backlog"
+    return "todo"
+
+
+def state_before_close(
+    *,
+    milestone: dict | None,
+    labels: list[str],
+    closed: bool,
+    substrate_map: axis_labels.SubstrateMap | None = None,
+    status: StatusRead | None = None,
+) -> str | None:
+    """Where an issue was in the lifecycle before it closed — the state the move
+    to `done` a close makes starts from (#1231) — or None where nothing says.
+
+    The one reading of it, for each reader of that move: close-issue's journal
+    entry, move-issue's entry for relabelling an issue GitHub closed, and the
+    forward cascade, which tells a finished issue from a won't-do one by where
+    it came from, where the issue did not close as completed. A closed issue
+    reads as `done` whatever else it carries, so this is
+    :func:`infer_current_state` read as if the issue were still open:
+
+    - its state label, where it has one — on an issue GitHub closed when a pull
+      request merged, where the merge found it, for as long as nothing has
+      written its label to `done` since;
+    - else, where it has a milestone, `backlog` — **inferred**, as an open
+      issue's position is: nothing recorded it there, so an issue a merge closed
+      from Review whose only mark was a milestone reads as backlog all the same;
+    - else, on an issue still open, `todo`: its position, as the engine detects
+      it;
+    - else None: an issue already closed with neither a state label nor a
+      milestone carries nothing of where it was, and `todo` would read its close
+      as a won't-do. A reader that needs to know then turns to the close reason.
+
+    None, too, under a `derive`-bound `state`: open/closed is then the only state
+    the issue carries, so nothing records where in the lifecycle it was.
+
+    Where the map binds state to the board, the card's Status, ``status``,
+    records it: a merge's close leaves the card where the work was, such as at
+    Review. None where the Status places the issue in no open state.
+    """
+    if state_is_board_carried(substrate_map):
+        placed = infer_current_state(
+            state="open",
+            milestone=milestone,
+            labels=labels,
+            substrate_map=substrate_map,
+            status=status,
+        )
+        return None if placed == UNDETERMINED else placed
+    if axis_labels.state_derive_binding(substrate_map) is not None:
+        return None
+    if (
+        closed
+        and not milestone
+        and axis_labels.resolve_read("state", labels, substrate_map) is None
+    ):
+        return None
+    return infer_current_state(
+        state="open", milestone=milestone, labels=labels, substrate_map=substrate_map
+    )
+
+
+# --- gate inference -------------------------------------------------------
+#
+# DEC-007's unticked-checkbox rule is NOT re-implemented here: it lives in
+# `_lib.checkbox_gate`, the one home shared with close-issue / done-work /
+# merge-pr, and is re-exported above so `gate_checkboxes_ticked` and this
+# module's other readers see the same answer the commands refuse on.
+
+
+def closing_issue_numbers(pr_body: str) -> list[int]:
+    """Issue numbers a PR closes via `Closes/Fixes/Resolves #N` (cross-checked
+    against the checkbox close-gate) — outside a list of the answers an earlier
+    run left, which closes nothing (DEC-065 point 1)."""
+    pattern = re.compile(r"\b(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
+    seen: list[int] = []
+    for m in pattern.finditer(friction_answers.strip(pr_body or "")):
+        n = int(m.group(1))
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
+def branch_matches_issue(branch: str, issue_number: int) -> bool:
+    """True when a branch name matches the `<type>/<N>-<slug>` shape for the
+    issue (the start-work convention)."""
+    return bool(re.match(rf"^[a-z]+/{issue_number}-", branch))
+
+
+#: The DEC-013 integration-branch marker. It sits ABOVE the parent-ref as the
+#: first body line (`Integration: integration/<slug>`), so every parent-ref
+#: recognizer must skip it or the marker shadows the parent-ref (#763).
+# The marker's shape is owned by body-format.yaml `integration_marker.pattern`
+# (git-conventions.yaml's `designation_marker_pattern` is declared "the git-side
+# view" of the same shape). This constant is kept byte-identical to that schema
+# value — `tests/test_pm_integration_marker.py` drift-guards the equality, so the
+# schema stays the contract (COR-018). Anything looser would strip a typo'd
+# marker (e.g. `integration/Foo_Bar!!`) instead of letting it fall through and
+# hard-reject — the guard DEC-013 promises.
+INTEGRATION_MARKER_RE = re.compile(r"^Integration: integration/([a-z0-9][a-z0-9-]*[a-z0-9])$")
+
+# A line that *attempts* the marker — starts with the `Integration:` key — but may
+# be malformed. validate-issue uses this to distinguish "no marker" from "marker
+# present but wrong form", so it can emit a clear marker-form finding rather than a
+# misleading parent-ref message.
+ATTEMPTED_INTEGRATION_MARKER_RE = re.compile(r"^Integration:")
+
+
+def strip_integration_marker(body: str) -> str:
+    """Return `body` with a leading DEC-013 `Integration:` marker line removed.
+
+    The marker is the first body line, above the parent-ref (DEC-013). Parent-ref
+    recognizers call this first so the marker doesn't shadow the parent-ref — the
+    single source of truth for the skip (the recognition itself lives in
+    `body_parent_ref`, which every reader of an issue's parent goes through, and
+    in `validate-issue` / `edit-issue`'s own form check). No-op when absent."""
+    if not body:
+        return body
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue  # skip leading blanks
+        if INTEGRATION_MARKER_RE.match(line.strip()):
+            del lines[i]
+            return "\n".join(lines)
+        return body  # first non-blank line is not the marker → unchanged
+    return body
+
+
+def _first_content_line(body: str) -> str | None:
+    """First non-blank line of `body`, stripped; None when empty/all-blank."""
+    for line in (body or "").splitlines():
+        s = line.strip()
+        if s:
+            return s
+    return None
+
+
+def malformed_integration_marker(body: str) -> str | None:
+    """The first content line, when it *attempts* a DEC-013 integration marker
+    (`Integration:` key) but does not match the valid `integration/<slug>` form;
+    else None.
+
+    validate-issue uses this to emit a precise marker-form hard-reject (DEC-013 /
+    #763 AC3) instead of the misleading `body.parent-ref` message a malformed
+    marker would otherwise trigger by falling through to the parent-ref check."""
+    first = _first_content_line(body)
+    if first is None:
+        return None
+    if ATTEMPTED_INTEGRATION_MARKER_RE.match(first) and not INTEGRATION_MARKER_RE.match(first):
+        return first
+    return None
+
+
+def integration_slug(body: str) -> str | None:
+    """The `<slug>` from a DEC-013 `Integration: integration/<slug>` marker on the
+    body's first content line, or None when absent (or malformed). Consumers derive
+    the owning integration branch as `integration/<slug>` — through
+    `resolve_base_branch`, which every branch- and PR-opening verb shares."""
+    first = _first_content_line(body)
+    if first is None:
+        return None
+    m = INTEGRATION_MARKER_RE.match(first)
+    return m.group(1) if m else None
+
+
+def resolve_base_branch(config: dict, body: str, *, explicit: str | None = None) -> str:
+    """The base branch for an issue's work (DEC-013 `base-branch`) — the ONE
+    resolution shared by start-work (branch start-point) and every PR-opening
+    verb (open-pr, create-draft, review-work), so the branch and its PR agree.
+
+    Precedence: an `explicit` caller choice (a verb's `--base`) wins; else the
+    closing issue's `Integration: integration/<slug>` marker names the base;
+    else the project's default branch, as the backbone declares it (COR-054;
+    `_lib/default_branch`). A malformed marker is not a branch and falls
+    through to the default. Takes no HEAD input, so the checked-out branch can
+    never leak in (#835). Raises `default_branch.Unanswered` when the default
+    branch is needed and the backbone cannot say it: the verbs refuse rather
+    than cut from, or target, a guessed branch."""
+    if explicit:
+        return explicit
+    slug = integration_slug(body)
+    if slug:
+        return f"integration/{slug}"
+    return default_branch.name(config)
+
+
+def state_is_active(state: str) -> bool:
+    """True when a state is in-progress or further (used by the parent
+    descendant walk: a parent is 'active' if a descendant is at least
+    in-progress).
+
+    Greenfield reads the kit five-state order (in-progress / review / done all
+    count as active — `done` counts because it is `>= in-progress` in the order;
+    this is the established greenfield contract and is preserved here unchanged).
+    Under a `derive` binding the open-ish states collapse to a single ``open``
+    (ADR-026 §5) that subsumes in-progress — the predicate cannot tell Backlog
+    from In-progress — so a derived ``open`` (and the open-ish ``blocked``)
+    counts as active: the forward-cascade walk treats a possibly-in-flight
+    open-ish child as active rather than silently dropping it (a `ValueError` on
+    `STATE_ORDER.index("open")` would otherwise misclassify it as inactive). The
+    derived ``done`` IS ``"done"`` (the kit terminal value), so it falls through
+    to the order check and counts active exactly as greenfield `done` does — no
+    divergence. A whole-tracker derive map is the only place ``open``/``blocked``
+    appear, so this does not perturb the greenfield order.
+    """
+    if state in (axis_labels.DERIVE_STATE_OPEN, axis_labels.DERIVE_STATE_BLOCKED):
+        return True
+    try:
+        return STATE_ORDER.index(state) >= STATE_ORDER.index("in-progress")
+    except ValueError:
+        return False

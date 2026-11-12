@@ -1,0 +1,121 @@
+# Harness requirements — the properties the methodology requires of the
+# harness that hosts it (COR-047).
+#
+# Each entry states one requirement as observable behaviour any harness could
+# satisfy (never as one harness's key, flag, or tool), names where its truth
+# is visible (its observation point), and cites the defect or design
+# dependency that admitted it. Adapters answer these entries in their own
+# support declarations; a requirement with no declaration for the harness in
+# use, or whose observation point a verification pass cannot reach, resolves
+# indeterminate — never satisfied. Admission is demand-driven: an entry needs
+# evidence to enter, and a transient one names its retirement condition.
+
+schema_version: 1
+
+
+# Entries. Lookup by id.
+#
+# Per-entry fields (declared in the companion's $defs.entry.properties):
+#   title:                short name
+#   behaviour:            the observable behaviour, harness-neutral
+#   observation_point:    out-of-session | interposed-runtime | in-session
+#   evidence:             the defect or design dependency that admitted it
+#   retirement_condition: (optional) when a transient requirement retires
+requirements:
+  delegated-result-complete:
+    title: A delegated helper's full result reaches the agent that delegated to it
+    behaviour: >-
+      When an agent delegates work to a helper through the harness, the helper's
+      complete result is delivered back to the delegating agent — uncut, and
+      without any further exchange being needed to retrieve the remainder.
+    observation_point: in-session
+    evidence: >-
+      Measured in a live session on 2026-09-12: with the harness's experimental
+      multi-agent feature enabled, three helpers spawned with a name each
+      returned a result hard-truncated at exactly 4064 characters, the remainder
+      retrievable only through a messaging tool the delegating agent did not
+      hold. Reviewer output routinely runs 8–12 KB, so more than half of each
+      review was silently lost while the surviving prefix read as complete. The
+      methodology's own reviewer dispatch depends on this behaviour; its interim
+      mitigation is to dispatch helpers unnamed, recorded as standing discipline
+      for the project-management agent.
+    retirement_condition: >-
+      The harness delivers a helper's full result to the delegating agent
+      regardless of how the helper was spawned, or removes the delivery mode
+      that truncates it — verified by repeating the measurement.
+  unattended-confined-run:
+    title: A process can start an agent unattended, confined for that one run
+    behaviour: >-
+      A process can start an agent with nobody attending. For that one run,
+      the agent is confined to rules and a folder the process sets. A call
+      those rules do not allow is refused, not asked. After the run, the
+      process can read the run's files and its outcome.
+    observation_point: out-of-session
+    evidence: >-
+      A design dependency (COR-047 point 9): project-management DEC-056 point
+      5 starts each granted fixer with nobody watching, held to what
+      proposing needs, and ADR-066 point 13 words what it requires of the
+      harness. The drift command, `pkit pm fix-drift`, is the first command
+      that depends on it.
+  unattended-working-run:
+    title: A process can start an agent unattended that edits and builds in a folder the process names
+    behaviour: >-
+      A process can start an agent with nobody attending, in a folder it
+      names, under only the settings it passes. Everything the agent runs is
+      held inside a sandbox that writes only that folder. A call no rule
+      allows is refused, not asked. Each event of the run reaches the process
+      as it happens, and so do the calls it refused. The process can run a
+      command with no agent inside the same sandbox.
+    observation_point: out-of-session
+    evidence: >-
+      A design dependency (COR-047 point 9): project-management DEC-063
+      starts a fresh builder for each of a worker's Tasks, in a sandboxed
+      clone of its own, and ADR-073 words what it requires of the harness.
+      The build command, `pkit pm build-task`, is the first command that
+      depends on it.
+  session-loads-rules:
+    title: Every session holds every layer's loaded rules from its start to its end
+    behaviour: >-
+      Each session the harness starts in a project holds every layer's loaded
+      file of operational rules — the methodology core's, each installed
+      capability's and the project's — from the session's start and for its
+      whole length, after the harness shortens the session's context too. That
+      covers a session a person starts, a helper an agent delegates to, and a
+      run started with nobody attending.
+    observation_point: interposed-runtime
+    evidence: >-
+      A design dependency (COR-047 point 9): COR-070 point 6 states it, resting
+      on COR-068 point 2, under which a loaded rule binds only on the sessions
+      that load its file. A harness may load its start-up files in a session a
+      person starts and not in some helpers it starts for another agent, or in
+      a run started without the project's settings, and a session that loads
+      none is bound by none of the rules, with nothing to say so.
+  session-agent-withheld-tools:
+    title: A session's agent withheld named tools has none of them and keeps the rest
+    behaviour: >-
+      An agent whose definition names tools it is withheld, run as a whole
+      session's agent, has none of those tools in the session. It keeps
+      every other tool the session holds, the tools of each server the
+      session connects included.
+    observation_point: out-of-session
+    evidence: >-
+      A design dependency (COR-047 point 9): project-management DEC-068 runs
+      its project manager as a whole session's agent, through the project's
+      default-agent switch, with every tool the session gives it less a list
+      it is withheld. COR-013 point 7 and ADR-085 word what it requires of the
+      harness. A withheld tool the harness still offered would give back what
+      the definition took away, with no sign. It is seen in the report a
+      session gives at its start.
+  helper-withheld-tools:
+    title: A helper withheld named tools has none of them
+    behaviour: >-
+      An agent whose definition names tools it is withheld, run as a helper
+      another agent delegates to, has none of those tools.
+    observation_point: in-session
+    evidence: >-
+      A design dependency (COR-047 point 9): the project manager whose
+      definition withholds tools (project-management DEC-068) also runs as a
+      helper where another session dispatches it (project-management DEC-029,
+      "Invocation pattern"), and ADR-085 words what it requires of the
+      harness. A helper's tools are visible only inside the session that
+      dispatches it.

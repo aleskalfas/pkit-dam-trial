@@ -1,0 +1,66 @@
+# pm validate-body — check an issue body against the methodology
+
+Sub-procedure of the pm composite skill (`pm.md` in this folder). Per [project-management:DEC-020-methodology-as-executable-commands], this sub-procedure has thinned to an intent-to-command router: the methodology's body rules live in `body-format.yaml` + `titles.yaml` + `classification.yaml` + `issue-types.yaml`; the deterministic `validate-issue.py` script reads them and surfaces findings; this file maps user intent to the script invocation.
+
+## When to use this operation
+
+- Just before re-stamping an issue body after an edit (e.g., the user supplied new acceptance criteria — validate the result before pushing).
+- Before transitioning an issue to Done — the close-gate from [project-management:DEC-007-checkbox-validation] is checked here.
+- On first interaction with an inherited issue (filed before the capability was installed, or filed in a different repo) — surfaces every rule violation as a starting point for the operator to fix.
+- As a CI gate when the adopter wires the script into a PR check (the script's `--json` output is designed for that).
+
+This operation **does not mutate** the issue. It reports findings; the caller decides whether to edit the body (then re-validate), bypass (with audit; not yet automated in v0.3.x), or accept the warnings.
+
+## What the script enforces
+
+The deterministic enforcement lives in `scripts/validate-issue.py`. It reads `issue-types.yaml` (structural-type inference from title prefix), `titles.yaml` (per-type title pattern and wording rules), `body-format.yaml` (per-type required sections + universal body rules), `classification.yaml` (axes presence + mutual exclusion), and the adopter's `project/config.yaml` (substrate mode).
+
+Behaviour summary (the script is the source of truth):
+
+- **Membership gate** (per [project-management:DEC-021-team-membership-gate]) — closed mode refuses non-members.
+- **Title format** — validates the title prefix against the per-type regex. A Task's prefix may be `[Task]` or a kind-driven one (`[Bug]`, `[Docs]`, `[Test]`, `[Refactor]`, `[Chore]`); the title-format finding lists every accepted prefix. Then every wording rule `titles.yaml` declares for the type, under its `name` as the finding label: a Conventional Commits prefix after the bracket is a hard-reject at `--phase create` and a warning at `--phase transition`, so a title filed before the rule was enforced does not block a move; a lowercase `scope:` token after the bracket and a Task title under 30 characters after its prefix are warnings (EPIC, Feature and Umbrella titles have no length floor).
+- **Required body sections** — checks every `## Heading` listed in `body-format.yaml`'s `required_sections` for the inferred type.
+- **Parent-ref first line** — checks the first non-empty body line matches the `parent_ref_form` for the type (when `parent_ref_optional: false`).
+- **Classification axes** — `type:*` label required and mutually exclusive; `priority:*` and `workstream:*` demanded according to where each axis is actually carried, asked per axis rather than inferred from whether a board exists ([project-management:DEC-051-axis-carriage-activation] decision point 1). The kit's own label is demanded only where the kit's labels are that axis's substrate; an axis bound to the adopter's own labels is checked against those; an axis carried by a title prefix, a derive predicate, or nothing at all is not demanded. A board-carried axis reports as unverified rather than missing — this gate does not read board fields.
+- **Kind/structural consistency** (per [project-management:DEC-011-title-formats] / `classification.yaml`'s `structural_restriction`) — a non-`feature` `type:*` label on an epic/feature/umbrella is the kind/structural mismatch; those structural types carry kind `feature` by definition. Severity is **phase-split** (#410): at `--phase create` it is a hard-reject (at the schema's `mismatch_severity`) — refused at the point of manufacture; at `--phase transition` (the default) the same finding is reported at **warning** severity and does **not** block the transition, because a pre-existing container-kind mismatch corrupts the closing-PR conv-type derivation (a create-PR concern), not the transition in flight. This is the validate-issue enforcement point DEC-011 names (create-phase refusal, transition-phase report).
+- **Kind prefix / kind label** (per `titles.yaml`'s `issue-task` validations) — a Task whose kind-driven prefix disagrees with its `type:*` label (e.g. `[Task]` on `type:docs`) is reported as a kind-prefix mismatch. Greenfield only; containers are exempt. Phase-split the same way (#410): hard-reject at `--phase create`, warning at `--phase transition`, because the closing PR's conv-type reads the label, not the prefix, so a pre-existing drift does not affect the move in flight. Retitle, or change the kind (`set-field --kind` rewrites both).
+- **Mandatory assignment** (per [project-management:DEC-019-mandatory-issue-state]) — surfaces as a warning at validate-time; would be hard-reject at filing.
+- **Universal body rules** — h1 (`# ...`) headings forbidden (the issue title is the h1); `file:line` references emit a warning (line numbers go stale); a `## Implementation` or `## How` section emits a warning; a decision id that no record holds emits a warning, read through `pkit refs lookup` (a bare `DEC-NNN`, which names no capability, is not checked, and a lookup that fails is one notice that the ids were not checked). The capability README ("Issue body validation") names the forms of id it reads and the two finding labels.
+- **Use-case citations** (per [project-management:DEC-054-use-case-validation]) — on a Feature or Task body, each use-case id cited in the `## Use cases` section is read against the use-case point, `pkit::work-tracking:use-cases`: the use cases settled on the default branch. One the point does not hold is reported, naming what the set was read against — the default-branch commit, or the project's filler file. The check is of existence only: an id the point holds passes, whichever use case the author meant, and so does a withdrawn one. An id outside that section is not a citation, a body of another type is not read, and a body that cites nothing resolves nothing. While nothing defines or fills the point, the rule says nothing. When the point cannot be read, or answered without a filler that was meant to answer, one notice says which citations were not checked, and why: a notice about the check, never a report that a use case is unknown. Both are reported at the severity the rule's token in `body-format.yaml` gives, a warning, and neither refuses anything. Remedy for a citation the point does not hold: cite only use cases that have settled, or drop the id; if the use case has landed since, fetch the default branch and validate again. The capability README ("Use cases in planning and in bodies") names the two finding labels and shows each line.
+
+Findings are tagged by the severity token read from the relevant schema entry: `[validation-severity:hard-reject]`, `[validation-severity:bypassable-with-audit]`, or `[validation-severity:warning]`. The script's output groups by severity and the exit code carries the gate:
+
+- Exit `0` — every check passed, or only warning-level findings.
+- Exit `1` — one or more `hard-reject` or `bypassable-with-audit` findings.
+- Exit `2` — usage error (issue not found; `gh` failure).
+
+## How to invoke
+
+Dispatch via the kit-level capability-command dispatcher (per [pkit:COR-021]):
+
+```
+pkit project-management validate-issue <issue-number> [--json] [--capability-root <path>]
+```
+
+Direct-path is equivalent:
+
+```
+.pkit/capabilities/project-management/scripts/validate-issue.py 42 --json
+```
+
+`--json` is the canonical surface for CI integration; the JSON shape carries the issue number, title, and findings array (each with `severity`, `label`, `detail`).
+
+## Handling the script's output
+
+- **No findings** — surface "no findings" cleanly. The body is valid against every rule the methodology mandates.
+- **Findings present** — surface the script's output verbatim. Do not re-summarise or re-order; the severity grouping + `summary:` line are the contract.
+- For each blocking finding, recommend the remediation: edit the body to add missing sections, fix the title prefix, etc. After the user edits, re-run the script.
+- For warning-level findings, mention them but do not block — the user decides whether to address now or defer.
+
+## Intent recognition
+
+The LLM's only judgment before invoking is which issue to validate. Everything downstream is the script's job — pass the issue number through and surface the result.
+
+## Forward-looking note — bypass flag
+
+`bypassable-with-audit` severity findings (per [project-management:DEC-014-validation-severity-model]) are recognised by the script today but the `--bypass "<reason>"` invocation form is a follow-up. When it lands, this sub-procedure walks the audit-comment ceremony before the bypassing mutation runs.

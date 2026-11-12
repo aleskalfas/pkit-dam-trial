@@ -1,0 +1,47 @@
+# Adopter overlay for kit-shipped agents (per COR-013).
+#
+# Each top-level key is a *category* — a named bucket of adopter-specific
+# paths. Kit-shipped agents reference these categories via `<name>`
+# placeholders in their frontmatter and body. The deploy-agents primitive
+# resolves each placeholder with the values listed here at deploy time.
+#
+# Customise this file for your project's actual file paths. The defaults
+# below assume a generic repo layout — change them to the docs your team
+# actually uses.
+
+workflow-docs:
+  - README.md
+
+project-root-docs:
+  - README.md
+
+# Architecture documentation roots (per COR-024). The architect agent
+# reads these; populate with the docs your team treats as architectural.
+# Conventional default points at docs/architecture/ when that tree exists.
+architecture-docs:
+  - README.md
+
+# ADR records location (per COR-024 + COR-025). The architect agent owns
+# this directory; `pkit new decision adr <slug>` stamps records here. The
+# directory is not created on install — author your first ADR via the
+# command, which prompts you to create the directory first.
+adr-records:
+  - docs/architecture/decisions/
+
+# Process-authoring targets (per ADR-051). The `process-author` agent's write
+# authority: your own process-definition files and predicate-script locations,
+# at FILE granularity — not whole capability subtrees, and never `package.yaml`
+# (the process commands own predicate registration). Ships as an explicit empty
+# list, so the agent deploys owning nothing until you nominate paths; an entry
+# that resolves into sync-managed content is refused at deploy time.
+process-authoring-targets: []
+
+# Per-agent overrides (optional): replace categories for a specific agent,
+# and set the model / effort it runs at (absent = inherit from the caller).
+# overrides:
+#   product-manager:
+#     workflow-docs:
+#       - docs/roadmap.md
+#   critic:
+#     model: sonnet        # inherit, an alias (sonnet, opus, haiku, …) or claude-…
+#     effort: medium       # inherit, low, medium, high, xhigh or max

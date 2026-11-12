@@ -1,0 +1,8 @@
+schema_version: 1
+component:
+  kind: adapter
+  name: claude-code
+  version: 0.8.0
+  installed_at: '2026-11-12T22:38:38.081806+00:00'
+requires_backbone: '>=2.0.0,<2.1.0'
+backend_state: {}

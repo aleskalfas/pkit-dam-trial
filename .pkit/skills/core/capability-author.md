@@ -1,0 +1,225 @@
+---
+name: capability-author
+description: Author a new capability — an opt-in installable methodology discipline at .pkit/capabilities/<name>/ — with proper layout, package metadata, and the COR-017 contract. Use when packaging a coherent body of decisions, skills, agents, and scripts that some adopters need and others don't.
+metadata:
+  wraps_command: pkit new capability
+gates:
+  - COR-005
+  - COR-006
+  - COR-007
+  - COR-008
+  - COR-017
+reads:
+  records:
+    - COR-010
+    - COR-011
+    - COR-031
+    - COR-059
+  paths:
+    - .pkit/rules/core.md
+    - .pkit/cli/README.md
+    - .pkit/lifecycle/manifest.md
+    - .pkit/permissions/README.md
+    - .pkit/decisions/README.md
+    - .pkit/decisions/core/COR-017-capability-pattern.md
+    - .pkit/decisions/core/COR-005-bundle-pattern.md
+    - .pkit/decisions/core/COR-007-pattern-extraction.md
+---
+
+# Authoring a capability
+
+This skill walks through adding a new **capability** at `.pkit/capabilities/<name>/` (per COR-017). A capability is an opt-in installable discipline — a coherent bundle of decisions, skills, agents, scripts, and schemas that some adopters install per project and others don't. Capabilities slot in alongside areas, bundles, and adapters as a sibling concept, not a fourth area variant.
+
+## When this skill applies
+
+Reach for a capability when:
+
+- The discipline is **useful but not universal** — most adopters won't need it, but those who do need the whole bundle (decisions + skills + maybe an agent + maybe a script).
+- A clean opt-in/opt-out boundary exists. If you can describe "install this and it appears, uninstall and it disappears, no shared files" you have a capability.
+- The pattern has earned its keep per COR-007 — at minimum, a concrete adopter motivated it; ideally, two or more adopters or use cases would benefit. Inventing capabilities speculatively is the failure mode this skill is designed to prevent.
+
+Do **not** use this skill for:
+
+- Universal disciplines every adopter must follow — those belong in `core/` (areas) and ship via propagation, not opt-in install.
+- Single-adopter customisation — that belongs in the adopter's `project/` namespaces (per COR-011's universal variant).
+- Harness translations — those are adapters (per COR-005).
+- Alternative implementations of the same area's contract — those are bundles (per COR-005).
+
+## Acceptance gate (run first)
+
+Per `.pkit/decisions/README.md`'s acceptance gate: verify every record in `gates:` is `accepted` before authoring. Halt if any is `proposed` or `superseded`.
+
+The current dependencies:
+
+- **COR-005** — the bundle/adapter pattern; capabilities share their package-yaml shape and skill/command-pairing discipline.
+- **COR-006** — artifact roles; what belongs in a decision vs a skill vs an agent vs a script.
+- **COR-007** — pattern extraction; capabilities should formalise a recurring discipline, not anticipate one.
+- **COR-008** — git workflow conventions; the commit step.
+- **COR-017** — the capability pattern; the canonical record fixing layout, lifecycle, citation form, and install/sync/uninstall semantics.
+
+## Procedure
+
+### 1. Pick the capability name
+
+Use a kebab-case noun that names the *discipline*, not the implementation. Examples:
+
+- `evidence` — citation discipline (not `citations` or `evidence-yaml`)
+- `product-management` — product-management discipline (not `pm-agent` or `scrum`)
+- `storyboard-authoring` — storyboard discipline (not `storyboards`, which would conflict with the universal area)
+
+The name becomes the directory name, the value of `component.name` in `package.yaml`, and the prefix in citations: `[<capability-name>:DEC-NNN-<slug>]`.
+
+**Reserved names: `core`, `project`, `adr` and `backbone`.** `pkit new capability`, `pkit capabilities install`, and `pkit capabilities register` all refuse each, giving the reason:
+
+- `core` is the name core's own entries carry where a capability's carry the capability's name — the namespace of the core decision records and agents (`pkit new decision core …`, `pkit new agent core …`), and the core schemas area (`.pkit/schemas/`) wherever a schemas verb takes an owner — so a capability named `core` could have no decision records or agents stamped, and its `schemas/` would be silently unreachable.
+- `project` is the name the project's own entries carry where a capability's carry the capability's name — the namespace of the project's decision records and agents (`pkit new decision project …`, `pkit new agent project …`), and the opening name of the project's checks in an evidence point (the software-analysis and living-docs capabilities' DEC-001, point 7) — so a capability named `project` would be indistinguishable from the project itself.
+- `adr` is the namespace of the project's architecture decision records, which `pkit new decision adr …` stamps before any capability name is tried, so a capability named `adr` could have no decision records stamped.
+- `backbone` is the name the backbone carries where a component's carry the component's name — the component of the backbone's changesets (`component: backbone` under `.changes/unreleased/`), the owner of its validators (beside a capability's `<capability>:<name>`), the component its rule sets are cited with (`backbone:<SET>`), and the component its documentation locations are recorded under — so a capability named `backbone` would have its changesets, validators, rule sets and documentation locations read as the backbone's.
+
+A capability registered under any of these names before it was reserved stays registered; `pkit validate` reports it as an error naming the rename.
+
+**Not a backbone command's name either.** The dispatcher reads an installed capability's name as a top-level command, and a backbone command (`validate`, `status`, `sync`, `capabilities`, … — `pkit --help` lists them) holds its name first, so a capability named after one could never surface its commands as `pkit <name> …`. `pkit new capability` refuses such a name, reading the commands from the dispatcher when it runs. `pkit capabilities install` and `register` do not: the backbone gains commands with its releases, so an upgrade can take a name that was free when a capability shipped, and refusing it then would break the installation of something that worked. Instead `pkit validate` reports an installed capability that ships a `commands:` block under a backbone command's name as an error naming the rename; one with no `commands:` block surfaces no namespace and is not reported.
+
+**Not an adapter's name either.** An adapter and a capability cannot share a name: the backbone reads a component by its name alone where it reads both kinds — a changeset names its component and the release keys every `package.yaml` under `.pkit/` by name, so a release would move only one of the two; every registered component's validators are owned by its name, so the two would share one owner; and the wiring resolver reads the component registry by name, so one of the two would be read under the other's kind. `pkit new capability`, `pkit capabilities install` and `register` refuse a name an adapter holds in the project — registered in the backbone manifest, or present at `.pkit/adapters/<name>/` — giving the reason, as `pkit new adapter` refuses a name a capability holds. A pair registered before the refusal stays registered; `pkit validate` reports it as an error at each of the two, naming its rename.
+
+### 2. Read the contract
+
+Read `.pkit/decisions/core/COR-017-capability-pattern.md`. Every capability ships:
+
+- `package.yaml` — component metadata (`schema_version`, `kind: capability`, `name`, `version`, `description`, `requires_backbone`, all required; the package schema refuses a key it does not know — see `.pkit/lifecycle/manifest.md`, "Package metadata (`package.yaml`)").
+- `README.md` — adopter-facing intro: the discipline, the commands, the conventions.
+- Some non-empty subset of `decisions/`, `skills/`, `agents/`, `scripts/`, `schemas/`. A capability with no decisions and no skills is suspicious — at minimum, you'd expect one decision establishing the discipline's invariant plus one skill or script operationalising it.
+- `migrations/` — the capability's migrations, one folder for each version they bring an installed project to (`<major>.<minor>.0/`). It stays empty until the capability lands a change that breaks against an installed project's state. That change ships its migration here, stamped with `pkit new migration --tier capability --component <name> --name <slug>` through the `migration-author` skill (COR-010). A version transition runs it when it moves the project to that version (COR-059).
+
+### 3. Stamp the scaffold
+
+Use the authoring command (per `.pkit/cli/README.md`):
+
+```
+pkit new capability <name>
+```
+
+The command:
+
+- Creates `.pkit/capabilities/<name>/`.
+- Stamps `package.yaml` with `kind: capability`, `version: 0.1.0`, a placeholder `description` to replace with the one-line summary, and `requires_backbone` pinned to a range matching the project's current backbone.
+- Stamps `README.md` with placeholder prose explaining the discipline, install command, and citation form.
+- Creates empty `decisions/`, `skills/`, `agents/`, `scripts/`, `schemas/` and `migrations/` subdirectories, each holding a `.gitkeep`.
+
+Unlike `pkit new adapter`, the scaffolding step registers nothing. Once the capability is built, `pkit capabilities register <name>` registers it in place, in the project that authored it: it copies nothing, records the origin `incubated-in-repo`, and deploys the capability's skills and agents (COR-031). `sync` leaves a capability registered this way untouched, since the project's tree is its only source. A project takes a capability the methodology ships with `pkit capabilities install <name>` instead, which copies the capability's subtree in and records the origin `kit-shipped`; in the methodology's own source repository, where the subtree is that source, `install` registers it in place and copies nothing. `.pkit/cli/README.md`, "Capabilities — two ways in", holds both paths.
+
+The command refuses if a capability with that name already exists, if the slug isn't kebab-case, if the name is reserved (`core`, `project`, `adr` or `backbone`), if it is a backbone command's, or if an adapter holds it (see step 1).
+
+### 4. Fill in the README
+
+Open `.pkit/capabilities/<name>/README.md` and replace the placeholders with:
+
+- **One-paragraph summary** — what discipline the capability formalises, when an adopter would install it.
+- **What this capability ships** — the kit-shipped artifacts an adopter receives.
+- **Adopter setup** — the install command and any per-project configuration the adopter must fill in.
+- **Citing this capability's decisions** — keep the stamped paragraph; it documents the `[<capability-name>:DEC-NNN-<slug>]` citation form.
+- **Dependencies** — what the adopter needs in place: external tooling, other capabilities, accounts.
+
+### 5. Author the decisions
+
+Capability decisions live in `decisions/` with filenames `DEC-NNN-<slug>.md`. The numbering is scoped to *this* capability — every capability has its own `DEC-001`. Stamp each with `pkit new decision <name> <slug>` through the `decision-author` skill, which numbers it within the capability.
+
+Each decision has the same shape as a PRJ decision, and follows the disciplines every record follows (`.pkit/decisions/README.md`, "Writing a record"). Project-neutrality does not apply — capabilities are explicitly discipline-specific:
+
+```markdown
+---
+id: DEC-001
+title: <imperative short title>
+status: accepted
+date: YYYY-MM-DD
+author: <name>
+---
+
+## Context
+
+## Decision
+
+## Rationale
+
+## Implications
+```
+
+Cite other capability decisions in the same capability using the form `[<this-capability>:DEC-NNN-<slug>]`. Cite COR / PRJ records as `COR-NNN` / `PRJ-NNN` (the kit's existing forms).
+
+### 6. Author the skills, agents, scripts, and schemas
+
+Skills, agents, scripts, and schemas in a capability follow the same shapes as their area-shipped counterparts (per COR-006). Three notes specific to capabilities:
+
+- Skills and agents may cite *this capability's* decisions in body prose via the `[<name>:DEC-NNN-slug]` form. The validator (`pkit refs validate`) walks capability subtrees and resolves these citations.
+- Scripts can be Python with PEP 723 inline metadata (so adopters can run them via `uv run` without a host project) or shell. If a script needs Python dependencies, declare them inline so the script is self-installing.
+- If the capability keeps lasting state in the agent workspace — files that must outlast the session that wrote them, such as a queue that waits for a person — keep it under a direct child named after the capability, `.agent-workspace/<name>/`. Every agent working in the checkout shares that folder, and `pkit workspace remove` refuses any path at or under a child named after a registered capability, so an agent clearing its own files never removes the capability's (core rule 16, and `.pkit/cli/README.md`, "Workspace commands").
+
+### 6b. (Optional) Ship a permission fragment
+
+If the capability needs to **shape its own agents' tool reach** — define a privilege the backbone catalog should not carry, and deny it to one of the capability's agents — it ships a `permissions/` fragment (the capability-contributed privilege-definition + grant mechanism; see `.pkit/permissions/README.md`). Stamp the skeleton:
+
+```
+pkit permissions scaffold <name>
+```
+
+This stamps `.pkit/capabilities/<name>/permissions/privilege-catalog.yaml` (the privilege *definition*) and `grants.yaml` (the deny *policy*), with inline guidance. It refuses an unknown capability and refuses to clobber an existing fragment file. Skip this step entirely if the capability shapes no permissions.
+
+Two footguns the stamped comments call out — and that you must respect when editing the fragment:
+
+- **Fragment privilege keys are authored BARE.** Write `ad-hoc-scraping:`, not `<name>:ad-hoc-scraping:`. The loader rewrites each key to the capability-scoped id `<name>:ad-hoc-scraping`. Writing the scope yourself double-scopes it.
+- **A grant references a fragment privilege with the SCOPED token.** In `grants.yaml`, reference it as `[privilege-catalog:<name>:ad-hoc-scraping]` — the `<name>:` scope is **required**. A bare `[privilege-catalog:ad-hoc-scraping]` resolves to no merged privilege, so the deny silently does **not** bind (a fail-open hazard). A *backbone* privilege is still referenced bare (e.g. `[privilege-catalog:issue-tracker-write]`).
+- **`guardrail: true` is forbidden in a fragment.** A capability may extend the recognised vocabulary but may never install a deny on every adopter by default; the loader rejects such an entry.
+
+`pkit schemas validate` runs a fragment-token-resolution lint over every installed capability's `grants.yaml`: a token resolving to no privilege in the merged catalog fails the gate (catching the bare-vs-scoped mistake even in a hand-authored fragment). Run it after editing the fragment.
+
+### 7. Self-check
+
+Walk the capability against COR-017's universal-element checklist:
+
+- *Is the capability genuinely opt-in?* If every adopter would install it, it's not a capability — it belongs in core areas.
+- *Does the capability stand on its own?* Could an adopter install it and use it without inheriting hidden expectations from the rest of the kit?
+- *Are the decisions principle-shaped?* No inventory dressed up as decisions. The COR-017 disciplines apply to capability decisions too.
+- *Is there a citation form that an author can use?* `[<name>:DEC-NNN-<slug>]` should round-trip through `pkit refs validate`.
+- *Is the README adopter-facing?* It explains the discipline, not the implementation; an adopter reading it cold should understand what they're opting into.
+
+If any check fails, revise.
+
+### 8. Register it and check it
+
+Before committing, validate the capability mechanically:
+
+```
+pkit refs validate                              # capability subtree is parsed cleanly
+```
+
+If the capability ships a `permissions/` fragment, also run `pkit schemas validate` — its fragment-token-resolution lint confirms each grant token resolves to a real privilege in the merged catalog (catches a bare-vs-scoped token).
+
+Then bring it into the project:
+
+```
+pkit capabilities register <name>              # registered in place, origin incubated-in-repo; its skills and agents deploy
+pkit status                                     # capability appears under installed, marked incubated
+```
+
+`pkit capabilities uninstall <name>` takes it out again: it unregisters the capability and undeploys it, and keeps the subtree, which is the only copy of the work. Catch any layout or schema mistakes here, not at adopter time.
+
+### 9. Commit
+
+Per COR-008, conventional-commits format. Type is `feat`; scope is `capabilities` or the capability name:
+
+```
+feat(capabilities): add <name> capability
+
+<body — 1–3 paragraphs naming the discipline this capability
+formalises, what it ships, and what motivated bundling it as an opt-in
+capability rather than core content>
+```
+
+The capability lands at `version: 0.1.0`. It moves from there under the version-bump policy the project records for itself, which says when, how far and who writes the new number (the core rules, `.pkit/rules/core.md`, rule 10). "Moving a capability's version" below says what moves it.
+
+## Variations
+
+- **Adding decisions/skills/agents to an existing capability** — edit the capability's subtree directly. Refusing to use the scaffolding command for follow-up work is fine; the scaffold is just for the first instance.
+- **Adopters authoring their own capability** — same procedure, same command. An adopter who develops a discipline worth sharing creates it under their own copy of the methodology and contributes upstream if generally useful.
+- **Moving a capability's version** — the capability's version moves whenever it lands a surface change visible to adopters: new decision, new skill, new agent, new script, removed file, schema change. The project's version-bump policy says how it moves, and a change that breaks against installed state ships its migration in `migrations/` (step 2). A project that installed the capability takes the new version only through a version transition (COR-059). `pkit upgrade` moves the capability with the release that ships it, and `pkit capabilities upgrade <name>` moves it alone, to the version the project's recorded release ships. Either runs its migrations from the version the project records. `pkit sync` copies the capability at the version the project records and moves no version. A capability registered in place moves when its project edits it, since no release ships it.
+- **Swappable implementations of the same capability** — defer until two implementations exist. COR-017's variants note (Implications section) captures this: if the same discipline ships in multiple flavours (e.g., evidence-yaml-python vs evidence-sqlite), pattern-extract a sub-structure when the second flavour lands per COR-007.

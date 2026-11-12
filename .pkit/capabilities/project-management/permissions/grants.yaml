@@ -1,0 +1,17 @@
+schema_version: 1
+# Capability-contributed intent-grant fragment (ADR-016).
+# Discovered by load_model via manifest-walk; applies only when the
+# project-management capability is an installed component.
+# The privilege definition stays in the backbone catalog (deferred seam CA-1).
+grants:
+  - subject: agent:project-manager
+    privilege: '[privilege-catalog:issue-tracker-write]'
+    effect: deny
+  # Read-redirect deny (issue #319): block the raw gh read views the clean
+  # show-* verbs replace (gh issue view / gh pr view / gh pr diff) to route the
+  # agent to `pkit project-management show-issue` / `show-pr` (and their
+  # `--field`) — the prompt-free, non-piping path. Scoped narrowly; gh pr
+  # checks / gh run / gh api / gh issue|pr list stay available.
+  - subject: agent:project-manager
+    privilege: '[privilege-catalog:issue-tracker-read-raw]'
+    effect: deny

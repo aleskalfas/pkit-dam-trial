@@ -1,0 +1,399 @@
+"""When a reviewer's verdict still stands — the one freshness rule (#1179).
+
+DEC-028 "Stale-verdict handling" states the rule; this module is its single
+implementation, read by every consumer that has to tell a fresh verdict from
+a stale one, so they cannot disagree:
+
+  * `done-work`'s merge gate counts only fresh verdicts (`gate_verdicts`'
+    required `is_fresh`) and names, in a refusal, what a stale one reviewed
+    and what changed since;
+  * `review-pr` skips a required reviewer whose latest verdict is fresh;
+  * `show-pr --field review` / `review-history` mark a stale verdict, with
+    the reason.
+
+The rule judges one verdict — the reviewer's latest; which verdict is the
+latest is `_lib.agent_verdicts`' business, decided before this rule is asked,
+so a superseded verdict never counts however fresh it would be. Per verdict:
+
+  * **A verdict naming the head it reviewed** (`<!-- pkit-verdict sha=<oid>
+    -->`) stands until the author changes something its reviewer checks. The
+    author's changes since that head come from `_lib.author_delta` (a clean
+    merge of the base branch contributes nothing). An APPROVED from a
+    reviewer whose whole remit is its diff-property floors
+    (`Resolution.floors_by_reviewer`: a floor requires it on this PR and
+    every rule it has is a floor and nothing else) stays fresh while those
+    changes reach none of its floors, each read as the resolver reads it
+    (`_lib.required_reviewers.reached_floors`): `touches-code` through the
+    same not-code list, `touches-ruled-artefact` by asking the backbone which
+    artefacts the author's changes since the reviewed head altered, a run of
+    the author's own commits between merges of the base at a time — a merge
+    of the base only when the author changed something inside it — and
+    counting one an accepted rule binds on at the start or the end of its
+    run, and one the run brings under an accepted rule without altering it,
+    and a floor this pm does not know by any change. Any
+    other verdict goes stale on any change: one from the baseline or from a
+    reviewer with any classification rule — matched on this PR or not, it
+    declares a remit wider than the floors — and every CHANGES_REQUESTED —
+    the author is answering it, so floor scoping protects approvals only.
+    When the changes, or the ruled artefacts they altered, cannot be read,
+    the verdict is stale.
+  * **A verdict naming the base it was reviewed against** (`base=<oid>` in
+    the same marker) is stale, whatever the author changed, once that base
+    is not an ancestor of the base branch's head — the PR was retargeted or
+    its base rewritten, so its diff over the base carries commits the
+    reviewer never saw. When that cannot be read the verdict is stale; a
+    marker naming no base skips the check.
+  * **A verdict naming no head** is fresh when it was posted strictly after
+    the PR's head arrived on the host (`_lib.head_arrival`), and stale
+    otherwise — or when that arrival cannot be read. The head commit's own
+    dates are never read: the committer's clock sets them, and a rebase or an
+    amend keeps them.
+
+Every outcome carries a one-line reason a consumer prints as it stands. The
+rule is pure logic: the author's changes, the base's history and the head's
+arrival are read through injected callables, each computed at most once per
+reviewed head or base, the arrival at most once and only for a verdict that
+names no head.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+
+try:
+    from _lib.agent_verdicts import APPROVED, PATH_LOCAL, Verdict
+    from _lib.audit import short_sha
+    from _lib.author_delta import AuthorDelta, BaseCheck
+    from _lib.head_arrival import ARRIVAL_VIEW_FIELDS, HeadArrival
+    from _lib.required_reviewers import (
+        DEFAULT_NOT_CODE,
+        NotCode,
+        Resolution,
+        _Unresolvable,
+        reached_floors,
+    )
+    from _lib.review_contributions import FLOOR_TOUCHES_RULED_ARTEFACT
+    from _lib.ruled_artefacts import RuledAlteration
+except ImportError:  # pragma: no cover - exercised via spec-loaded fallback
+    from agent_verdicts import (  # type: ignore[no-redef]
+        APPROVED,
+        PATH_LOCAL,
+        Verdict,
+    )
+    from audit import short_sha  # type: ignore[no-redef]
+    from author_delta import AuthorDelta, BaseCheck  # type: ignore[no-redef]
+    from head_arrival import ARRIVAL_VIEW_FIELDS, HeadArrival  # type: ignore[no-redef]
+    from required_reviewers import (  # type: ignore[no-redef]
+        DEFAULT_NOT_CODE,
+        NotCode,
+        Resolution,
+        _Unresolvable,
+        reached_floors,
+    )
+    from review_contributions import FLOOR_TOUCHES_RULED_ARTEFACT  # type: ignore[no-redef]
+    from ruled_artefacts import RuledAlteration  # type: ignore[no-redef]
+
+
+# The `gh pr view --json` fields `rule_for_pr` reads; the consumers fetch them
+# with the comments, as `_lib.pr_review.REVIEW_VIEW_FIELDS`.
+PR_VIEW_FIELDS = ("commits", "headRefOid", "baseRefOid", *ARRIVAL_VIEW_FIELDS)
+
+# How many changed paths a reason names before counting the rest.
+_PATHS_NAMED = 5
+
+
+@dataclass(frozen=True)
+class Freshness:
+    """Whether a verdict stands, and why, in one line a consumer prints."""
+
+    fresh: bool
+    reason: str
+
+
+# `(since) -> AuthorDelta`: the author's changes from a reviewed head to the
+# PR's head.
+DeltaFn = Callable[[str], AuthorDelta]
+
+
+# `(reviewed_base) -> BaseCheck`: whether a reviewed base is still in the
+# base branch's history.
+BaseFn = Callable[[str], BaseCheck]
+
+
+# `(start, end) -> RuledAlteration`: the artefacts the change from `start` to
+# `end`, one stretch of the author's change, altered (`_lib.ruled_artefacts`).
+RuledFn = Callable[[str, str], RuledAlteration]
+
+
+# `() -> HeadArrival`: when the PR's head arrived on the host.
+ArrivalFn = Callable[[], HeadArrival]
+
+
+def _no_delta(_since: str) -> AuthorDelta:
+    return AuthorDelta(error="the pull request's head is unknown")
+
+
+def _no_base(_reviewed_base: str) -> BaseCheck:
+    return BaseCheck(error="the base branch's head is unknown")
+
+
+def _no_ruled(_start: str, _end: str) -> RuledAlteration:
+    return RuledAlteration(error="no reader of the ruled artefacts a change altered was given")
+
+
+def _no_arrival() -> HeadArrival:
+    return HeadArrival(error="no reader of when the head arrived was given")
+
+
+class FreshnessRule:
+    """The freshness rule for one PR at its current head.
+
+    Every argument defaults to its fail-closed value: no head, no base, no
+    floor-scoped reviewer, and no way to read the author's changes, the
+    base's history or when the head arrived — under which no verdict is
+    fresh.
+    """
+
+    def __init__(
+        self,
+        *,
+        head_sha: str = "",
+        base_tip: str = "",
+        floors_by_reviewer: Mapping[str, frozenset[str]] | None = None,
+        not_code: NotCode = DEFAULT_NOT_CODE,
+        delta_since: DeltaFn = _no_delta,
+        base_kept: BaseFn = _no_base,
+        ruled_since: RuledFn = _no_ruled,
+        head_arrival: ArrivalFn = _no_arrival,
+    ) -> None:
+        self._head_sha = head_sha
+        self._base_tip = base_tip
+        self._floors_by_reviewer = dict(floors_by_reviewer or {})
+        self._not_code = not_code
+        self._delta_since = delta_since
+        self._base_kept = base_kept
+        self._ruled_since = ruled_since
+        self._head_arrival = head_arrival
+        self._arrival: HeadArrival | None = None
+        self._deltas: dict[str, AuthorDelta] = {}
+        self._rulings: dict[str, tuple[str, ...] | _Unresolvable] = {}
+        self._stretches: dict[tuple[str, str], RuledAlteration] = {}
+        self._bases: dict[str, BaseCheck] = {}
+
+    def is_fresh(self, verdict: Verdict) -> bool:
+        """The predicate `gate_verdicts` takes."""
+        return self.assess(verdict).fresh
+
+    def assess(self, verdict: Verdict) -> Freshness:
+        if not verdict.sha:
+            return self._by_arrival(verdict)
+        reviewed = short_sha(verdict.sha)
+        base_moved = self._base_moved(verdict)
+        if base_moved is not None:
+            return base_moved
+        if verdict.sha == self._head_sha:
+            return Freshness(True, f"reviewed the current head {reviewed}")
+        delta = self._delta(verdict.sha)
+        if not delta.ok:
+            return Freshness(
+                False,
+                f"reviewed {reviewed}; the changes since cannot be read: {delta.error}",
+            )
+        if not delta.paths:
+            return Freshness(True, f"reviewed {reviewed}; only merges of the base branch since")
+        changed = f"reviewed {reviewed}; changed since: {_name_paths(delta.paths)}"
+        floors = self._floors_of(verdict)
+        if floors is None:
+            return Freshness(False, changed)
+        found = reached_floors(
+            floors,
+            delta.paths,
+            not_code=self._not_code,
+            ruled_artefacts=lambda: self._ruled(verdict.sha, delta),
+        )
+        if isinstance(found, _Unresolvable):
+            return Freshness(
+                False,
+                f"{changed} — whether it alters a ruled artefact, or brings one under a rule, "
+                f"cannot be read: {found.reason}",
+            )
+        reached = sorted(found)
+        if reached:
+            ruled = self._rulings.get(verdict.sha)
+            if FLOOR_TOUCHES_RULED_ARTEFACT in found and isinstance(ruled, tuple) and ruled:
+                # What cost the approval may lie outside the changed paths: a
+                # page a change to the places brought in, one a change to the
+                # rules brought under a rule, or one the base's side of a merge
+                # the author changed something inside altered.
+                changed += (
+                    f"; ruled artefacts altered or brought under a rule: {_name_paths(ruled)}"
+                )
+            return Freshness(False, f"{changed} — reaches its {', '.join(reached)} floor")
+        return Freshness(
+            True, f"{changed} — reaches none of its floors ({', '.join(sorted(floors))})"
+        )
+
+    def _by_arrival(self, verdict: Verdict) -> Freshness:
+        """A verdict naming no head stands only when it was posted after the
+        PR's head arrived on the host: the host's record, never the head
+        commit's own dates, which its committer's clock sets."""
+        if self._arrival is None:
+            self._arrival = self._head_arrival()
+        arrival = self._arrival
+        head = short_sha(self._head_sha)
+        if not arrival.ok:
+            return Freshness(
+                False,
+                f"no reviewed head recorded; when the head {head} arrived cannot be read: "
+                f"{arrival.error or 'no time was recorded'}",
+            )
+        if verdict.timestamp > arrival.timestamp:
+            return Freshness(
+                True, f"no reviewed head recorded; posted after the head {head} arrived"
+            )
+        return Freshness(
+            False,
+            f"no reviewed head recorded; posted before the head {head} arrived "
+            f"at {arrival.timestamp}",
+        )
+
+    def _base_moved(self, verdict: Verdict) -> Freshness | None:
+        """Why the verdict is stale because of its base, or None when its
+        base stands.
+
+        A verdict names the base branch's head it was reviewed against. When
+        that base is no longer an ancestor of the base branch's head, the
+        PR's diff over its base carries commits the reviewer never saw — a
+        stacked PR retargeted after its base was abandoned does, with no new
+        commit of its own. A verdict naming no base is not checked.
+        """
+        if not verdict.base or verdict.base == self._base_tip:
+            return None
+        against = f"reviewed {short_sha(verdict.sha)} against base {short_sha(verdict.base)}"
+        if verdict.base not in self._bases:
+            self._bases[verdict.base] = self._base_kept(verdict.base)
+        check = self._bases[verdict.base]
+        if not check.ok:
+            return Freshness(
+                False,
+                f"{against}; whether the base branch still contains it cannot be read: "
+                f"{check.error}",
+            )
+        if not check.kept:
+            return Freshness(
+                False,
+                f"{against}, which the base branch no longer contains — the pull "
+                "request was retargeted or its base rewritten",
+            )
+        return None
+
+    def _floors_of(self, verdict: Verdict) -> frozenset[str] | None:
+        """The floors a change must reach to stale this verdict, or None when
+        any change stales it.
+
+        Floor scoping protects an approval only. A CHANGES_REQUESTED goes
+        stale on any change: the author is answering it, and the fix may well
+        sit outside the reviewer's floors — a changeset, a README — so holding
+        the rejection fresh would leave the reviewer blocking a change it
+        never re-read. Contributed reviewers register on the local path only
+        (DEC-032), so a remote verdict is a baseline one.
+        """
+        if verdict.token != APPROVED or verdict.path != PATH_LOCAL:
+            return None
+        return self._floors_by_reviewer.get(verdict.reviewer)
+
+    def _ruled(self, sha: str, delta: AuthorDelta) -> tuple[str, ...] | _Unresolvable:
+        """The artefacts the author's changes since `sha` altered that the
+        floor counts, or why they cannot be read (DEC-028). Read once per
+        reviewed head: `delta` is that head's."""
+        if sha not in self._rulings:
+            self._rulings[sha] = self._read_ruled(delta)
+        return self._rulings[sha]
+
+    def _read_ruled(self, delta: AuthorDelta) -> tuple[str, ...] | _Unresolvable:
+        """Of what each stretch of the author's change altered — a run of
+        the author's own commits between merges of the base, or a merge of
+        the base the author changed something inside — each artefact an
+        accepted rule binds on at the stretch's start or end, and each it
+        brought under an accepted rule without altering it. A clean merge
+        of the base is no stretch, so what it brings never counts, whatever
+        it is: an edit, a rule or a place. The first stretch that alters one
+        settles it, so no later stretch is asked about. Changed paths with no
+        stretch to ask about cannot be read, never read as nothing."""
+        if delta.paths and not delta.stretches:
+            return _Unresolvable(
+                "the author's changes since the review name no stretch to ask the backbone about"
+            )
+        for stretch in delta.stretches:
+            found = self._altered_in(stretch.start, stretch.end)
+            if not found.ok:
+                return _Unresolvable(found.error)
+            if found.locations:
+                return found.locations
+        return ()
+
+    def _altered_in(self, start: str, end: str) -> RuledAlteration:
+        """What the change from `start` to `end` altered, asked once."""
+        if (start, end) not in self._stretches:
+            self._stretches[(start, end)] = self._ruled_since(start, end)
+        return self._stretches[(start, end)]
+
+    def _delta(self, sha: str) -> AuthorDelta:
+        if sha not in self._deltas:
+            self._deltas[sha] = self._delta_since(sha)
+        return self._deltas[sha]
+
+
+def head_sha(pr_view: Mapping) -> str:
+    """The PR's head commit: `headRefOid`, else the last listed commit's oid."""
+    head = str(pr_view.get("headRefOid") or "")
+    if head:
+        return head
+    commits = pr_view.get("commits") or []
+    last = commits[-1] if commits else None
+    return str(last.get("oid") or "") if isinstance(last, dict) else ""
+
+
+def rule_for_pr(
+    pr_view: Mapping,
+    resolution: Resolution,
+    *,
+    author_delta: Callable[..., AuthorDelta],
+    base_kept: Callable[..., BaseCheck],
+    ruled_altered: Callable[..., RuledAlteration] | None = None,
+    head_arrival: Callable[[Mapping, str], HeadArrival] | None = None,
+) -> FreshnessRule:
+    """The freshness rule for a PR, from its `gh pr view` payload.
+
+    `pr_view` carries at least `PR_VIEW_FIELDS`. `resolution` is the PR's
+    resolved required set: its floor-scoped reviewers and its not-code list
+    decide what reaches a floor. A failed resolution names no floor-scoped
+    reviewer, so every verdict goes stale on any change. `author_delta` and
+    `base_kept` are `_lib.author_delta`'s, `ruled_altered` is
+    `_lib.ruled_artefacts`', and `head_arrival` reads when the head arrived
+    (`_lib.head_arrival.read_head_arrival`, its `gh` wiring bound), each
+    passed by the consumer so its tests can stand them in. Without
+    `ruled_altered`, an approval scoped to `touches-ruled-artefact` goes stale
+    on any change; without `head_arrival`, a verdict naming no head is stale.
+    """
+    head = head_sha(pr_view)
+    base_tip = str(pr_view.get("baseRefOid") or "")
+    return FreshnessRule(
+        head_sha=head,
+        base_tip=base_tip,
+        floors_by_reviewer=resolution.floors_by_reviewer,
+        not_code=resolution.not_code,
+        delta_since=lambda since: author_delta(since, head, base_tip=base_tip),
+        base_kept=lambda reviewed_base: base_kept(reviewed_base, base_tip),
+        ruled_since=_no_ruled
+        if ruled_altered is None
+        else lambda start, end: ruled_altered(start, end),
+        head_arrival=_no_arrival if head_arrival is None else lambda: head_arrival(pr_view, head),
+    )
+
+
+def _name_paths(paths: tuple[str, ...]) -> str:
+    named = ", ".join(paths[:_PATHS_NAMED])
+    rest = len(paths) - _PATHS_NAMED
+    return f"{named} (+{rest} more)" if rest > 0 else named

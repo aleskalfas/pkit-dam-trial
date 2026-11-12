@@ -1,0 +1,963 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "package.schema.json",
+  "title": "Component package metadata (`package.yaml`)",
+  "description": "A backbone file schema (ADR-056) for the `package.yaml` of a component — a capability or an adapter: every field the shipped package files use and the blocks the connection-points, documentation-roots and friction records add, with the write categories a capability declares (ADR-088 point 1). STRICT ON UNKNOWN KEYS: every object here that declares its keys closes with `additionalProperties: false`, at the top level and inside every block, so a key the schema does not know is an error; `project_kit.package_validate` reports it at the key with the nearest known key suggested, through the one renderer of ADR-056 point 4. The lifecycle reference's manifest schema records the decision and what an adopter does about such a key ('Validation: the package schema'); a tree whose schema predates it keeps its permissive copy until synced, and there an unknown key is a warning. The fields COR-017 lists among a component's required ones — `schema_version`, `component`, `description`, `requires_backbone` — are required of capabilities and adapters alike. Every part of a role name or a point address is a word, `[a-z][a-z0-9-]*`: the word the configuration schema's selection keys admit, defined once as `project_kit.refs.ADDRESS_WORD_PATTERN` and held equal here by a test. Two `schema_version` values are in use and both are accepted: version 2 marks a file that adopted the `commands:` block (COR-021 said the version bumps with it); no reader distinguishes the two, and both require the same fields. `provides` is admitted from COR-013 (hook implementations) though no shipped file uses it; no egress or privilege declaration exists in any package file — those live in the permission model's own data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "component",
+    "description",
+    "requires_backbone"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "The package file's own schema version, required (COR-017). Two values are in use, both accepted.",
+      "type": "integer",
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "component": {
+      "$ref": "#/$defs/component"
+    },
+    "description": {
+      "description": "One-line summary, required (COR-017): what `pkit capabilities list` shows and the capability's command-group help (COR-021).",
+      "$ref": "#/$defs/non-empty-string"
+    },
+    "requires_backbone": {
+      "description": "Version range of compatible backbone versions, required (COR-017), evaluated at install and upgrade (COR-010). Parseability is checked in Python.",
+      "$ref": "#/$defs/version-range"
+    },
+    "requires_capabilities": {
+      "description": "Declared dependencies on other capabilities, each a name and a version range, and optionally marked `optional: true` (COR-030).",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/capability-dependency"
+      }
+    },
+    "commands": {
+      "description": "The command tree the dispatcher registers under `pkit <capability>` (COR-021): a key is a token; a value carrying `script` is a leaf, any other value is a sub-group.",
+      "$ref": "#/$defs/command-group"
+    },
+    "aliases": {
+      "description": "Alternative namespaces for the command group (`pm` for `project-management`).",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/component-name"
+      }
+    },
+    "validators": {
+      "description": "Validators by which this component joins validation, `pkit validate`, each naming a command it registers (COR-055 point 3; the block's keys are ADR-058's): a mapping from a validator name (a word) to its entry, which names one leaf of this component's `commands:` tree by `command` — the leaf carries the `help` line and must declare `query-contract: true`. The umbrella addresses the validator `<component>:<name>` and runs the leaf's script from the project root with the one argument `--json`, the offline marker set and bounded like a predicate, reading one JSON document — and nothing else — from its standard output: `{\"summary\": [\"...\"], \"findings\": [{\"severity\": \"error\"|\"warning\"|\"info\"|\"report\", \"location\": \"...\", \"message\": \"...\"}]}` (a finding may add a `label`); diagnostics go to standard error. Only `error` fails the umbrella (COR-055 point 5). An abnormal exit, a timeout, a leaf without the declaration or an answer that is not that document is an error finding, never a clean pass (COR-055 point 6). `order` sorts the validator among the members (default 1000, after the backbone's, which take the orders below 1000). The living-docs capability registers the first, `living-docs:spaces`.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/validator"
+      }
+    },
+    "provides": {
+      "description": "Hook implementations this component answers, `{hook-name: implementation}` (COR-013). Reserved; no shipped file uses it.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/non-empty-string"
+      }
+    },
+    "footprint": {
+      "description": "Git-footprint paths this component deploys outside `.pkit/`, repository-relative (ADR-009).",
+      "$ref": "#/$defs/path-list"
+    },
+    "runtime_ignore": {
+      "description": "Runtime-local file globs to git-ignore, repository-relative (ADR-009 rule 7).",
+      "$ref": "#/$defs/path-list"
+    },
+    "connections": {
+      "$ref": "#/$defs/connections"
+    },
+    "docs": {
+      "$ref": "#/$defs/docs"
+    },
+    "friction": {
+      "$ref": "#/$defs/friction"
+    },
+    "project_rule_set": {
+      "$ref": "#/$defs/project-rule-set"
+    },
+    "loaded_rules": {
+      "$ref": "#/$defs/loaded-rules"
+    },
+    "write_categories": {
+      "$ref": "#/$defs/write-categories"
+    }
+  },
+  "$defs": {
+    "component": {
+      "title": "The component's identity",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "capability",
+            "adapter"
+          ]
+        },
+        "name": {
+          "description": "Must equal the directory the component lives in (checked in Python).",
+          "$ref": "#/$defs/component-name"
+        },
+        "version": {
+          "description": "The component's own version; it gates dependency edges. Parseability is checked in Python.",
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "component-name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$"
+    },
+    "capability-dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/component-name"
+        },
+        "version": {
+          "$ref": "#/$defs/version-range"
+        },
+        "optional": {
+          "description": "`true` marks an optional dependency (COR-030): it need not be installed, but an installed one must satisfy the range, and it never blocks uninstalling the capability it names. Absent or `false`, the dependency is required.",
+          "type": "boolean"
+        }
+      }
+    },
+    "command-group": {
+      "title": "A level of the command tree",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/command-node"
+      }
+    },
+    "command-node": {
+      "title": "A command leaf or a sub-group",
+      "description": "A leaf is detected by the presence of `script` at its level (COR-021).",
+      "type": "object",
+      "if": {
+        "required": [
+          "script"
+        ]
+      },
+      "then": {
+        "$ref": "#/$defs/command-leaf"
+      },
+      "else": {
+        "$ref": "#/$defs/command-group"
+      }
+    },
+    "command-leaf": {
+      "title": "One command",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "script",
+        "help"
+      ],
+      "properties": {
+        "script": {
+          "description": "Path of the script relative to the component root; must exist (checked in Python).",
+          "$ref": "#/$defs/relative-path"
+        },
+        "help": {
+          "description": "One-line user-facing description.",
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "query-contract": {
+          "description": "The one constant declaration that this command honours the query contract (COR-050 point 2 and ADR-057 point 3; the literal is ADR-058's): bounded, deterministic, read-only, needing no network. Required on the command a validator names (validation runs it as a query, COR-055 point 3), and on every query command a capability registers. It grants nothing and is trusted, not enforced.",
+          "const": true
+        },
+        "reads": {
+          "description": "What a data point's command filler reads beyond the working tree (COR-052 point 6): `history` — the current history, read from HEAD — and `settled` — the default branch, as the backbone resolves it, never a base named for one run. Absent: the working tree only. Declared by the capability and trusted; it reads them through the backbone's reading commands and does not compare the branch at hand with settled state. The status report and `pkit validate` name each declared state and the commit it was read at; a filler that declares `settled` is not started while the default branch resolves to no commit, unless — in a repository with no remote — it has none yet. Taken only with the query-contract declaration.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "history",
+              "settled"
+            ]
+          }
+        }
+      }
+    },
+    "validator": {
+      "title": "One registered validator",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "description": "The leaf of this component's `commands:` tree that answers the validator's findings; must exist and declare `query-contract: true` (checked in Python). Its `help` is the validator's.",
+          "$ref": "#/$defs/command-reference"
+        },
+        "order": {
+          "description": "Where it sorts among the members: the backbone's members take the orders below 1000, and 1000 is the default.",
+          "type": "integer"
+        }
+      }
+    },
+    "connections": {
+      "title": "The `connections` block (COR-053 point 3)",
+      "description": "The roles this component provides and its connection points, split by whose point it is and which way it flows: `extension-points` are points this component defines (`accepts` data in, `offers` processes and events out); `extensions` are where it plugs into others (`contributes` data, `subscribes` to events, `depends-on` processes). Field layout beyond the two key pairs is this reference's choice (the lifecycle reference's manifest schema).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roles": {
+          "description": "Qualified role names this component provides, `<publisher>::<role>` (COR-053 point 1). Every point it defines sits under one of these (checked in Python).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/qualified-role"
+          }
+        },
+        "extension-points": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "accepts": {
+              "description": "Data points this component defines, keyed by point address.",
+              "type": "object",
+              "propertyNames": {
+                "$ref": "#/$defs/point-address"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/data-point"
+              }
+            },
+            "offers": {
+              "description": "Processes and events this component offers, keyed by point address.",
+              "type": "object",
+              "propertyNames": {
+                "$ref": "#/$defs/point-address"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/offered-point"
+              }
+            }
+          }
+        },
+        "extensions": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "contributes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/contribution"
+              }
+            },
+            "subscribes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/subscription"
+              }
+            },
+            "depends-on": {
+              "$ref": "#/$defs/depends-on"
+            }
+          }
+        }
+      }
+    },
+    "data-point": {
+      "title": "An accepted data point (COR-053 point 2, COR-052)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "schema",
+        "description"
+      ],
+      "properties": {
+        "schema_version": {
+          "$ref": "#/$defs/point-version"
+        },
+        "schema": {
+          "description": "The point's companion JSON Schema, a path relative to the component's `schemas/` directory; must exist (checked in Python).",
+          "$ref": "#/$defs/relative-path"
+        },
+        "description": {
+          "$ref": "#/$defs/point-description"
+        },
+        "combination": {
+          "description": "How several fillers combine (COR-052 point 3): `single` — one filler answers, by precedence (project filler, then the one contribution — the contributor selection picks among several — then the default); `union` — entries merged by id, a project entry overriding one whole, two capabilities supplying one id an error; `additive` — entries merged, any collision an error, an entry leaving only through a removal override with its reason. `single` when absent.",
+          "type": "string",
+          "enum": [
+            "single",
+            "union",
+            "additive"
+          ]
+        },
+        "default": {
+          "$ref": "#/$defs/point-default"
+        },
+        "inert": {
+          "description": "The inert policy (COR-052 point 6): what the point does when a filler meant to answer cannot — its version does not match, its command failed, its output is invalid. `fallback` resolves from the remaining fillers with a warning naming the one that failed; `fail` leaves the whole point unresolved, as a consumer feeding a gate or a check must declare. `fallback` when absent.",
+          "type": "string",
+          "enum": [
+            "fallback",
+            "fail"
+          ]
+        },
+        "mandatory": {
+          "$ref": "#/$defs/mandatory"
+        },
+        "question": {
+          "description": "The point's question (COR-061): a command of this component's that asks the person about the point and records each answer they give. Must exist in `commands:` and must not declare the query contract, since it writes (checked in Python). The backbone runs it at the end of a capability's install or upgrade and of a transition of the backbone, only where standard input and standard output are both terminals, and prints `pkit <component> <command>` to run later where they are not. Sync never runs it.",
+          "$ref": "#/$defs/command-reference"
+        }
+      }
+    },
+    "point-default": {
+      "title": "The definer's default for a data point (COR-052 point 2)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "participation"
+      ],
+      "properties": {
+        "value": {
+          "description": "The default value, in the point's own shape: validated by the point's companion schema when the point resolves."
+        },
+        "participation": {
+          "description": "How the default takes part: `always` — it contributes like any other filler, at the lowest precedence; `alone` — it answers only when no other filler is declared, and never because a declared filler broke.",
+          "type": "string",
+          "enum": [
+            "always",
+            "alone"
+          ]
+        }
+      }
+    },
+    "offered-point": {
+      "title": "An offered process or event (COR-053 point 2)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "description"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "process",
+            "event"
+          ]
+        },
+        "schema_version": {
+          "$ref": "#/$defs/point-version"
+        },
+        "description": {
+          "$ref": "#/$defs/point-description"
+        },
+        "process": {
+          "description": "For `kind: process` — the id of the process definition whose interface is offered (COR-036).",
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "command": {
+          "description": "For `kind: event` — the writing command that emits it; must exist in `commands:` (checked in Python).",
+          "$ref": "#/$defs/command-reference"
+        },
+        "schema": {
+          "description": "For `kind: event` — the payload's companion JSON Schema under `schemas/`; must exist (checked in Python).",
+          "$ref": "#/$defs/relative-path"
+        },
+        "subject": {
+          "description": "For `kind: event` — the payload field naming the event's subject.",
+          "$ref": "#/$defs/non-empty-string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "event"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "command",
+              "schema",
+              "subject"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "process"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "process"
+            ]
+          }
+        }
+      ]
+    },
+    "contribution": {
+      "title": "A contribution to another role's data point",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point",
+        "schema_version"
+      ],
+      "properties": {
+        "point": {
+          "$ref": "#/$defs/point-address"
+        },
+        "schema_version": {
+          "description": "The point version this contribution targets (COR-053 point 5).",
+          "$ref": "#/$defs/point-version"
+        },
+        "command": {
+          "description": "The command filler that supplies the data (COR-052 point 6); must exist in `commands:` and declare `query-contract: true` (checked in Python). It takes no parameter: run with `--json` alone, offline-marked and bounded, it prints the filler envelope `{schema_version, value}`.",
+          "$ref": "#/$defs/command-reference"
+        },
+        "value": {
+          "description": "The data this contribution supplies, written here rather than printed by a command: the point's value, validated by the point's companion schema when the point resolves. A contribution names `value` or `command`, not both (checked in Python)."
+        },
+        "description": {
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "mandatory": {
+          "$ref": "#/$defs/mandatory"
+        }
+      }
+    },
+    "subscription": {
+      "title": "A subscription to another role's event",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "point",
+        "schema_version",
+        "command"
+      ],
+      "properties": {
+        "point": {
+          "$ref": "#/$defs/point-address"
+        },
+        "schema_version": {
+          "$ref": "#/$defs/point-version"
+        },
+        "command": {
+          "description": "The subscriber command the backbone runs after the producing command finishes; must exist in `commands:` (checked in Python).",
+          "$ref": "#/$defs/command-reference"
+        },
+        "description": {
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "mandatory": {
+          "$ref": "#/$defs/mandatory"
+        }
+      }
+    },
+    "depends-on": {
+      "title": "Generated process connections (COR-053 point 4)",
+      "description": "GENERATED, never hand-written: its single source is the process definitions' `depends_on`, regenerated by `pkit capabilities refresh <name>` and marked `generated: true` — one entry per distinct upstream and targeted interface version, sorted. The wiring resolver reads the entries and the capability lifecycle reads their `mandatory` marks; a copy that differs from what the definitions generate fails validation (the packages pass, which reads the definitions), naming the refresh command as the fix. This schema fixes only the shape and the mark.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated"
+      ],
+      "properties": {
+        "generated": {
+          "const": true
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "process"
+            ],
+            "properties": {
+              "process": {
+                "description": "The upstream process, in the implementation form `<capability>:<process-id>` or the role form `<publisher>::<role>:<point>` (COR-038, COR-053 point 2), each part a word: the pattern of the process definitions' `upstream` it is copied from.",
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*(::[a-z][a-z0-9-]*)?:[a-z][a-z0-9-]*$"
+              },
+              "schema_version": {
+                "description": "The upstream interface version the connection targets, copied from the definition entry's `version`; absent when the entry names none.",
+                "$ref": "#/$defs/point-version"
+              },
+              "mandatory": {
+                "$ref": "#/$defs/mandatory"
+              }
+            }
+          }
+        }
+      }
+    },
+    "mandatory": {
+      "title": "The mandatory mark (COR-053 point 6)",
+      "description": "Only with a reason; the mark without one is rejected.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "docs": {
+      "title": "The `docs` block (COR-049 point 4)",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "locations": {
+          "description": "The sub-paths of this component's own documents, keyed by a location name, each relative to one of the project's documentation roots. Relative sub-paths only: no absolute path, no `..` (checked in Python).",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/location-name"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/doc-location"
+          }
+        }
+      }
+    },
+    "doc-location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relative-path"
+        },
+        "root": {
+          "description": "Which documentation root the sub-path is under; `internal` when absent.",
+          "type": "string",
+          "enum": [
+            "internal",
+            "user"
+          ]
+        },
+        "description": {
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "friction": {
+      "title": "The `friction` block (COR-050 points 1, 2 and 8; COR-056 point 2)",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "description": "Anchor kinds this component registers (COR-050 point 2): a mapping from a kind — a word, as an anchor block and a rule's cited source write it — to its entry, which names by `command` the leaf of this component's `commands:` tree that resolves an anchor of the kind; the leaf must exist and declare `query-contract: true` (checked in Python). A kind the backbone resolves itself (`path`, `record`, `artefact`), or one another installed capability registers too, is refused (checked in Python). The backbone runs the leaf's script under the query policy with `--json`, `--` and then the anchor value, and reads `{\"paths\": [...]}`: the files the anchor stands on (the lifecycle reference's manifest schema).",
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/anchor-kind"
+          }
+        },
+        "types": {
+          "description": "This component's type registry (COR-056 point 2): a mapping from a type's name to its entry. The type's full name is `<component>:<name>`. A place of this component names one with `type`. The backbone resolves each artefact's type from the places that match its file. `pkit friction artefacts --json` lists every registry and gives each artefact its type.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/type-name"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/friction-type"
+          }
+        },
+        "places": {
+          "description": "Where this component's anchored artefacts live: each place a path glob inside one of the component's declared documentation locations (`location`), or, without one, inside the project (checked in Python).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/friction-place"
+          }
+        },
+        "surface": {
+          "description": "Repository-relative path globs this component says ought to be described; paths in it that no artefact anchors to are reported as uncovered (COR-050 point 8).",
+          "$ref": "#/$defs/path-list"
+        },
+        "held": {
+          "description": "Folders of held documents: files this component owns that are not artefacts, such as a log of reviews it has carried out (COR-050 point 1). Each lies within one of the component's declared locations; no place reads one of its files as an artefact.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/friction-held"
+          }
+        }
+      }
+    },
+    "anchor-kind": {
+      "title": "One registered anchor kind",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "description": "The leaf of this component's `commands:` tree that resolves an anchor of the kind; must exist and declare `query-contract: true` (checked in Python).",
+          "$ref": "#/$defs/command-reference"
+        }
+      }
+    },
+    "friction-place": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "location": {
+          "description": "A name from `docs.locations`; the place lies inside it.",
+          "$ref": "#/$defs/location-name"
+        },
+        "path": {
+          "$ref": "#/$defs/relative-path"
+        },
+        "type": {
+          "description": "The type the artefacts in this place take: a name this component's `types` declares (COR-056 point 2). A name it does not declare gives no type, and validation reports it without failing (checked in Python).",
+          "$ref": "#/$defs/type-name"
+        },
+        "revisits": {
+          "description": "The links of the artefacts this place holds whose source's change revisits their targets (COR-050 point 16), one entry per link. Never on by default: a place without the key declares none.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/friction-link"
+          }
+        },
+        "derived-links": {
+          "description": "The forms of the derived links a command of this component writes in the files this place holds, from data its check holds them equal to (COR-050 point 5). Wherever friction compares the body of such a file, each link of a declared form in running text is read as its words alone. Never on by default: a place without the key declares none.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/friction-derived-link"
+          }
+        },
+        "description": {
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "friction-link": {
+      "title": "One link that revisits its targets (COR-050 point 16)",
+      "type": "object",
+      "description": "A link chooses its targets in one of two ways, so it names exactly one of `targets` and `all-but`.",
+      "additionalProperties": false,
+      "required": [
+        "when"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "targets"
+          ]
+        },
+        {
+          "required": [
+            "all-but"
+          ]
+        }
+      ],
+      "properties": {
+        "targets": {
+          "description": "The source's own field that lists the link's targets, each by its anchor's value: a value names every anchor of the source that has it.",
+          "$ref": "#/$defs/own-field"
+        },
+        "all-but": {
+          "description": "The source's own fields that list the anchors that stay out, each by its anchor's value: the link's targets are every other anchor of the source.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/own-field"
+          }
+        },
+        "when": {
+          "description": "The trigger fields: the source's own fields whose change, compared parsed between the base and the head, revisits the link's targets.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/own-field"
+          }
+        },
+        "description": {
+          "description": "What the link is, and why a change to its trigger fields asks after its targets.",
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "friction-derived-link": {
+      "title": "One form of derived link (COR-050 point 5)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "target": {
+          "description": "A regular expression, in Python's dialect, that the target of an inline link `[words](target)` matches whole. It must compile (checked in Python).",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "description": "Which links the form takes, and the command that writes them.",
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "own-field": {
+      "description": "An artefact's own front-matter field, outside the `pkit` container (COR-053 point 10).",
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
+      "not": {
+        "const": "pkit"
+      }
+    },
+    "friction-type": {
+      "title": "One type of the component's type registry (COR-056 point 2)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "description"
+      ],
+      "properties": {
+        "description": {
+          "description": "What an artefact of the type is.",
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "kind-field": {
+          "description": "The artefact's own field in which an artefact of the type declares its kind, outside the `pkit` container (COR-056 point 4). Where the place that wins gives this type, an artefact takes it only when the field is present and not empty, and otherwise has no type.",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$",
+          "not": {
+            "const": "pkit"
+          }
+        },
+        "project-places": {
+          "description": "Whether a project may give this type to its own places, as `{path, type}` in its configuration. Default `false`: an entry that does not say admits no project place.",
+          "type": "boolean"
+        }
+      }
+    },
+    "project-rule-set": {
+      "title": "The one project rule set a capability declares (COR-017)",
+      "description": "A capability that ships a method rule set may declare one project rule set, which its install creates once for each install, where no set of the project's own inherits the method set, directly or not. `name` is the set's name. `inherits` names one of the capability's own method sets, which the created set pins at its major. `scope.types` selects by the capability's own types, `<capability>:<type>`, since a capability cannot know a project's paths. `title` heads the created file. Python checks three things more: `inherits` names a method set the capability ships, whose version reads, `name` is none of the capability's own sets' names, and each type is one the capability declares.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "inherits",
+        "scope",
+        "title"
+      ],
+      "properties": {
+        "name": {
+          "description": "The created set's name, as a rule set's `rule-set` field takes it (COR-051 point 3).",
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*$"
+        },
+        "inherits": {
+          "description": "The name of one of the capability's own method rule sets, written bare.",
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*$"
+        },
+        "scope": {
+          "description": "The created set's scope: the capability's own types alone.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "types"
+          ],
+          "properties": {
+            "types": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+              }
+            }
+          }
+        },
+        "title": {
+          "description": "One line, what the set is for: the created file's heading follows its name with it.",
+          "type": "string",
+          "pattern": "^[^\\n]*\\S[^\\n]*$"
+        }
+      }
+    },
+    "loaded-rules": {
+      "title": "How an adapter's harness reaches the installed capabilities' loaded files (COR-070 point 2; ADR-076 point 4)",
+      "description": "An adapter's delivery of each installed capability's loaded file, `.pkit/capabilities/<name>/rules.md`: the backbone renders one index of them at `.pkit/rules/capabilities.md` in the form `entry` gives, and the adapter's merge primitive keeps `line` present in `host`, beside core's include in the same form, so the harness's syntax reaches the backbone only as this data. An adapter without the key delivers no capability's rules, and validation warns of it. Validation fails while registered adapters' `entry` forms differ. A capability declares none.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry",
+        "host",
+        "line"
+      ],
+      "properties": {
+        "entry": {
+          "description": "The index's line for one capability's loaded file, `{file}` standing for its path read from the index's folder, such as `@{file}`. The part before `{file}` is the harness's import token, which a loaded set may not write outside code.",
+          "type": "string",
+          "pattern": "^[^\\n]*\\{file\\}[^\\n]*$"
+        },
+        "host": {
+          "description": "The file that reaches the index, relative to the project's root and inside it, such as `CLAUDE.md`.",
+          "$ref": "#/$defs/relative-path"
+        },
+        "line": {
+          "description": "The line the host keeps, `{index}` standing for the index's path read from the host's folder, such as `@{index}`. Read for core's loaded file's path in place of the index's, it is core's include, which the host keeps too and validation checks (ADR-083).",
+          "type": "string",
+          "pattern": "^[^\\n]*\\{index\\}[^\\n]*$"
+        }
+      }
+    },
+    "type-name": {
+      "description": "A type's name within its owner: a word of lower-case letters and digits, joined by single hyphens. It holds no `:` and no `/` (COR-056 point 1).",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+    },
+    "friction-held": {
+      "description": "A folder of held documents: `path`, a folder, or a glob of folders at one depth — `*`, `?` and `[...]` within a segment before the folder's own name, never in its last segment, never `**` — inside the declared location `location` names (COR-050 point 1).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "location",
+        "path"
+      ],
+      "properties": {
+        "location": {
+          "description": "A name from `docs.locations`; the folder lies inside it.",
+          "$ref": "#/$defs/location-name"
+        },
+        "path": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/relative-path"
+            },
+            {
+              "pattern": "^(?!.*\\*\\*)(?:.*/)?[^/*?\\[]+/?$"
+            }
+          ]
+        },
+        "description": {
+          "$ref": "#/$defs/non-empty-string"
+        }
+      }
+    },
+    "qualified-role": {
+      "description": "`<publisher>::<role>`, each part a word `[a-z][a-z0-9-]*` (`project_kit.refs.ADDRESS_WORD_PATTERN`): the configuration schema's provider-selection key.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*::[a-z][a-z0-9-]*$"
+    },
+    "point-address": {
+      "description": "`<publisher>::<role>:<point>`, each part a word `[a-z][a-z0-9-]*` (`project_kit.refs.ADDRESS_WORD_PATTERN`): the configuration schema's contributor-selection key.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*::[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$"
+    },
+    "point-version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "point-description": {
+      "description": "Required prose: what the point means and what one may rely on. Nothing parses it (COR-053 point 3).",
+      "$ref": "#/$defs/non-empty-string"
+    },
+    "write-categories": {
+      "title": "The overlay categories a capability declares for its agents' writes (COR-073 point 1, ADR-088 point 1)",
+      "description": "Each key is the category's whole name: the capability's name, a dot, then a word, `[a-z][a-z0-9-]*` — the same string the owner's `owns` holds as a placeholder and the agents overlay holds as a key. Python checks that the part before the dot is the capability's name, that `owner` is an agent the capability ships whose `owns` names the category and that no other agent of it does, and that `default-query` names a leaf of `commands:` declaring the query contract and no `reads`. Only a capability holds the block. Its install, and the commands that fill missing overlay categories, write the query's answer into the overlay where the project set no value; a category without `default-query` gets the empty list.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/write-category"
+      }
+    },
+    "write-category": {
+      "title": "One write category",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner"
+      ],
+      "properties": {
+        "owner": {
+          "description": "The one agent of the capability that owns the category: an agent it ships under `agents/`, whose `owns` names the category's placeholder (checked in Python).",
+          "$ref": "#/$defs/non-empty-string"
+        },
+        "default-query": {
+          "description": "The leaf of the capability's `commands:` that answers the category's default: run from the project root with `--json` alone, offline-marked and bounded, it prints one JSON document, `{\"paths\": [...]}`, with an optional one-line `note`. It must declare the query contract and no `reads` (checked in Python). Absent: the category has no default, and the empty list is written.",
+          "$ref": "#/$defs/command-reference"
+        }
+      }
+    },
+    "command-reference": {
+      "description": "A path through the `commands:` tree, tokens separated by spaces (`create issue`), landing on a leaf.",
+      "type": "string",
+      "pattern": "^\\S+( \\S+)*$"
+    },
+    "location-name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "relative-path": {
+      "description": "Relative, no `..` segment — the Python check names the offending segment.",
+      "$ref": "#/$defs/non-empty-string"
+    },
+    "version-range": {
+      "$ref": "#/$defs/non-empty-string"
+    },
+    "path-list": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/relative-path"
+      }
+    },
+    "non-empty-string": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

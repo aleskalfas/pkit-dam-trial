@@ -1,0 +1,81 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "ruamel.yaml>=0.18",
+# ]
+# ///
+"""Project-management capability — cascade-membership (process predicate, DEC-034).
+
+COR-037 cascade `membership` predicate for the issue-lifecycle CLOSURE fold: the
+per-subject step for each candidate `cascade-members` listed. The engine threads
+ONLY the candidate's subject id (the single-subject runner, COR-032); the folding
+parent's id is not passed. result=True for every candidate whose issue can be
+read — whatever its first line says, since a natively linked child may name no
+issue there — and never a determinate "not a member": who the children are is
+`cascade-members`' answer alone, through the containment seam (native links
+included). An unreadable candidate (gh failure) is indeterminate, which holds the
+whole fold fail-closed per COR-037 rather than silently dropping the candidate.
+A candidate in another repository — a native sub-issue that lives there, its id
+`owner/repo#<n>` — is a member without a read here; its state is read there by
+the classifier, `detect-state`.
+
+READ-ONLY. The process engine (COR-033) invokes this as
+  <script> <child-issue-number | owner/repo#<n>> --json
+and reads the structured-JSON contract on stdout. Self-contained via PEP 723.
+
+Exit codes:
+  0  evaluated (result emitted as JSON); 2  usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_HERE = Path(__file__).parent
+sys.path.insert(0, str(_HERE))
+from _lib import bootstrap_gate
+from _lib import lifecycle_predicates as predicates
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Confirm a candidate child can be read (cascade membership); rejects none."
+    )
+    parser.add_argument(
+        "issue_number",
+        help="The keyed subject: the CANDIDATE child issue number, or owner/repo#<n> for one "
+        "in another repository.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit the structured JSON contract.")
+    parser.add_argument("--actor", default=None, help="The actor being gated (gates only).")
+    args = parser.parse_args()
+
+    # Prerequisite gate (#747): refuse on an un-bootstrapped project rather
+    # than operating on assumed defaults. See _lib/bootstrap_gate.py.
+    if not bootstrap_gate.enforce("cascade-membership"):
+        return 2
+
+    subject = predicates.read_subject(args.issue_number)
+    if subject is None:
+        print(
+            "error: the subject must be an issue number, or owner/repo#<n> for an issue in "
+            f"another repository, got {args.issue_number!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    payload = predicates.cascade_membership(subject)
+    # A predicate that genuinely couldn't evaluate exits non-zero so the engine
+    # treats it as INDETERMINATE (fail-closed, COR-037: indeterminate membership
+    # holds the whole fold, never silently dropping the candidate). Strip the marker.
+    indeterminate = bool(payload.pop(predicates.INDETERMINATE_KEY, False))
+    print(json.dumps(payload))
+    return 2 if indeterminate else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

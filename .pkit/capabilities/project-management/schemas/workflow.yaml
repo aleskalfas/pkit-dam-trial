@@ -1,0 +1,558 @@
+# Issue-lifecycle process definition — rebound onto the shared process
+# substrate (COR-033) as a KEYED process (COR-032), per DEC-033.
+#
+# Conforms to the substrate shape contract at
+# ../../../schemas/_defs/process.schema.json (the `process` $def). The
+# engine (in the `pkit` binary, ADR-020) owns the state-machine
+# mechanics — position, validation, journal — and reads `states` +
+# `transitions` + each `detection`/`gate` predicate, PLUS the shared
+# `process.cascade` declaration (COR-037 / DEC-034: pm's closure fold,
+# rebound onto the substrate's cascade slot). The pm-LOCAL TOP-LEVEL
+# blocks (the sibling `cascade` carrying FORWARD/downward, and
+# `closure_triggers`) and the pm-local fields on states/transitions
+# (`display_name`, `applies_to`, `command`, `pr_state_effect`,
+# `authorisation`, `executor`, `severity`, `notes`) are ignored by the
+# engine and consumed by pm's wrappers — the substrate stays content-free
+# (DEC-033 D3: forward → local; DEC-034, partially superseding it: closure →
+# shared slot).
+# NOTE the two same-named `cascade` constructs are disambiguated by NESTING:
+# the engine reads ONLY `process.cascade` (the closure fold); the top-level
+# `cascade:` sibling (forward/downward) is wrapper-only. See the in-line note
+# at the shared declaration.
+#
+# Five states (todo → backlog → in-progress → review → done) the
+# methodology drives every issue through. Every state detects with ONE
+# classifier, `detect-state`, under `mode: classified` (COR-033 point 5;
+# DEC-033 D2): it reads the issue once and answers which state the issue
+# is in, by move-issue's exact inference precedence (closed→done; first
+# state:* label; milestone→backlog; else todo) — behaviour parity is the
+# acceptance bar (DEC-033). The engine runs it once per reading of an
+# issue's position. A closure-fold member in another repository (subject
+# id `owner/repo#<n>`, below) is read there by open/closed alone: closed
+# is done, open is none of these states. Its answer makes at most one
+# state true, so the state ORDER below decides nothing among these five;
+# it still orders the engine's reading (the first state whose detection
+# is true is the position). The per-state `detect-<state>` commands stay
+# registered, for direct use; this definition does not name them.
+
+schema_version: 4
+
+source:
+  upstream: pm-workflow
+  commit: 9d1f0237f5d5778ed9811c72f22ae8268e5faff3
+  decisions: [MET-005]
+  captured_at: 2026-05-21
+
+process:
+  id: issue-lifecycle
+  version: 7
+  # A subject id is an issue number — or, for a closure-fold member that is a
+  # native sub-issue in another repository, `owner/repo#<n>` (`cascade-members`
+  # gives it; `cascade-membership` and `detect-state` accept it).
+  subject:
+    cardinality: keyed
+    key: issue-number
+
+  states:
+    - id: done
+      display_name: Done
+      meaning: |
+        Issue closed (merged via PR, closed as completed without one, or
+        closed as won't-do).
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      terminal: true
+      detection:
+        mode: classified
+        predicate:
+          run: detect-state
+
+    - id: review
+      display_name: Review
+      meaning: |
+        PR open, awaiting human review. Task only — parents skip this
+        state.
+      applies_to:
+        - "[issue-types:task]"
+      detection:
+        mode: classified
+        predicate:
+          run: detect-state
+
+    - id: in-progress
+      display_name: In Progress
+      meaning: |
+        Branch open, work in flight.
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      detection:
+        mode: classified
+        predicate:
+          run: detect-state
+
+    - id: backlog
+      display_name: Backlog
+      meaning: |
+        Scheduled — committed by a Milestone or an audited promotion, or
+        brought level with a descendant by the forward cascade; not started.
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      detection:
+        mode: classified
+        predicate:
+          run: detect-state
+
+    - id: todo
+      display_name: Todo
+      meaning: |
+        Filed; not yet scheduled to a Milestone.
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      entry: true
+      detection:
+        mode: classified
+        predicate:
+          run: detect-state
+
+  transitions:
+    - from: todo
+      to: backlog
+      trigger: promote-issue
+      command: promote-issue
+      pr_state_effect: "none → none"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:bypassable-with-audit]"
+      why: User assigns the Milestone; agent may execute on verbal authorisation with an audit comment.
+      hint: pkit project-management promote-issue <issue-number>
+      notes: |
+        User typically assigns the Milestone; agent may execute on verbal
+        authorisation, posting an audit comment per
+        `bypassable-with-audit` semantics. Owned by `promote-issue` per
+        DEC-026; the wrapper calls `move-issue --to backlog`, which carries
+        the reason into the audit trail (DEC-049), and then attaches the
+        milestone when one is given. The forward cascade also brings an
+        ancestor to Backlog when a descendant is scheduled or started; it is
+        not a promotion and needs neither a milestone nor a reason.
+
+    - from: backlog
+      to: in-progress
+      trigger: start-work
+      command: start-work
+      pr_state_effect: "none → none"
+      authorisation: agent-autonomous
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:warning]"
+      why: Agent opens the branch and starts work.
+      hint: pkit project-management start-work <issue-number>
+      notes: |
+        Agent opens the branch on `start-work`. For parents, the
+        transition is inferred from forward cascade (see `cascade.forward`).
+        Owned by `start-work` per DEC-026; the wrapper creates the branch,
+        sets the assignee, and then calls `move-issue --to in-progress`.
+
+    - from: in-progress
+      to: review
+      trigger: review-work
+      command: review-work
+      pr_state_effect: "none → ready | draft → ready"
+      authorisation: agent-autonomous
+      executor: agent
+      applies_to:
+        - "[issue-types:task]"
+      severity: "[validation-severity:warning]"
+      why: Agent opens the PR; review is task-only.
+      hint: pkit project-management review-work <issue-number>
+      notes: |
+        Agent opens the PR on `review-work`. Review is task-only. Owned
+        by `review-work` per DEC-026; the wrapper opens a ready PR if
+        none exists, flips draft→ready if a draft exists, assigns
+        reviewers per DEC-027 mode resolution, then calls `move-issue
+        --to review`.
+
+    - from: review
+      to: done
+      trigger: done-work
+      command: done-work
+      pr_state_effect: "ready → merged"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      gate:
+        kind: authorisation-artifact
+        predicate:
+          run: gate-pr-merged
+      why: User authorises the merge per-PR; a different authority's merge is the gate.
+      hint: pkit project-management done-work <issue-number>
+      notes: |
+        User authorises the merge per-PR; agent runs the squash-merge
+        after the checkbox-completeness check passes. PR-merge bypassing
+        the gate is a hard reject — the audit-trail mechanism does not
+        apply (the merge button is the gate). The declared gate is an
+        authorisation-artifact: a merged PR whose merger differs from the
+        actor being gated (cross-authority, COR-033 P4). Owned by
+        `done-work` per DEC-026; approval gate is mode-conditional per
+        DEC-027 / DEC-028.
+
+        The DEC-007 checkbox close-gate ALSO applies on this transition,
+        as a `done-work` PRE-FLIGHT rather than a declared gate: `gate:`
+        is single-valued, so the checkbox check cannot be declared here
+        beside `gate-pr-merged`. It has to run before the squash-merge
+        is authorised anyway — `Closes #N` auto-closes the issue on
+        merge, so a gate the engine evaluated on arrival at `done` would
+        already have been passed. `done-work` refuses on any unticked
+        box, listing each one; `--skip-checkbox-gate` overrides
+        (discouraged). The rule is the same one
+        `gate-checkboxes-ticked` evaluates on the `close-issue`
+        transitions below — one implementation, in
+        `scripts/_lib/checkbox_gate.py` (#734).
+
+    - from: in-progress
+      to: done
+      trigger: close-issue
+      command: close-issue
+      pr_state_effect: "none → none"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      gate:
+        kind: deterministic
+        predicate:
+          run: gate-checkboxes-ticked
+      why: Closure-cascade eligibility path for parents, or a Task completed without a pull request; checkboxes must be ticked.
+      hint: pkit project-management close-issue <issue-number>
+      notes: |
+        Closure-cascade eligibility path for parents — every child closed,
+        parent's checkboxes (acceptance/success criteria) all ticked, user
+        authorises closure for this level. Owned by `close-issue` (not part
+        of the seven-command palette per DEC-026; closure is its own
+        concern).
+
+        For a Task, the close as completed of work that was not a pull
+        request (DEC-006, `manual-completed`): `close-issue --mode=completed
+        --result "<where the result lives>"`, on the user's authorisation,
+        once every checkbox is ticked. The close comment names where the
+        work's result lives.
+
+    # The move back (DEC-006, "Moving back from In Progress"): a person stops
+    # work nobody is doing. Not a forward move, so no ancestor moves with it.
+
+    - from: in-progress
+      to: backlog
+      trigger: move-issue
+      command: move-issue
+      # A Task's branch and draft pull request stay as they are, for the next
+      # taker to continue or to replace (DEC-006).
+      pr_state_effect: "none → none | draft → draft"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      why: The user moves back an issue in a Milestone that nobody is working on, giving the reason the work stopped.
+      hint: pkit project-management move-issue <issue-number> --to backlog --reason "<why the work stopped>"
+      notes: |
+        Lands in Backlog where the issue is in a Milestone, or, for a
+        container, where a child of it is in Backlog; `move-issue` refuses
+        `--to backlog` otherwise and names `--to todo`. The reason is
+        required: it is posted as the move's audit comment before the label
+        changes, and journaled with the move. The owner's claim is released
+        through the ownership seam's one release path, and the move is
+        refused, the owner named, where this clone cannot release it. A
+        container with a child In Progress or in Review is refused, the
+        child named, and so is one whose children cannot all be told. Where
+        the substrate map binds the state to the board, the move is refused
+        and writes nothing (DEC-006).
+
+    - from: in-progress
+      to: todo
+      trigger: move-issue
+      command: move-issue
+      pr_state_effect: "none → none | draft → draft"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      why: The user moves back an issue in no Milestone that nobody is working on, giving the reason the work stopped.
+      hint: pkit project-management move-issue <issue-number> --to todo --reason "<why the work stopped>"
+      notes: |
+        Lands in Todo where the issue is in no Milestone and, for a
+        container, no child of it is in Backlog; `move-issue` refuses
+        `--to todo` otherwise and names `--to backlog`. Otherwise as the
+        move back to Backlog above.
+
+    - from: backlog
+      to: done
+      trigger: close-issue
+      command: close-issue
+      pr_state_effect: "none → none"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      gate:
+        kind: deterministic
+        predicate:
+          run: gate-checkboxes-ticked
+      why: Won't-do close from Backlog, all checkboxes ticked or removed first; or a Task completed without a pull request, every checkbox ticked.
+      hint: pkit project-management close-issue <issue-number>
+      notes: |
+        Won't-do close from Backlog. All checkboxes must be ticked or
+        removed first (per MET-006). Owned by `close-issue`. A Task closes
+        from here as completed without a pull request too, every checkbox
+        ticked, as from In Progress above.
+
+    - from: todo
+      to: done
+      trigger: close-issue
+      command: close-issue
+      pr_state_effect: "none → none"
+      authorisation: user
+      executor: agent
+      applies_to:
+        - "[issue-types:epic]"
+        - "[issue-types:feature]"
+        - "[issue-types:umbrella]"
+        - "[issue-types:task]"
+      severity: "[validation-severity:hard-reject]"
+      gate:
+        kind: deterministic
+        predicate:
+          run: gate-checkboxes-ticked
+      why: Won't-do close from Todo, or a Task completed without a pull request; same checkbox rule as Backlog → Done.
+      hint: pkit project-management close-issue <issue-number>
+      notes: |
+        Won't-do close from Todo. Same checkbox rule as Backlog → Done.
+        Owned by `close-issue`. A Task closes from here as completed without
+        a pull request too, as from Backlog.
+
+    # PR sub-lifecycle per DEC-026 — no issue-state transition; the
+    # wrapper drives a PR-state change only (self-loops on the same state).
+
+    - from: in-progress
+      to: in-progress
+      trigger: create-draft
+      command: create-draft
+      pr_state_effect: "none → draft"
+      authorisation: agent-autonomous
+      executor: agent
+      applies_to:
+        - "[issue-types:task]"
+      severity: "[validation-severity:warning]"
+      why: Opens a draft PR while the issue stays In Progress (CI on WIP).
+      hint: pkit project-management create-draft <issue-number>
+      notes: |
+        `create-draft` opens a draft PR while the issue stays in
+        In Progress. Used when CI should run on the work-in-progress
+        branch before the work is ready for review. No issue-state
+        change; only a PR-state effect.
+
+    - from: review
+      to: review
+      trigger: back-to-draft
+      command: back-to-draft
+      pr_state_effect: "ready → draft"
+      authorisation: agent-autonomous
+      executor: agent
+      applies_to:
+        - "[issue-types:task]"
+      severity: "[validation-severity:warning]"
+      why: Flips a Ready PR back to Draft and dismisses prior approvals; issue stays in Review.
+      hint: pkit project-management back-to-draft <issue-number>
+      notes: |
+        `back-to-draft` flips a Ready PR back to Draft (via
+        `gh pr ready --undo`) and dismisses prior APPROVED reviews
+        (`gh pr review --dismiss`) so the next `done-work` cycle
+        requires fresh review of changed content. Issue stays in Review
+        because the work-flow phase hasn't changed — the reviewer is
+        still waiting; only the PR-readiness flipped.
+
+  # --- SHARED cascade slot (COR-037) — the CLOSURE fold, DEC-034 ----------
+  # This `cascade:` is the SHARED-shape declaration the engine reads
+  # (`process.cascade`): pm's "a parent closes once every child is done" rule,
+  # rebound from bespoke wrapper logic onto the substrate everyone else uses.
+  #
+  # NAME DISAMBIGUATION (DEC-034 Implications): there are now TWO same-named
+  # `cascade` constructs in this file, distinguished by NESTING LEVEL —
+  #   * THIS one, nested INSIDE `process:` (so `process.cascade`), is the only
+  #     `cascade` the engine reads (load_definition passes the `process:` block
+  #     as the engine's `data`, and the engine reads `data.get("cascade")`); and
+  #   * the pm-LOCAL `cascade:` block below, a TOP-LEVEL sibling of `process:`
+  #     (forward / downward only), which the engine never looks at.
+  # The CLOSURE fold lives in this shared declaration, not in the local block;
+  # forward / downward stay local and wrapper-driven (DEC-034, which partially
+  # supersedes DEC-033 D3: closure → shared slot; forward → stays local).
+  #
+  # The fold supplies the CHILDREN-HALF of close-eligibility only. The full
+  # close rule is the CONJUNCTION of (a) the `gate-checkboxes-ticked`
+  # deterministic gate on the close transitions (UNCHANGED, separate per-
+  # transition gate) AND (b) this fold — read+AND'd by the close-issue wrapper.
+  cascade:
+    runs: project-management:issue-lifecycle   # children are issues — the same keyed process
+    members:
+      run: cascade-members         # parent-scoped: every child of the parent (the candidate set),
+                                   # each id an issue number, or `owner/repo#<n>` for a native
+                                   # sub-issue in another repository
+    membership:
+      run: cascade-membership      # per-subject: the candidate can be read (never drops a listed child);
+                                   # a candidate in another repository is a member on the list's word
+    reducer:
+      op: all                      # every child must have reached the terminal `done`
+      outcome: done                # the terminal state reached by BOTH pr-merge completion AND won't-do
+    on_empty: satisfied            # a CHILDLESS container's children-half is satisfied (DEC-034):
+                                   # closes via the checkbox gate alone, identical to pm today. A
+                                   # broken membership read still HOLDS the fold (COR-037 precedence:
+                                   # indeterminate membership overrides on_empty — never fail-open).
+
+# --- pm-LOCAL blocks (engine ignores; pm wrappers consume) -----------------
+# DEC-033 D3, partially superseded by DEC-034: the FORWARD cascade +
+# closure_triggers are pm-domain semantics and stay capability-local so the
+# shared substrate stays content-free. The CLOSURE cascade is the shared slot
+# above (process.cascade); only forward / downward live here.
+#
+# This top-level `cascade:` is a SIBLING of `process:` — NOT `process.cascade`
+# — so the engine never reads it (see the disambiguation note above).
+
+cascade:
+  forward:
+    direction: upward
+    behaviour: |
+      Automatic. When an issue moves forward (todo → backlog → in-progress),
+      the agent checks each ancestor (to the top) and brings any that is
+      behind up to the moved issue's state, capped at in-progress. An
+      ancestor moves only through transitions declared above: one in todo
+      goes todo → backlog, then backlog → in-progress, each journaled, where
+      a journal is kept, with the moved issue's move as its reason. No
+      todo → in-progress is declared for the cascade. A won't-do close from
+      todo or backlog moves no ancestor forward; the closure cascade still
+      runs. A Task's completed close (`manual-completed`) is progress from
+      todo or backlog too, so it brings each ancestor behind up to
+      in-progress, before the closure cascade. The forward cascade is scoped to
+      todo → backlog → in-progress only; containers do not forward-cascade
+      into review or done. When an issue enters review, or done from
+      in-progress or review, each ancestor behind is brought to at most
+      in-progress. Containers reach done only via the closure cascade once
+      all children are done (cascade-eligibility-close).
+      First child to move flips the chain; later siblings re-flipping is
+      a no-op.
+    applies_to_levels:
+      - "[issue-types:epic]"
+      - "[issue-types:feature]"
+      - "[issue-types:umbrella]"
+    idempotent: true
+    requires_user_authorisation: false
+
+  downward:
+    direction: none
+    behaviour: |
+      Disallowed. Parent state changes do not change children. Children
+      advance on their own pace. Modelling parent → child cascade would
+      be the wrong direction of causation.
+    applies_to_levels: []
+    idempotent: false
+    requires_user_authorisation: false
+
+closure_triggers:
+  - id: pr-merge-into-main
+    target_state: done
+    applies_to:
+      - "[issue-types:task]"
+    mechanism: |
+      Agent opens PR → user authorises merge → agent squash-merges
+      (head branch deleted on merge). GitHub's `Closes #N` keyword in the
+      PR body
+      auto-closes the Task on merge. Cascade-check runs against the
+      Task's parents immediately after.
+
+  - id: pr-merge-into-integration
+    target_state: done
+    applies_to:
+      - "[issue-types:task]"
+      - "[issue-types:feature]"
+    mechanism: |
+      Same as `pr-merge-into-main` but the PR base is
+      `integration/<slug>` (per the `Integration:` marker on the issue
+      body). `Closes #N` auto-closes the marked descendant on merge into
+      the integration branch; the owning root closes via a separate
+      final `integration/<slug>` → main PR with `Closes #<owning>`.
+
+  - id: manual-completed
+    target_state: done
+    applies_to:
+      - "[issue-types:task]"
+    mechanism: |
+      A Task whose work was not a pull request (an audit, an
+      investigation, a decision walked with the user). User authorises
+      the close once every checkbox is ticked (per MET-006, not
+      skippable). Agent posts a close comment naming where the work's
+      result lives (an issue, a record, a comment) and closes the Task as
+      completed, from Todo, Backlog or In Progress; a Task in Review has
+      a PR open and closes through its merge. Completed work is progress,
+      so the forward cascade then brings each ancestor behind up to
+      In Progress, and the closure cascade runs as for a PR-merge closure.
+
+  - id: manual-wont-do
+    target_state: done
+    applies_to:
+      - "[issue-types:epic]"
+      - "[issue-types:feature]"
+      - "[issue-types:umbrella]"
+      - "[issue-types:task]"
+    mechanism: |
+      User authorises won't-do closure with a reason. Agent verifies
+      all checkboxes are ticked or removed (per MET-006), records the
+      reason in a close comment, closes the issue. The closure cascade
+      runs as for a PR-merge closure.
+
+  - id: cascade-eligibility-close
+    target_state: done
+    applies_to:
+      - "[issue-types:epic]"
+      - "[issue-types:feature]"
+      - "[issue-types:umbrella]"
+    mechanism: |
+      Triggered by the closure cascade when the last open child of a
+      parent closes. Agent validates parent's close criteria
+      (Feature/EPIC checkboxes ticked, Umbrella purpose served) and
+      prompts the user for explicit authorisation per level. Never
+      auto-closes.
