@@ -6,7 +6,7 @@
 schema_version: 1
 pkit_schema: project-management:bootstrap-stamp
 bootstrap:
-  completed_at: '2026-11-12T07:07:11.954610+00:00'
-  capability_version: 0.55.0
+  completed_at: '2026-11-13T12:18:50.339336+00:00'
+  capability_version: 0.57.0
   by: bootstrap
   repo: github.com/aleskalfas/pkit-dam-trial

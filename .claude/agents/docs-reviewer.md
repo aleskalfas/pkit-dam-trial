@@ -35,7 +35,8 @@ reads:
     - .pkit/capabilities/project-management/decisions/DEC-055-pr-lists-answers.md
     - .pkit/capabilities/project-management/decisions/DEC-065-answers-read-from-check.md
     - .pkit/capabilities/project-management/README.md
-  patterns: []
+  patterns:
+    - docs/conventions.md
 ---
 
 # Docs reviewer

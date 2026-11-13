@@ -36,6 +36,11 @@ adr-records:
 # that resolves into sync-managed content is refused at deploy time.
 process-authoring-targets: []
 
+# The project's coding conventions, which software-engineer writes to and the
+# code-review panel judges by (software-engineering DEC-001).
+project-conventions:
+  - docs/conventions.md
+
 # Per-agent overrides (optional): replace categories for a specific agent,
 # and set the model / effort it runs at (absent = inherit from the caller).
 # overrides:
